@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::phase::ExecutionPhase;
+
 /// Versioned schema emitted by scans and consumed by the query/runtime layers.
 pub const MODEL_IR_SCHEMA: &str = "candle-graph/model/1";
 
@@ -152,6 +154,9 @@ pub struct TensorContract {
     pub device: DeviceFact,
     pub layout: LayoutFact,
     pub requires_grad: Option<bool>,
+    /// Train vs inference graph this contract belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_phase: Option<ExecutionPhase>,
     pub evidence: Vec<Evidence>,
 }
 
@@ -239,6 +244,9 @@ pub struct Function {
     pub tensor_outputs: Vec<StableId>,
     pub is_entrypoint: bool,
     pub is_loss: bool,
+    /// Static graphs built for this entrypoint (train and/or infer).
+    #[serde(default)]
+    pub execution_phases: Vec<ExecutionPhase>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +271,12 @@ pub struct Operation {
     /// Float-range transfer after rounding (`real`, `non_negative`, `saturating_unit`, …).
     #[serde(default)]
     pub domain_rule: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_phase: Option<ExecutionPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_duration_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing_samples: Option<u64>,
     pub evidence: Vec<Evidence>,
 }
 
@@ -440,6 +454,14 @@ pub struct CargoSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeTimingSummary {
+    pub from: StableId,
+    pub to: StableId,
+    pub avg_duration_ns: u64,
+    pub samples: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSummary {
     pub trace_schema: String,
     pub entrypoint: Option<String>,
@@ -463,6 +485,12 @@ pub struct RuntimeSummary {
     pub saturating_activations: usize,
     #[serde(default)]
     pub value_observations: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_phase: Option<ExecutionPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_operation_duration_ns: Option<u64>,
+    #[serde(default)]
+    pub edge_timings: Vec<EdgeTimingSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -11,7 +11,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::model_ir::{Finding, Function, ModelIr, StableId, TensorContract};
+use crate::model_ir::{Finding, Function, ModelIr, StableId, TensorContract, ExecutionPhase};
 
 pub const QUERY_SCHEMA: &str = "candle-graph/query/1";
 
@@ -45,6 +45,12 @@ pub enum QueryKind {
     Path,
     /// Compact agent-oriented rollup for model repair and improvement workflows.
     ModelImprovement,
+    /// Phase-filtered graph: tensors + operations for training autograd paths.
+    GraphTrain,
+    /// Phase-filtered graph: tensors + operations for inference no-grad paths.
+    GraphInfer,
+    /// Runtime profile rollup: operation and edge timings merged from a v3 trace.
+    Profile,
 }
 
 impl std::str::FromStr for QueryKind {
@@ -80,6 +86,9 @@ impl std::str::FromStr for QueryKind {
             "model_improvement" | "model-improvement" | "improvement" | "agent" => {
                 Ok(Self::ModelImprovement)
             }
+            "graph_train" | "graph-train" | "train_graph" | "train-graph" => Ok(Self::GraphTrain),
+            "graph_infer" | "graph-infer" | "infer_graph" | "infer-graph" => Ok(Self::GraphInfer),
+            "profile" | "profiler" | "timings" => Ok(Self::Profile),
             other => bail!("unknown query kind `{other}`"),
         }
     }
@@ -524,6 +533,9 @@ pub fn execute(model: &ModelIr, request: &QueryRequest) -> Result<QueryResponse>
             })
             .collect(),
         QueryKind::ModelImprovement => vec![model_improvement(model)],
+        QueryKind::GraphTrain => vec![phase_graph(model, ExecutionPhase::Train)],
+        QueryKind::GraphInfer => vec![phase_graph(model, ExecutionPhase::Infer)],
+        QueryKind::Profile => vec![profile_query(model)],
         QueryKind::Path => {
             let from = required_selector(request)?;
             let to = request
@@ -565,6 +577,9 @@ pub fn execute(model: &ModelIr, request: &QueryRequest) -> Result<QueryResponse>
             | QueryKind::Stages
             | QueryKind::Runtime
             | QueryKind::ModelImprovement
+            | QueryKind::GraphTrain
+            | QueryKind::GraphInfer
+            | QueryKind::Profile
     ) {
         items.sort_by_key(stable_value_key);
     }
@@ -746,6 +761,87 @@ fn doctor(model: &ModelIr) -> Value {
             {"kind": "assembly"},
             {"kind": "entrypoints"},
             {"kind": "modules"},
+        ],
+    })
+}
+
+fn phase_graph(model: &ModelIr, phase: ExecutionPhase) -> Value {
+    let tensors: Vec<Value> = model
+        .tensors
+        .iter()
+        .filter(|tensor| tensor.execution_phase == Some(phase))
+        .map(|tensor| {
+            json!({
+                "id": tensor.id,
+                "name": tensor.name,
+                "role": format!("{:?}", tensor.role),
+                "requires_grad": tensor.requires_grad,
+                "owner_function": tensor.owner_function,
+            })
+        })
+        .collect();
+    let operations: Vec<Value> = model
+        .operations
+        .iter()
+        .filter(|operation| operation.execution_phase == Some(phase))
+        .map(|operation| {
+            json!({
+                "id": operation.id,
+                "name": operation.name,
+                "function": operation.function,
+                "inputs": operation.inputs,
+                "output": operation.output,
+                "avg_duration_ns": operation.avg_duration_ns,
+                "timing_samples": operation.timing_samples,
+            })
+        })
+        .collect();
+    json!({
+        "id": format!("graph-{}", phase.as_str()),
+        "phase": phase,
+        "tensor_count": tensors.len(),
+        "operation_count": operations.len(),
+        "tensors": tensors,
+        "operations": operations,
+        "drill_down": [
+            {"kind": "tensors"},
+            {"kind": "operations"},
+            {"kind": "profile"},
+        ],
+    })
+}
+
+fn profile_query(model: &ModelIr) -> Value {
+    let mut slowest: Vec<Value> = model
+        .operations
+        .iter()
+        .filter_map(|operation| {
+            operation.avg_duration_ns.map(|duration| {
+                json!({
+                    "id": operation.id,
+                    "name": operation.name,
+                    "phase": operation.execution_phase,
+                    "avg_duration_ns": duration,
+                    "samples": operation.timing_samples,
+                })
+            })
+        })
+        .collect();
+    slowest.sort_by(|left, right| {
+        right["avg_duration_ns"]
+            .as_u64()
+            .unwrap_or(0)
+            .cmp(&left["avg_duration_ns"].as_u64().unwrap_or(0))
+    });
+    slowest.truncate(50);
+    json!({
+        "id": "profile",
+        "runtime": model.runtime,
+        "slowest_operations": slowest,
+        "drill_down": [
+            {"kind": "graph-train"},
+            {"kind": "graph-infer"},
+            {"kind": "runtime"},
         ],
     })
 }

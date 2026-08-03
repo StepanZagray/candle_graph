@@ -5,7 +5,7 @@
 //! flow; the former syntax/name-based implementation is quarantined until that frontend exists.
 //! Optional runtime traces refine (but never erase) static facts.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -22,7 +22,7 @@ use crate::model_ir::{
     BuilderSourceKind, CargoSummary, Component, Confidence, DeviceFact, Evidence, EvidenceKind,
     Finding, FindingSeverity, Function, FunctionParameter, LayoutFact, ModelIr, Module, Operation,
     OptimizerMembership, Parameter, ParameterRole, PipelineStage, RuntimeSummary, ShapeFact,
-    StableId, StageDispatchKind, StageKind, TensorContract, TensorRole, Visibility,
+    EdgeTimingSummary, StableId, StageDispatchKind, StageKind, TensorContract, TensorRole, Visibility,
 };
 use crate::op_semantics::{self, GradFlow};
 use crate::runtime::{self, ExpectedIdentity, GradientState, RuntimeTrace};
@@ -275,6 +275,7 @@ fn build_functions(
             tensor_outputs: Vec::new(),
             is_entrypoint,
             is_loss,
+            execution_phases: Vec::new(),
         });
     }
     lookup
@@ -2288,11 +2289,17 @@ fn add_dataflow(krate: &Crate, model: &mut ModelIr) {
         .enumerate()
         .map(|(index, function)| (function.id.clone(), index))
         .collect();
-    for (function_id, _name, entry, is_loss) in selected {
-        let graph = match dataflow::analyze_with_candle_version(
+    for (function_id, name, entry, is_loss) in selected {
+        let phases = crate::phase::entrypoint_phases(&name, &entry, is_loss);
+        if let Some(&function_index) = function_indices.get(&function_id) {
+            model.functions[function_index].execution_phases = phases.clone();
+        }
+        for phase in phases {
+        let graph = match dataflow::analyze_with_phase(
             krate,
             &entry,
             candle_nn_version.as_deref(),
+            phase,
         ) {
             Ok(graph) => graph,
             Err(error) => {
@@ -2313,7 +2320,11 @@ fn add_dataflow(krate: &Crate, model: &mut ModelIr) {
             let node = graph.node(*node_id);
             let id = StableId::new(
                 "tensor",
-                [function_id.0.as_str(), node.id.0.to_string().as_str()],
+                [
+                    phase.as_str(),
+                    function_id.0.as_str(),
+                    node.id.0.to_string().as_str(),
+                ],
             );
             let name = node_name(&node.kind);
             let role = match &node.kind {
@@ -2341,6 +2352,7 @@ fn add_dataflow(krate: &Crate, model: &mut ModelIr) {
                     GradState::Frozen | GradState::Severed => Some(false),
                     _ => None,
                 },
+                execution_phase: Some(phase),
                 evidence: vec![source_evidence(
                     krate.file_label(node.span),
                     format!(
@@ -2352,6 +2364,7 @@ fn add_dataflow(krate: &Crate, model: &mut ModelIr) {
             tensor_ids[node.id.0] = Some(id);
         }
         if let Some(&function_index) = function_indices.get(&function_id) {
+            if phase == crate::phase::ExecutionPhase::Train {
             model.functions[function_index].tensor_inputs = graph
                 .nodes
                 .iter()
@@ -2363,6 +2376,7 @@ fn add_dataflow(krate: &Crate, model: &mut ModelIr) {
                 .and_then(|node| tensor_ids[node.0].clone())
                 .map(|tensor| vec![tensor])
                 .unwrap_or_default();
+            }
         }
         for node in &graph.nodes {
             let NodeKind::Call { callee } = &node.kind else {
@@ -2385,7 +2399,11 @@ fn add_dataflow(krate: &Crate, model: &mut ModelIr) {
                 .collect();
             let operation_id = StableId::new(
                 "operation",
-                [function_id.0.as_str(), node.id.0.to_string().as_str()],
+                [
+                    phase.as_str(),
+                    function_id.0.as_str(),
+                    node.id.0.to_string().as_str(),
+                ],
             );
             model.operations.push(Operation {
                 id: operation_id.clone(),
@@ -2404,6 +2422,9 @@ fn add_dataflow(krate: &Crate, model: &mut ModelIr) {
                 },
                 shape_rule: shape_rule(&effect.name).to_string(),
                 domain_rule: effect.domain_rule_label(),
+                execution_phase: Some(phase),
+                avg_duration_ns: None,
+                timing_samples: None,
                 evidence: vec![Evidence {
                     kind: EvidenceKind::Source,
                     confidence: Confidence::Proven,
@@ -2436,7 +2457,7 @@ fn add_dataflow(krate: &Crate, model: &mut ModelIr) {
                 vec![function_id.clone()],
             );
         }
-        let inference_entrypoint = !is_loss;
+        let inference_entrypoint = phase == crate::phase::ExecutionPhase::Infer;
         for violation in &graph.numeric_domain_violations {
             let (severity, confidence) =
                 numeric_finding_severity(violation.proven, violation.impact, inference_entrypoint);
@@ -2497,6 +2518,7 @@ fn add_dataflow(krate: &Crate, model: &mut ModelIr) {
                 related,
             );
         }
+        } // execution phase
     }
 }
 
@@ -2572,6 +2594,25 @@ fn link_implicit_parameter_reads(
             parameter.uses.push(operation_id.clone());
         }
     }
+}
+
+fn aggregate_edge_timings(trace: &RuntimeTrace) -> Vec<EdgeTimingSummary> {
+    let mut edge_totals: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
+    for edge in &trace.edge_timings {
+        let key = (edge.from_static_id.clone(), edge.to_static_id.clone());
+        let entry = edge_totals.entry(key).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(edge.duration_ns);
+        entry.1 += 1;
+    }
+    edge_totals
+        .into_iter()
+        .map(|((from, to), (total, samples))| EdgeTimingSummary {
+            from: StableId(from),
+            to: StableId(to),
+            avg_duration_ns: if samples > 0 { total / samples } else { 0 },
+            samples,
+        })
+        .collect()
 }
 
 fn merge_runtime(model: &mut ModelIr, trace: &RuntimeTrace) {
@@ -2658,15 +2699,46 @@ fn merge_runtime(model: &mut ModelIr, trace: &RuntimeTrace) {
                 .iter_mut()
                 .find(|operation| operation.id.0 == static_id)
             {
+                let mut detail = format!(
+                    "runtime operation {} observed as {}",
+                    observation.event_id, observation.op
+                );
+                if let Some(duration_ns) = observation.duration_ns {
+                    detail.push_str(&format!(" duration_ns={duration_ns}"));
+                }
                 operation.evidence.push(Evidence {
                     kind: EvidenceKind::Runtime,
                     confidence: Confidence::Proven,
                     source: observation.source.clone(),
-                    detail: format!(
-                        "runtime operation {} observed as {}",
-                        observation.event_id, observation.op
-                    ),
+                    detail,
                 });
+            }
+        }
+        let mut op_duration_totals: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        for observation in &trace.operations {
+            let Some(static_id) = observation.static_id.as_deref() else {
+                continue;
+            };
+            let Some(duration_ns) = observation.duration_ns else {
+                continue;
+            };
+            let entry = op_duration_totals
+                .entry(static_id.to_string())
+                .or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(duration_ns);
+            entry.1 += 1;
+        }
+        for (static_id, (total, samples)) in op_duration_totals {
+            if samples == 0 {
+                continue;
+            }
+            if let Some(operation) = model
+                .operations
+                .iter_mut()
+                .find(|operation| operation.id.0 == static_id)
+            {
+                operation.avg_duration_ns = Some(total / samples);
+                operation.timing_samples = Some(samples);
             }
         }
         for identity in audit
@@ -2761,7 +2833,18 @@ fn merge_runtime(model: &mut ModelIr, trace: &RuntimeTrace) {
     model.coverage.runtime_observations = trace.tensors.len()
         + trace.operations.len()
         + trace.gradients.len()
-        + trace.values.len();
+        + trace.values.len()
+        + trace.edge_timings.len();
+    let edge_timing_summaries = aggregate_edge_timings(trace);
+    let avg_operation_duration_ns = trace
+        .operations
+        .iter()
+        .filter_map(|op| op.duration_ns)
+        .reduce(|a, b| a.saturating_add(b))
+        .and_then(|total| {
+            let count = trace.operations.iter().filter(|op| op.duration_ns.is_some()).count();
+            (count > 0).then_some(total / count as u64)
+        });
     model.runtime = Some(RuntimeSummary {
         trace_schema: trace.schema.clone(),
         entrypoint: Some(trace.run.entrypoint.clone()),
@@ -2778,6 +2861,13 @@ fn merge_runtime(model: &mut ModelIr, trace: &RuntimeTrace) {
         first_non_finite_step: audit.first_non_finite_step,
         saturating_activations: audit.saturating_activations.len(),
         value_observations: trace.values.len(),
+        execution_phase: trace
+            .run
+            .phase
+            .as_deref()
+            .and_then(crate::phase::ExecutionPhase::parse),
+        avg_operation_duration_ns,
+        edge_timings: edge_timing_summaries,
     });
 }
 

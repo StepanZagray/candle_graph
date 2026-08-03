@@ -128,6 +128,7 @@ fn streaming_writer_emits_importable_static_ids_and_gradients() {
         cfg: vec![],
         analysis_id: Some("analysis:candle-graph%2Fbuild%2F1%3Aabc".into()),
         build_id: Some("candle-graph/build/1:abc".into()),
+        phase: None,
     };
     let mut writer = RuntimeTraceWriter::new(Vec::new(), run).unwrap();
     writer
@@ -152,6 +153,8 @@ fn streaming_writer_emits_importable_static_ids_and_gradients() {
             source: Some("model::step head".into()),
             inputs: vec!["step-0-input".into()],
             output: Some("step-0-output".into()),
+            step: None,
+            duration_ns: None,
         })
         .unwrap();
     writer
@@ -190,6 +193,7 @@ fn streaming_writer_rejects_duplicate_ids_and_invalid_gradients() {
         cfg: vec![],
         analysis_id: None,
         build_id: None,
+        phase: None,
     };
     let mut writer = RuntimeTraceWriter::new(Vec::new(), run).unwrap();
     let tensor = TensorObservation {

@@ -23,11 +23,13 @@ pub mod load;
 pub mod model_baseline;
 pub mod model_ir;
 pub mod op_semantics;
+pub mod phase;
+pub mod profile;
 pub mod query;
 pub mod report;
 pub mod runtime;
 pub mod verify;
 pub mod viewer;
 
-pub use extract::Extractor;
+pub use phase::ExecutionPhase;
 pub use ir::Structure;

@@ -53,6 +53,8 @@ enum Command {
     Query(QueryArgs),
     /// Write a multi-file audit bundle for agent / CI consumption.
     Audit(AuditArgs),
+    /// Merge static analysis with a runtime v3 profile trace (timings + phase).
+    Profile(ProfileArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -174,6 +176,24 @@ struct AuditArgs {
 }
 
 #[derive(Parser, Debug)]
+struct ProfileArgs {
+    /// Runtime profile trace (`candle-graph/runtime/3` JSON or JSONL).
+    #[arg(long, value_name = "FILE")]
+    runtime_trace: PathBuf,
+
+    /// Package directory to analyze. Defaults to the current directory.
+    #[arg(value_name = "PATH")]
+    path: Option<PathBuf>,
+
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// Write profile query JSON to a file instead of stdout.
+    #[arg(long, value_name = "FILE")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
 struct CommonArgs {
     /// Path to `Cargo.toml` for the package under analysis.
     #[arg(long, value_name = "PATH")]
@@ -229,6 +249,7 @@ fn main() -> Result<()> {
         Command::Report(report) => run_report(report),
         Command::Query(query) => run_query(query),
         Command::Audit(audit) => run_audit(audit),
+        Command::Profile(profile) => run_profile(profile),
     }
 }
 
@@ -316,6 +337,31 @@ fn run_audit(args: AuditArgs) -> Result<()> {
             deny_rules: args.common.deny.clone(),
             strict: args.strict,
         }),
+    })
+}
+
+fn run_profile(args: ProfileArgs) -> Result<()> {
+    let path =
+        cli::resolve_package_path(args.path.as_deref(), args.common.manifest_path.as_deref())?;
+    let mut analyze = analyze_request(&args.common, path);
+    analyze.runtime_trace = Some(args.runtime_trace);
+    cli::run_model(&ModelRun {
+        analyze,
+        report: ReportMode::Query {
+            kind: "profile".into(),
+            selector: None,
+            to: None,
+            limit: 100,
+            offset: 0,
+            format: OutputFormat::Json,
+        },
+        output: args.output.or(args.common.output),
+        diagnostics: None,
+        fail_on_warning_error: false,
+        deny_rules: args.common.deny.clone(),
+        check_baseline: None,
+        update_baseline: None,
+        audit: None,
     })
 }
 

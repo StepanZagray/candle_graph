@@ -44,6 +44,9 @@ Compact-by-default rules:
 | What is the training pipeline order and subprocess CLI? | `pipeline`, `stages`, `stages --select latent` |
 | Which Cargo features, cfg values, target, and Candle versions apply? | `cargo` |
 | What did a runtime probe observe? | `runtime` |
+| What does the train-phase graph contain? | `graph-train`, `graph_train` |
+| What does the infer-phase graph contain? | `graph-infer`, `graph_infer` |
+| What are the slowest profiled operations? | `profile` (requires v3 `--runtime-trace`) |
 | What is uncertain or broken? | `findings`, then `findings --select <exact-id>` |
 | Is there a static tensor/dataflow path between two selectors? | `path --select <from> --to <to>` |
 
@@ -65,7 +68,16 @@ cargo run --release -- /path/to/model --query tensors \
   --select 'MyModel::forward' --limit 20 --format json
 cargo run --release -- /path/to/model --query tensor \
   --select '<tensor-stable-id>' --format json
+cargo run --release -- /path/to/model \
+  --runtime-trace run.runtime.json --query runtime --format json
+cargo run --release -- /path/to/model --query graph-train --format json
+cargo run --release -- /path/to/model --query graph-infer --format json
+cargo run --release -- /path/to/model \
+  --runtime-trace profile.jsonl --query profile --format json
 ```
+
+See [runtime-analysis-guide.md](runtime-analysis-guide.md) for when to use each runtime query and how
+to emit traces from model code.
 
 Recommended agent workflow for modular model development:
 

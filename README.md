@@ -15,6 +15,8 @@ loads checkpoint tensor payloads or requires a GPU for static analysis.
 - `candle-graph/query/1`: deterministic, bounded agent queries with fully qualified selectors,
   compact-by-default progressive disclosure, and `limit`/`offset` pagination;
 - `candle-graph/runtime/1`: JSON/JSONL tensor observations and per-parameter gradient facts;
+  see [docs/runtime-analysis-guide.md](docs/runtime-analysis-guide.md) for the full workflow and
+  v2 (time series) / v3 (profiler) extensions;
 - the original single-root tree, key list, baseline, checkpoint-header verification, dataflow
   report, and standalone HTML viewer.
 
@@ -133,8 +135,10 @@ cargo run --release -- /path/to/model \
   --query runtime --format json
 ```
 
-See [docs/agent-query-api.md](docs/agent-query-api.md) for the query map and
-[docs/runtime-protocol.md](docs/runtime-protocol.md) for the trace schema.
+See [docs/agent-query-api.md](docs/agent-query-api.md) for the query map,
+[docs/runtime-protocol.md](docs/runtime-protocol.md) for trace field definitions, and
+[docs/runtime-analysis-guide.md](docs/runtime-analysis-guide.md) for the recommended runtime workflow
+(gradient audit, phase graphs, offline profiling).
 
 The original single-component workflows remain available:
 

@@ -371,6 +371,7 @@ mod tests {
             tensor_outputs: Vec::new(),
             is_entrypoint: true,
             is_loss: false,
+            execution_phases: Vec::new(),
         });
         model.findings.push(Finding {
             id: StableId::new("finding", ["compiler-semantic-evidence"]),

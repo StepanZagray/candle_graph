@@ -11,6 +11,7 @@ use syn::spanned::Spanned;
 
 use crate::ir::SrcSpan;
 use crate::load::{self, Crate, ImplFn};
+use crate::phase::ExecutionPhase;
 use crate::op_semantics::{
     self, affine_domain, domain_includes_zero, domain_violation, library_body, AbstractDtype,
     BodyAtom, DomainRequirement, DomainViolationConfidence, DtypeRule, GradFlow, LibraryBody,
@@ -229,6 +230,18 @@ impl ExprGraph {
                 matches!(self.node(*id).grad, GradState::Trainable) && !reachable.contains(id)
             })
             .collect()
+    }
+
+    /// Sever autograd connectivity as in inference / `no_grad` mode.
+    pub fn apply_inference_mode(&mut self) {
+        for node in &mut self.nodes {
+            if matches!(
+                node.grad,
+                GradState::Trainable | GradState::Differentiable | GradState::LayoutDependent
+            ) {
+                node.grad = GradState::Severed;
+            }
+        }
     }
 
     /// Edges marked as severing autograd.
@@ -473,8 +486,21 @@ pub fn analyze_with_candle_version(
     entrypoint: &str,
     candle_nn_version: Option<&str>,
 ) -> anyhow::Result<ExprGraph> {
+    analyze_with_phase(krate, entrypoint, candle_nn_version, ExecutionPhase::Train)
+}
+
+/// Analyze an entrypoint for a specific execution phase (train autograd vs inference no-grad).
+pub fn analyze_with_phase(
+    krate: &Crate,
+    entrypoint: &str,
+    candle_nn_version: Option<&str>,
+    phase: ExecutionPhase,
+) -> anyhow::Result<ExprGraph> {
     let mut analyzer = Analyzer::new(krate, candle_nn_version);
     analyzer.run(entrypoint)?;
+    if phase == ExecutionPhase::Infer {
+        analyzer.graph.apply_inference_mode();
+    }
     analyzer.graph.classify_numeric_impacts();
     Ok(analyzer.graph)
 }

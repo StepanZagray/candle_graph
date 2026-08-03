@@ -156,6 +156,7 @@ impl<'a> FunctionAnalyzer<'a> {
                 device: fact.device,
                 layout: fact.layout,
                 requires_grad: fact.requires_grad,
+                execution_phase: None,
                 evidence: fact.evidence,
             })
             .collect();

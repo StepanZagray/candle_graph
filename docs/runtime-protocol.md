@@ -132,3 +132,49 @@ cargo run --release -- /path/to/model \
 
 The trace records one observed execution. It refines concrete runtime properties but never turns a
 conditional static architecture or training claim into a universal one.
+
+## Schema v2 (`candle-graph/runtime/2`)
+
+v2 adds optional `step: u64` on tensor, gradient, and value observations so a trace can represent a
+time series (JSONL or a single multi-fact document). Importers treat v1 traces as v2 with all steps
+omitted.
+
+Additional record type in v2+ documents:
+
+```json
+{
+  "event_id": "step-42-q-logit",
+  "source": "losses.q",
+  "step": 42,
+  "min": -3.1,
+  "max": 22.4,
+  "abs_max": 22.4,
+  "nonfinite_count": 0,
+  "saturated_count": 0
+}
+```
+
+Value observations support numeric-domain runtime confirmation; they are optional and must be
+emitted by the probe — the analyzer does not invent them.
+
+## Schema v3 (`candle-graph/runtime/3`)
+
+v3 extends v2 for profiling:
+
+- `run.phase`: `"train"` or `"infer"`
+- `operations[].duration_ns`: wall time for one observed op
+- `edge_timings[]`: `{ from_static_id, to_static_id, duration_ns, step? }`
+
+Emit v3 JSONL with `ProfileSession` (`candle_graph::profile`) or
+`RuntimeTraceWriter::new_with_schema(…, SCHEMA_V3, …)`.
+Merge into the model IR with:
+
+```bash
+cargo candle-graph profile --runtime-trace forward-profile.jsonl --path /path/to/model
+```
+
+## End-to-end workflow
+
+For the recommended order of operations (static gate → checkpoint audit → phase graphs → offline
+profiler), worked examples, and limitations, see
+[runtime-analysis-guide.md](runtime-analysis-guide.md).

@@ -10,9 +10,11 @@ use std::io::Write;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+
 /// Schema identifier written into every document and expected on parse.
 pub const SCHEMA: &str = "candle-graph/runtime/1";
 pub const SCHEMA_V2: &str = "candle-graph/runtime/2";
+pub const SCHEMA_V3: &str = "candle-graph/runtime/3";
 
 /// Build / process metadata for a single probe run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +37,9 @@ pub struct RunMetadata {
     /// Omitted for backward compatibility; when present, importers must check it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_id: Option<String>,
+    /// Train vs inference phase for this trace (`train` / `infer`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
 /// Expected analysis/build identity supplied by an importer when correlating a trace.
@@ -129,6 +134,23 @@ pub struct OperationObservation {
     /// Output tensor event or storage id, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// Optional training step index when the trace is a time series.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<u64>,
+    /// Wall time spent in this operation (nanoseconds), when profiled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ns: Option<u64>,
+}
+
+/// Observed data-flow edge timing between two static ids (profiler output).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeTimingObservation {
+    pub event_id: String,
+    pub from_static_id: String,
+    pub to_static_id: String,
+    pub duration_ns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<u64>,
 }
 
 /// Builder-root + parameter-key identity for gradient facts.
@@ -273,6 +295,8 @@ pub struct RuntimeTrace {
     pub gradients: Vec<GradientFact>,
     #[serde(default)]
     pub values: Vec<ValueObservation>,
+    #[serde(default)]
+    pub edge_timings: Vec<EdgeTimingObservation>,
 }
 
 /// JSONL / streaming event records that assemble into a [`RuntimeTrace`].
@@ -289,6 +313,7 @@ pub enum RuntimeEvent {
     Operation(OperationObservation),
     Gradient(GradientFact),
     Value(ValueObservation),
+    EdgeTiming(EdgeTimingObservation),
 }
 
 /// Streaming JSONL emitter for instrumented CPU or synthetic rollouts.
@@ -302,14 +327,19 @@ pub struct RuntimeTraceWriter<W: Write> {
 }
 
 impl<W: Write> RuntimeTraceWriter<W> {
-    /// Start a JSONL stream by writing its required metadata event.
+    /// Start a JSONL stream by writing its required metadata event (schema v1).
     pub fn new(writer: W, run: RunMetadata) -> Result<Self> {
+        Self::new_with_schema(writer, SCHEMA, run)
+    }
+
+    /// Start a JSONL stream with an explicit schema (`/1`, `/2`, or `/3`).
+    pub fn new_with_schema(writer: W, schema: &str, run: RunMetadata) -> Result<Self> {
         let mut output = Self {
             writer,
             seen_event_ids: HashSet::new(),
         };
         output.write_event(&RuntimeEvent::Meta {
-            schema: SCHEMA.to_string(),
+            schema: schema.to_string(),
             run,
         })?;
         Ok(output)
@@ -338,6 +368,18 @@ impl<W: Write> RuntimeTraceWriter<W> {
     pub fn value(&mut self, observation: ValueObservation) -> Result<()> {
         self.reserve_event_id(&observation.event_id)?;
         self.write_event(&RuntimeEvent::Value(observation))
+    }
+
+    /// Emit one data-flow edge timing observation (runtime v3).
+    pub fn edge_timing(&mut self, observation: EdgeTimingObservation) -> Result<()> {
+        self.reserve_event_id(&observation.event_id)?;
+        self.write_event(&RuntimeEvent::EdgeTiming(observation))
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.writer
+            .flush()
+            .context("flushing runtime JSONL trace")
     }
 
     /// Flush the stream and return the underlying writer.
@@ -478,6 +520,13 @@ impl RuntimeTrace {
                 .then_with(|| a.step.cmp(&b.step))
                 .then_with(|| a.source.cmp(&b.source))
         });
+        self.edge_timings.sort_by(|a, b| {
+            a.from_static_id
+                .cmp(&b.from_static_id)
+                .then_with(|| a.to_static_id.cmp(&b.to_static_id))
+                .then_with(|| a.step.cmp(&b.step))
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
     }
 
     /// Reject duplicate event ids and invalid gradient facts.
@@ -485,12 +534,13 @@ impl RuntimeTrace {
     /// Contradictory tensor/gradient *observations* are not rejected here; they are reported by
     /// [`Self::audit`] as Unknown conflicts so importers never silently overwrite a winner.
     pub fn validate(&self) -> Result<()> {
-        if self.schema != SCHEMA && self.schema != SCHEMA_V2 {
+        if self.schema != SCHEMA && self.schema != SCHEMA_V2 && self.schema != SCHEMA_V3 {
             bail!(
-                "unsupported runtime schema {:?}; expected {:?} or {:?}",
+                "unsupported runtime schema {:?}; expected {:?}, {:?}, or {:?}",
                 self.schema,
                 SCHEMA,
-                SCHEMA_V2
+                SCHEMA_V2,
+                SCHEMA_V3
             );
         }
 
@@ -517,6 +567,9 @@ impl RuntimeTrace {
         }
         for v in &self.values {
             push_id(&v.event_id)?;
+        }
+        for edge in &self.edge_timings {
+            push_id(&edge.event_id)?;
         }
         Ok(())
     }
@@ -904,6 +957,7 @@ pub fn parse_jsonl(input: &str) -> Result<RuntimeTrace> {
     let mut operations = Vec::new();
     let mut gradients = Vec::new();
     let mut values = Vec::new();
+    let mut edge_timings = Vec::new();
 
     for (line_no, line) in input.lines().enumerate() {
         let line = line.trim();
@@ -930,6 +984,7 @@ pub fn parse_jsonl(input: &str) -> Result<RuntimeTrace> {
             RuntimeEvent::Operation(op) => operations.push(op),
             RuntimeEvent::Gradient(g) => gradients.push(g),
             RuntimeEvent::Value(v) => values.push(v),
+            RuntimeEvent::EdgeTiming(edge) => edge_timings.push(edge),
         }
     }
 
@@ -943,6 +998,7 @@ pub fn parse_jsonl(input: &str) -> Result<RuntimeTrace> {
         operations,
         gradients,
         values,
+        edge_timings,
     }
     .finalize()
 }
