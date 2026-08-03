@@ -6,8 +6,27 @@ crate-wide model IR and bounded query API are designed so coding agents can answ
 questions without loading an entire source tree into context.
 
 The analyzer combines conservative Rust-source analysis with the Cargo configuration selected for
-the scan. An optional runtime trace can refine static tensor facts and audit gradients. It never
-loads checkpoint tensor payloads or requires a GPU for static analysis.
+the scan. With the optional `runtime` crate feature, a runtime trace can refine static tensor facts
+and audit gradients during training and inference. It never loads checkpoint tensor payloads or
+requires a GPU for static analysis.
+
+## Features
+
+- **Default (static)**: compile-time structure, dataflow, baselines, verification, and agent queries.
+- **`runtime`**: train/inference phase graphs, runtime trace import (`--runtime-trace`), gradient
+  audit, and the `profile` profiler / `cargo candle-graph profile` command.
+
+Enable runtime support when depending on this crate:
+
+```toml
+candle-graph = { version = "0.2.5", features = ["runtime"] }
+```
+
+Or when installing the CLI:
+
+```bash
+cargo install candle-graph --features runtime
+```
 
 - `candle-graph/model/1`: one unified IR for components, architecture edges, functions, modules,
   parameters, tensor contracts, stages, artifacts, optimizers, Cargo context, findings, and runtime

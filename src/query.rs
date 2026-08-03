@@ -80,18 +80,60 @@ impl std::str::FromStr for QueryKind {
             "operations" | "ops" => Ok(Self::Operations),
             "operation" | "op" => Ok(Self::Operation),
             "optimizers" | "optimizer" => Ok(Self::Optimizers),
-            "runtime" | "gradient_audit" | "gradients" => Ok(Self::Runtime),
+            "runtime" | "gradient_audit" | "gradients" => {
+                require_runtime_feature("runtime")?;
+                Ok(Self::Runtime)
+            }
             "findings" | "diagnostics" => Ok(Self::Findings),
             "path" | "trace" => Ok(Self::Path),
             "model_improvement" | "model-improvement" | "improvement" | "agent" => {
                 Ok(Self::ModelImprovement)
             }
-            "graph_train" | "graph-train" | "train_graph" | "train-graph" => Ok(Self::GraphTrain),
-            "graph_infer" | "graph-infer" | "infer_graph" | "infer-graph" => Ok(Self::GraphInfer),
-            "profile" | "profiler" | "timings" => Ok(Self::Profile),
+            "graph_train" | "graph-train" | "train_graph" | "train-graph" => {
+                require_runtime_feature("graph_train")?;
+                Ok(Self::GraphTrain)
+            }
+            "graph_infer" | "graph-infer" | "infer_graph" | "infer-graph" => {
+                require_runtime_feature("graph_infer")?;
+                Ok(Self::GraphInfer)
+            }
+            "profile" | "profiler" | "timings" => {
+                require_runtime_feature("profile")?;
+                Ok(Self::Profile)
+            }
             other => bail!("unknown query kind `{other}`"),
         }
     }
+}
+
+fn require_runtime_feature(kind: &str) -> Result<()> {
+    #[cfg(not(feature = "runtime"))]
+    {
+        bail!(
+            "query kind `{kind}` requires the `runtime` crate feature; rebuild with `--features runtime`"
+        );
+    }
+    #[cfg(feature = "runtime")]
+    {
+        let _ = kind;
+        Ok(())
+    }
+}
+
+fn ensure_runtime_query(kind: QueryKind) -> Result<()> {
+    if matches!(
+        kind,
+        QueryKind::Runtime | QueryKind::GraphTrain | QueryKind::GraphInfer | QueryKind::Profile
+    ) {
+        require_runtime_feature(match kind {
+            QueryKind::Runtime => "runtime",
+            QueryKind::GraphTrain => "graph_train",
+            QueryKind::GraphInfer => "graph_infer",
+            QueryKind::Profile => "profile",
+            _ => unreachable!(),
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +177,7 @@ pub fn execute(model: &ModelIr, request: &QueryRequest) -> Result<QueryResponse>
     if request.limit == 0 {
         bail!("query limit must be greater than zero");
     }
+    ensure_runtime_query(request.kind)?;
     let mut items = match request.kind {
         QueryKind::Summary => vec![summary(model)],
         QueryKind::Doctor => vec![doctor(model)],
@@ -504,17 +547,7 @@ pub fn execute(model: &ModelIr, request: &QueryRequest) -> Result<QueryResponse>
             })
             .map(serde_json::to_value)
             .collect::<serde_json::Result<Vec<_>>>()?,
-        QueryKind::Runtime => vec![json!({
-            "id": "runtime",
-            "summary": model.runtime,
-            "gradient_finding_count": model.findings.iter()
-                .filter(|finding| finding.rule.starts_with("runtime-"))
-                .count(),
-            "drill_down": [
-                {"kind": "findings", "select": "runtime-"},
-                {"kind": "tensors"},
-            ],
-        })],
+        QueryKind::Runtime => vec![runtime_query(model)],
         QueryKind::Findings => model
             .findings
             .iter()
@@ -765,6 +798,21 @@ fn doctor(model: &ModelIr) -> Value {
     })
 }
 
+fn runtime_query(model: &ModelIr) -> Value {
+    json!({
+        "id": "runtime",
+        "summary": model.runtime,
+        "gradient_finding_count": model.findings.iter()
+            .filter(|finding| finding.rule.starts_with("runtime-"))
+            .count(),
+        "drill_down": [
+            {"kind": "findings", "select": "runtime-"},
+            {"kind": "tensors"},
+        ],
+    })
+}
+
+#[cfg(feature = "runtime")]
 fn phase_graph(model: &ModelIr, phase: ExecutionPhase) -> Value {
     let tensors: Vec<Value> = model
         .tensors
@@ -811,6 +859,12 @@ fn phase_graph(model: &ModelIr, phase: ExecutionPhase) -> Value {
     })
 }
 
+#[cfg(not(feature = "runtime"))]
+fn phase_graph(_model: &ModelIr, _phase: ExecutionPhase) -> Value {
+    unreachable!("runtime queries require the `runtime` crate feature")
+}
+
+#[cfg(feature = "runtime")]
 fn profile_query(model: &ModelIr) -> Value {
     let mut slowest: Vec<Value> = model
         .operations
@@ -844,6 +898,11 @@ fn profile_query(model: &ModelIr) -> Value {
             {"kind": "runtime"},
         ],
     })
+}
+
+#[cfg(not(feature = "runtime"))]
+fn profile_query(_model: &ModelIr) -> Value {
+    unreachable!("runtime queries require the `runtime` crate feature")
 }
 
 fn model_improvement(model: &ModelIr) -> Value {

@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use candle_graph::discover::{self, ScanOptions};
 use candle_graph::model_ir::{BuilderRole, Confidence, ParameterRole, TensorRole};
 use candle_graph::query::{self, QueryKind, QueryRequest};
+#[cfg(feature = "runtime")]
 use candle_graph::runtime::{self, ExpectedIdentity, ObservationConfidence, SCHEMA};
 use candle_graph::verify;
 
@@ -494,6 +495,7 @@ fn parameterized_module_forward_links_parameter_uses() {
 }
 
 #[test]
+#[cfg(feature = "runtime")]
 fn runtime_trace_refines_static_contracts_and_audits_gradients() {
     let fixture = Fixture::new();
     let static_model = discover::analyze(
@@ -560,6 +562,7 @@ fn runtime_trace_refines_static_contracts_and_audits_gradients() {
 }
 
 #[test]
+#[cfg(feature = "runtime")]
 fn runtime_build_identity_mismatch_prevents_refinement() {
     let fixture = Fixture::new();
     let static_model = discover::analyze(
@@ -620,6 +623,7 @@ fn runtime_build_identity_mismatch_prevents_refinement() {
 }
 
 #[test]
+#[cfg(feature = "runtime")]
 fn runtime_conflicts_and_identity_are_unknown_not_proven_winners() {
     let fixture = Fixture::new();
     let static_model = discover::analyze(

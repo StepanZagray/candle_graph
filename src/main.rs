@@ -81,6 +81,7 @@ struct Args {
     offset: usize,
 
     /// Import runtime tensor/gradient observations (JSON or JSONL runtime schema v1).
+    #[cfg(feature = "runtime")]
     #[arg(long, value_name = "FILE")]
     runtime_trace: Option<PathBuf>,
 
@@ -369,6 +370,7 @@ fn run_model_mode(args: &Args) -> Result<()> {
         analyze: AnalyzeRequest {
             path: args.dir.clone(),
             cargo: cargo_options(args),
+            #[cfg(feature = "runtime")]
             runtime_trace: args.runtime_trace.clone(),
             component_root: args.root.clone(),
             dataflow: true,

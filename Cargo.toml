@@ -1,6 +1,6 @@
 [package]
 name = "candle-graph"
-version = "0.2.0"
+version = "0.2.5"
 edition = "2021"
 description = "Static structure and dataflow analysis for candle-rs models"
 readme = "README.md"
@@ -11,6 +11,13 @@ categories = ["development-tools", "science"]
 repository = "https://github.com/StepanZagray/candle_graph"
 documentation = "https://docs.rs/candle-graph"
 exclude = ["/target/**", "/.git/**"]
+
+[features]
+default = []
+runtime = []
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 anyhow = "1"
@@ -33,3 +40,11 @@ path = "src/main.rs"
 [[bin]]
 name = "cargo-candle-graph"
 path = "src/cargo_candle_graph.rs"
+
+[[test]]
+name = "runtime"
+required-features = ["runtime"]
+
+[[test]]
+name = "phase_profile"
+required-features = ["runtime"]

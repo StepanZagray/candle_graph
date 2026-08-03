@@ -54,6 +54,7 @@ enum Command {
     /// Write a multi-file audit bundle for agent / CI consumption.
     Audit(AuditArgs),
     /// Merge static analysis with a runtime v3 profile trace (timings + phase).
+    #[cfg(feature = "runtime")]
     Profile(ProfileArgs),
 }
 
@@ -176,6 +177,7 @@ struct AuditArgs {
 }
 
 #[derive(Parser, Debug)]
+#[cfg(feature = "runtime")]
 struct ProfileArgs {
     /// Runtime profile trace (`candle-graph/runtime/3` JSON or JSONL).
     #[arg(long, value_name = "FILE")]
@@ -208,6 +210,7 @@ struct CommonArgs {
     root: Option<String>,
 
     /// Import runtime tensor/gradient observations (JSON or JSONL runtime schema v1).
+    #[cfg(feature = "runtime")]
     #[arg(long, value_name = "FILE")]
     runtime_trace: Option<PathBuf>,
 
@@ -249,6 +252,7 @@ fn main() -> Result<()> {
         Command::Report(report) => run_report(report),
         Command::Query(query) => run_query(query),
         Command::Audit(audit) => run_audit(audit),
+        #[cfg(feature = "runtime")]
         Command::Profile(profile) => run_profile(profile),
     }
 }
@@ -340,6 +344,7 @@ fn run_audit(args: AuditArgs) -> Result<()> {
     })
 }
 
+#[cfg(feature = "runtime")]
 fn run_profile(args: ProfileArgs) -> Result<()> {
     let path =
         cli::resolve_package_path(args.path.as_deref(), args.common.manifest_path.as_deref())?;
@@ -375,6 +380,7 @@ fn analyze_request(common: &CommonArgs, path: PathBuf) -> AnalyzeRequest {
             target: common.target.clone(),
             package_target: common.cargo_target.clone(),
         },
+        #[cfg(feature = "runtime")]
         runtime_trace: common.runtime_trace.clone(),
         component_root: common.root.clone(),
         dataflow: true,

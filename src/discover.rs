@@ -5,10 +5,16 @@
 //! flow; the former syntax/name-based implementation is quarantined until that frontend exists.
 //! Optional runtime traces refine (but never erase) static facts.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(feature = "runtime")]
+use std::collections::BTreeMap;
+use std::path::Path;
+#[cfg(feature = "runtime")]
+use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(feature = "runtime")]
+use anyhow::Context;
 use quote::ToTokens;
 use syn::visit::{self, Visit};
 
@@ -21,15 +27,19 @@ use crate::model_ir::{
     ArchitectureEdge, Artifact, ArtifactKind, AssemblySite, BuilderNamespace, BuilderRole,
     BuilderSourceKind, CargoSummary, Component, Confidence, DeviceFact, Evidence, EvidenceKind,
     Finding, FindingSeverity, Function, FunctionParameter, LayoutFact, ModelIr, Module, Operation,
-    OptimizerMembership, Parameter, ParameterRole, PipelineStage, RuntimeSummary, ShapeFact,
-    EdgeTimingSummary, StableId, StageDispatchKind, StageKind, TensorContract, TensorRole, Visibility,
+    OptimizerMembership, Parameter, ParameterRole, PipelineStage, ShapeFact,
+    StableId, StageDispatchKind, StageKind, TensorContract, TensorRole, Visibility,
 };
+#[cfg(feature = "runtime")]
+use crate::model_ir::{EdgeTimingSummary, RuntimeSummary};
 use crate::op_semantics::{self, GradFlow};
+#[cfg(feature = "runtime")]
 use crate::runtime::{self, ExpectedIdentity, GradientState, RuntimeTrace};
 
 #[derive(Debug, Clone, Default)]
 pub struct ScanOptions {
     pub cargo: CargoOptions,
+    #[cfg(feature = "runtime")]
     pub runtime_trace: Option<PathBuf>,
     /// Optional component root, including private/internal model types.
     pub component_root: Option<String>,
@@ -140,6 +150,7 @@ pub fn analyze(path: impl AsRef<Path>, options: &ScanOptions) -> Result<ModelIr>
         add_dataflow(&krate, &mut model);
     }
 
+    #[cfg(feature = "runtime")]
     if let Some(path) = options.runtime_trace.as_deref() {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading runtime trace {}", path.display()))?;
@@ -2261,6 +2272,22 @@ fn apply_optimizer_roles(model: &mut ModelIr) {
     }
 }
 
+fn entrypoint_analysis_phases(
+    name: &str,
+    qualified_name: &str,
+    is_loss: bool,
+) -> Vec<crate::phase::ExecutionPhase> {
+    #[cfg(feature = "runtime")]
+    {
+        crate::phase::entrypoint_phases(name, qualified_name, is_loss)
+    }
+    #[cfg(not(feature = "runtime"))]
+    {
+        let _ = (name, qualified_name, is_loss);
+        vec![crate::phase::ExecutionPhase::Train]
+    }
+}
+
 fn add_dataflow(krate: &Crate, model: &mut ModelIr) {
     let candle_nn_version = model.cargo.as_ref().and_then(|cargo| {
         op_semantics::matched_candle_version(
@@ -2290,7 +2317,7 @@ fn add_dataflow(krate: &Crate, model: &mut ModelIr) {
         .map(|(index, function)| (function.id.clone(), index))
         .collect();
     for (function_id, name, entry, is_loss) in selected {
-        let phases = crate::phase::entrypoint_phases(&name, &entry, is_loss);
+        let phases = entrypoint_analysis_phases(&name, &entry, is_loss);
         if let Some(&function_index) = function_indices.get(&function_id) {
             model.functions[function_index].execution_phases = phases.clone();
         }
@@ -2596,6 +2623,7 @@ fn link_implicit_parameter_reads(
     }
 }
 
+#[cfg(feature = "runtime")]
 fn aggregate_edge_timings(trace: &RuntimeTrace) -> Vec<EdgeTimingSummary> {
     let mut edge_totals: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
     for edge in &trace.edge_timings {
@@ -2609,12 +2637,13 @@ fn aggregate_edge_timings(trace: &RuntimeTrace) -> Vec<EdgeTimingSummary> {
         .map(|((from, to), (total, samples))| EdgeTimingSummary {
             from: StableId(from),
             to: StableId(to),
-            avg_duration_ns: if samples > 0 { total / samples } else { 0 },
+            avg_duration_ns: total.checked_div(samples).unwrap_or(0),
             samples,
         })
         .collect()
 }
 
+#[cfg(feature = "runtime")]
 fn merge_runtime(model: &mut ModelIr, trace: &RuntimeTrace) {
     let expected = ExpectedIdentity {
         analysis_id: Some(model.analysis_id.0.clone()),
@@ -3569,6 +3598,7 @@ fn shape_rule(op: &str) -> &'static str {
     }
 }
 
+#[cfg(feature = "runtime")]
 fn parse_device(device: &str) -> DeviceFact {
     let lower = device.to_ascii_lowercase();
     if lower == "cpu" {

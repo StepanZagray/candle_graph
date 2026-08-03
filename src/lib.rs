@@ -7,6 +7,9 @@
 //!
 //! It reconstructs module and parameter structure, expression-level dtype and gradient dataflow,
 //! deterministic CI baselines, and a standalone interactive report.
+//!
+//! Compile-time static analysis is always available. Enable the `runtime` feature for
+//! train/inference phase graphs, runtime trace import, gradient audit, and profiling.
 
 pub mod analysis_cache;
 pub mod baseline;
@@ -24,9 +27,11 @@ pub mod model_baseline;
 pub mod model_ir;
 pub mod op_semantics;
 pub mod phase;
+#[cfg(feature = "runtime")]
 pub mod profile;
 pub mod query;
 pub mod report;
+#[cfg(feature = "runtime")]
 pub mod runtime;
 pub mod verify;
 pub mod viewer;

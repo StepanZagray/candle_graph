@@ -47,6 +47,7 @@ pub enum ReportMode {
 pub struct AnalyzeRequest {
     pub path: PathBuf,
     pub cargo: CargoOptions,
+    #[cfg(feature = "runtime")]
     pub runtime_trace: Option<PathBuf>,
     pub component_root: Option<String>,
     pub dataflow: bool,
@@ -105,6 +106,7 @@ pub fn analyze_model(request: &AnalyzeRequest) -> Result<ModelIr> {
 fn analyze_model_uncached(request: &AnalyzeRequest) -> Result<ModelIr> {
     let options = ScanOptions {
         cargo: request.cargo.clone(),
+        #[cfg(feature = "runtime")]
         runtime_trace: request.runtime_trace.clone(),
         component_root: request.component_root.clone(),
         dataflow: request.dataflow,
@@ -210,7 +212,12 @@ fn write_checkpoint_audit(
 ) -> Result<()> {
     let header = verify::read_header(checkpoint)?;
     let root = verify_root
-        .or_else(|| model.components.first().map(|c| c.builders.first().map(|b| b.name.as_str())).flatten())
+        .or_else(|| {
+            model
+                .components
+                .first()
+                .and_then(|c| c.builders.first().map(|b| b.name.as_str()))
+        })
         .unwrap_or("vb");
     let mut structure = legacy_structure_for_verify(request, root)?;
     let report = verify::verify(&mut structure, &header, root);
@@ -264,6 +271,7 @@ fn run_audit_bundle(model: &ModelIr, request: &AnalyzeRequest, audit: &AuditBund
         Some(&audit.output_dir.join("model-ir.json")),
         rendered.as_bytes(),
     )?;
+    #[cfg(feature = "runtime")]
     if let Some(runtime) = &request.runtime_trace {
         write_query(model, QueryKind::Runtime, &audit.output_dir.join("runtime.json"))?;
         let _ = runtime;
