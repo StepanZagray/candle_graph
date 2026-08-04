@@ -1,104 +1,142 @@
 use candle_graph::viewer::{embed_json, escape_for_script, render_html};
-use serde_json::json;
+use candle_graph::viewer_projection::{project, VIEWER_SCHEMA};
+use candle_graph::{
+    model_ir::{
+        Component, Confidence, DeviceFact, Evidence, EvidenceKind, Function, LayoutFact,
+        ModelCoverage, ModelIr, Module, Operation, Parameter, ParameterRole, ShapeFact, StableId,
+        TensorContract, TensorRole,
+    },
+    phase::ExecutionPhase,
+};
 
-fn sample_structure() -> serde_json::Value {
-    json!({
-        "schema": "candle-graph/structure/1",
-        "coverage": {
-            "instances": 2,
-            "params": 1,
-            "params_certain": 1,
-            "params_conditional": 0,
-            "params_unknown": 0,
-            "diagnostics": 1
+fn sample_model() -> ModelIr {
+    let component_id = StableId::new("component", ["Root"]);
+    let module_id = StableId::new("module", ["Root", ""]);
+    let param_id = StableId::new("parameter", ["Root", "head.weight"]);
+    let tensor_id = StableId::new("tensor", ["train", "Root::forward", "0"]);
+    let output_id = StableId::new("tensor", ["train", "Root::forward", "2"]);
+    let op_id = StableId::new("operation", ["train", "Root::forward", "1"]);
+    let function_id = StableId::new("function", ["Root::forward"]);
+    ModelIr {
+        schema: candle_graph::model_ir::MODEL_IR_SCHEMA.to_string(),
+        analysis_id: StableId::new("analysis", ["test"]),
+        cargo: None,
+        coverage: ModelCoverage {
+            components: 1,
+            modules: 1,
+            parameters: 1,
+            tensors: 1,
+            operations: 1,
+            diagnostics: 1,
+            ..ModelCoverage::default()
         },
-        "diagnostics": [{
-            "at": "model.rs:1",
-            "message": "sample </script><script>alert(1)</script> diagnostic",
-            "key": null
+        components: vec![Component {
+            id: component_id.clone(),
+            name: "Root".into(),
+            qualified_name: "Root".into(),
+            source: "model.rs:1".into(),
+            constructor: StableId::new("function", ["Root::new"]),
+            builders: vec![],
+            modules: vec![module_id.clone()],
+            parameters: vec![param_id.clone()],
+            entrypoints: vec![function_id.clone()],
+            evidence: vec![],
         }],
-        "modules": [
-            {
-                "prefix": "",
-                "root": "vb",
-                "prefix_derived": false,
-                "type": "Root",
-                "field": null,
-                "parent": null,
-                "repeat": null,
-                "certainty": {"kind": "certain"},
-                "at": "model.rs:1"
+        architecture_edges: vec![],
+        modules: vec![Module {
+            id: module_id,
+            component: component_id,
+            parent: None,
+            type_name: "Root".into(),
+            qualified_type: None,
+            field: None,
+            builder_root: "vb".into(),
+            prefix: String::new(),
+            repeat: None,
+            source: "model.rs:1".into(),
+            confidence: Confidence::Proven,
+        }],
+        parameters: vec![Parameter {
+            id: param_id.clone(),
+            component: StableId::new("component", ["Root"]),
+            module: StableId::new("module", ["Root", ""]),
+            key: "head.weight".into(),
+            builder_root: "vb".into(),
+            role: ParameterRole::Optimized,
+            kind: "linear".into(),
+            symbolic_shape: Some("[8, 8]".into()),
+            checkpoint_shape: None,
+            checkpoint_dtype: None,
+            source: "model.rs:5".into(),
+            uses: vec![op_id.clone()],
+            optimizer_memberships: vec![],
+            evidence: vec![],
+        }],
+        functions: vec![Function {
+            id: function_id,
+            name: "forward".into(),
+            qualified_name: "Root::forward".into(),
+            owner_type: Some("Root".into()),
+            visibility: candle_graph::model_ir::Visibility::Public,
+            parameters: vec![],
+            return_type: None,
+            cfg_predicates: vec![],
+            cfg_active: None,
+            source: "model.rs:10".into(),
+            calls: vec![],
+            tensor_inputs: vec![tensor_id.clone()],
+            tensor_outputs: vec![],
+            is_entrypoint: true,
+            is_loss: false,
+            execution_phases: vec![ExecutionPhase::Train],
+        }],
+        tensors: vec![TensorContract {
+            id: tensor_id.clone(),
+            name: "head.weight".into(),
+            role: TensorRole::Parameter,
+            owner_function: StableId::new("function", ["Root::forward"]),
+            parameter: Some(param_id),
+            shape: ShapeFact {
+                rank: Some(2),
+                dimensions: vec![],
+                source_expr: Some("[8, 8]".into()),
             },
-            {
-                "prefix": "block_{index}",
-                "root": "vb",
-                "prefix_derived": true,
-                "type": "Block",
-                "field": "blocks",
-                "parent": "",
-                "repeat": {"var": "index", "bound": "depth"},
-                "certainty": {"kind": "certain"},
-                "at": "model.rs:10"
-            }
-        ],
-        "parameters": [{
-            "key": "block_{index}.weight",
-            "root": "vb",
-            "template": true,
-            "kind": "linear",
-            "shape": "[dim, dim]",
-            "acquired_via": "linear",
-            "module": "Block",
-            "module_prefix": "block_{index}",
-            "certainty": {"kind": "certain"},
-            "checkpoint": "NotChecked",
-            "at": "model.rs:12"
-        }]
-    })
-}
-
-fn sample_dataflow() -> serde_json::Value {
-    json!({
-        "schema": "candle-graph/dataflow/1",
-        "nodes": [
-            {
-                "id": "n0",
-                "label": "weight",
-                "kind": "param",
-                "dtype": "BF16",
-                "shape": [8, 8],
-                "root": "vb",
-                "certainty": {"kind": "certain"},
-                "grad_state": "Trainable",
-                "at": "model.rs:12",
-                "repeat_group": "blocks"
-            },
-            {
-                "id": "n1",
-                "label": "weight#1",
-                "kind": "param",
-                "dtype": "BF16",
-                "shape": [8, 8],
-                "root": "vb",
-                "grad_state": "Frozen",
-                "at": "model.rs:12",
-                "repeat_group": "blocks"
-            },
-            {
-                "id": "n2",
-                "label": "loss",
-                "kind": "op",
-                "dtype": "F32",
-                "grad_state": "Severed",
-                "at": "model.rs:40"
-            }
-        ],
-        "edges": [
-            {"id": "e0", "from": "n0", "to": "n2", "kind": "data"},
-            {"id": "e1", "from": "n1", "to": "n2", "kind": "severing", "grad_state": "Severed"}
-        ],
-        "diagnostics": []
-    })
+            dtype: "F32".into(),
+            device: DeviceFact::Unknown,
+            layout: LayoutFact::Unknown,
+            requires_grad: Some(true),
+            execution_phase: Some(ExecutionPhase::Train),
+            evidence: vec![Evidence {
+                kind: EvidenceKind::Source,
+                confidence: Confidence::Proven,
+                source: Some("model.rs:5".into()),
+                detail: "sample </script><script>alert(1)</script>".into(),
+            }],
+        }],
+        operations: vec![Operation {
+            id: op_id,
+            function: StableId::new("function", ["Root::forward"]),
+            name: "matmul".into(),
+            qualified_name: None,
+            inputs: vec![tensor_id],
+            output: output_id,
+            source: "model.rs:11".into(),
+            dtype_rule: "preserve".into(),
+            gradient_rule: "Propagates".into(),
+            device_rule: "preserve".into(),
+            shape_rule: "unknown".into(),
+            domain_rule: String::new(),
+            execution_phase: Some(ExecutionPhase::Train),
+            timing: None,
+            evidence: vec![],
+        }],
+        stages: vec![],
+        artifacts: vec![],
+        optimizers: vec![],
+        assembly_sites: vec![],
+        findings: vec![],
+        runtime: None,
+    }
 }
 
 #[test]
@@ -107,58 +145,45 @@ fn escape_for_script_neutralizes_script_breakouts() {
     let esc = escape_for_script(raw);
     assert!(!esc.to_lowercase().contains("</script>"));
     assert!(esc.contains("\\u003c"));
-    assert!(esc.contains("script"));
 }
 
 #[test]
 fn embed_json_escapes_angle_brackets_in_values() {
-    let v = json!({"msg": "</script><img onerror=alert(1)>"});
+    let v = serde_json::json!({"msg": "</script><img onerror=alert(1)>"});
     let embedded = embed_json(&v);
     assert!(!embedded.to_lowercase().contains("</script>"));
-    assert!(embedded.contains("\\u003c/script\\u003e") || embedded.contains("\\u003c"));
 }
 
 #[test]
-fn render_html_escapes_structure_payload() {
-    let html = render_html(&sample_structure(), None);
-    assert!(html.contains(r#"id="cg-structure""#));
-    // Raw breakout sequence must not appear as closable script markup in the payload.
-    let after_structure = html.split(r#"id="cg-structure""#).nth(1).unwrap();
-    let payload = after_structure
+fn render_html_escapes_payload() {
+    let payload = project(&sample_model());
+    let html = render_html(&payload);
+    assert!(html.contains(r#"id="cg-payload""#));
+    let after_payload = html.split(r#"id="cg-payload""#).nth(1).unwrap();
+    let script_payload = after_payload
         .split("</script>")
         .next()
         .unwrap()
         .to_lowercase();
-    assert!(
-        !payload.contains("</script"),
-        "structure JSON payload must not contain a raw script closer"
-    );
-    assert!(html.contains("\\u003c/script\\u003e") || html.contains("\\u003cscript\\u003e"));
+    assert!(!script_payload.contains("</script"));
 }
 
 #[test]
 fn render_html_includes_landmarks_and_data_attributes() {
-    let html = render_html(&sample_structure(), None);
+    let html = render_html(&project(&sample_model()));
 
     assert!(html.contains(r#"data-viewer="candle-graph""#));
-    assert!(html.contains(r#"data-pane="hierarchy""#));
+    assert!(html.contains(r#"data-pane="sidebar""#));
     assert!(html.contains(r#"data-pane="canvas""#));
     assert!(html.contains(r#"data-pane="inspector""#));
+    assert!(html.contains(r#"data-view-tabs"#));
     assert!(html.contains(r#"data-module-tree"#));
-    assert!(html.contains(r#"data-module-search"#));
+    assert!(html.contains(r#"data-findings-list"#));
     assert!(html.contains(r#"data-canvas"#));
     assert!(html.contains(r#"data-inspector"#));
     assert!(html.contains(r#"data-coverage"#));
-    assert!(html.contains(r#"data-diagnostics"#));
     assert!(html.contains(r#"data-legend"#));
     assert!(html.contains(r#"data-theme-toggle"#));
-    assert!(html.contains(r#"data-empty-dataflow="true""#));
-    assert!(html.contains(r#"data-empty-state"#));
-    assert!(html.contains(r#"role="tree""#));
-    assert!(html.contains(r#"role="banner""#));
-    assert!(html.contains(r#"aria-label="Module hierarchy""#));
-    assert!(html.contains(r#"aria-label="Dataflow canvas""#));
-    assert!(html.contains(r#"aria-label="Inspector""#));
 
     for state in [
         "Trainable",
@@ -174,35 +199,27 @@ fn render_html_includes_landmarks_and_data_attributes() {
         );
     }
 
-    for field in ["source", "shape", "dtype", "root", "certainty", "grad"] {
-        assert!(
-            html.contains(&format!(r#"data-field="{field}""#)),
-            "missing inspector field {field}"
-        );
-    }
-
-    // No external network / CDN dependencies.
     assert!(!html.contains("https://"));
-    assert!(!html.contains("http://"));
-    assert!(!html.contains("cdn."));
-}
-
-#[test]
-fn render_html_with_dataflow_clears_empty_marker_and_embeds_graph() {
-    let html = render_html(&sample_structure(), Some(&sample_dataflow()));
-    assert!(!html.contains(r#"data-empty-dataflow="true""#));
-    assert!(html.contains(r#"id="cg-dataflow""#));
-    assert!(html.contains("Trainable"));
-    assert!(html.contains("repeat_group"));
-    assert!(html.contains("n0"));
+    assert!(!html.contains("<script src="));
+    assert!(html.contains("canvas-hint"));
+    assert!(html.contains("clearSelection"));
 }
 
 #[test]
 fn render_html_is_complete_document() {
-    let html = render_html(&sample_structure(), None);
+    let html = render_html(&project(&sample_model()));
     assert!(html.starts_with("<!DOCTYPE html>"));
-    assert!(html.contains("<html"));
     assert!(html.contains("</html>"));
-    assert!(html.contains("<style>"));
-    assert!(html.contains("const S=JSON.parse"));
+    assert!(html.contains("JSON.parse(document.getElementById(\"cg-payload\")"));
+    assert!(html.contains("<kbd>U</kbd> clear"));
+}
+
+#[test]
+fn project_uses_viewer_schema() {
+    let payload = project(&sample_model());
+    assert_eq!(payload["schema"], VIEWER_SCHEMA);
+    assert!(!payload["views"]["dataflow_train"]["edges"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }

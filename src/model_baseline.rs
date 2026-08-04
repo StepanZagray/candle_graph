@@ -1,7 +1,4 @@
 //! Deterministic ModelIr fingerprints for crate-wide CI checks.
-//!
-//! Unlike the legacy structure baseline, this captures stable identities from the unified
-//! `candle-graph/model/1` IR: components, parameters, entrypoints, and finding codes.
 
 use std::fmt;
 use std::fs;

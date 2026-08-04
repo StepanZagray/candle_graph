@@ -10,7 +10,6 @@ use std::io::Write;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-
 /// Schema identifier written into every document and expected on parse.
 pub const SCHEMA: &str = "candle-graph/runtime/1";
 pub const SCHEMA_V2: &str = "candle-graph/runtime/2";
@@ -377,9 +376,7 @@ impl<W: Write> RuntimeTraceWriter<W> {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.writer
-            .flush()
-            .context("flushing runtime JSONL trace")
+        self.writer.flush().context("flushing runtime JSONL trace")
     }
 
     /// Flush the stream and return the underlying writer.
@@ -897,10 +894,7 @@ fn latest_agreed_gradient<'a>(facts: &[&'a GradientFact]) -> Option<&'a Gradient
     if facts.is_empty() || !facts.iter().all(|g| g.step.is_some()) {
         return None;
     }
-    facts
-        .iter()
-        .copied()
-        .max_by_key(|g| g.step.unwrap_or(0))
+    facts.iter().copied().max_by_key(|g| g.step.unwrap_or(0))
 }
 
 fn float_eq(a: f64, b: f64) -> bool {

@@ -26,6 +26,29 @@ pub struct CargoOptions {
     pub package_target: Option<String>,
 }
 
+/// Names in candle-graph's own `[features]` table — not valid on arbitrary model crates.
+const CANDLE_GRAPH_FEATURES: &[&str] = &["static", "visualizer", "runtime", "all"];
+
+impl CargoOptions {
+    /// Strip feature flags that refer to candle-graph itself, not the crate under analysis.
+    ///
+    /// Users often run `cargo candle-graph view --features visualizer` (or `--features all`)
+    /// intending to enable the HTML visualizer on candle-graph. Those flags must not be
+    /// forwarded to `cargo metadata` for the analyzed model crate.
+    pub fn strip_candle_graph_features(&mut self) -> Vec<String> {
+        let mut stripped = Vec::new();
+        self.features.retain(|feature| {
+            if CANDLE_GRAPH_FEATURES.contains(&feature.as_str()) {
+                stripped.push(feature.clone());
+                false
+            } else {
+                true
+            }
+        });
+        stripped
+    }
+}
+
 /// One compile target of the selected package (lib, bin, …).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CargoTarget {

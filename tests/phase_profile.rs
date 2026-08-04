@@ -50,8 +50,10 @@ pub fn forward(x: Var) -> Result<Tensor> {
 "#;
     let fixture = write_temp_model(SRC);
     let krate = candle_graph::load::load(fixture.path()).unwrap();
-    let train = dataflow::analyze_with_phase(&krate, "forward", None, ExecutionPhase::Train).unwrap();
-    let infer = dataflow::analyze_with_phase(&krate, "forward", None, ExecutionPhase::Infer).unwrap();
+    let train =
+        dataflow::analyze_with_phase(&krate, "forward", None, ExecutionPhase::Train).unwrap();
+    let infer =
+        dataflow::analyze_with_phase(&krate, "forward", None, ExecutionPhase::Infer).unwrap();
     let train_active = train
         .nodes
         .iter()
@@ -78,10 +80,7 @@ pub fn forward(x: Var) -> Result<Tensor> {
 
 #[test]
 fn profile_session_emits_timed_operations_and_edges() {
-    let path = std::env::temp_dir().join(format!(
-        "candle-graph-profile-{}",
-        std::process::id()
-    ));
+    let path = std::env::temp_dir().join(format!("candle-graph-profile-{}", std::process::id()));
     let mut session = ProfileSession::open(
         &path,
         ProfileConfig {
@@ -94,7 +93,9 @@ fn profile_session_emits_timed_operations_and_edges() {
         .begin_operation("operation:train:Model::forward:0", "matmul", &[])
         .unwrap();
     std::thread::sleep(std::time::Duration::from_micros(100));
-    let duration = session.end_operation(&event, Some("tensor-out".into())).unwrap();
+    let duration = session
+        .end_operation(&event, Some("tensor-out".into()))
+        .unwrap();
     assert!(duration > 0);
     session
         .record_edge_timing(
@@ -153,11 +154,7 @@ impl Model {
     assert!(train_tensors > 0);
     assert!(infer_tensors > 0);
 
-    let graph_train = query::execute(
-        &model,
-        &QueryRequest::new(QueryKind::GraphTrain),
-    )
-    .unwrap();
+    let graph_train = query::execute(&model, &QueryRequest::new(QueryKind::GraphTrain)).unwrap();
     assert!(graph_train.items[0]["tensor_count"].as_u64().unwrap() > 0);
 }
 
@@ -179,10 +176,7 @@ impl Drop for TempModel {
 
 fn write_temp_model(source: &str) -> TempModel {
     let id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!(
-        "candle-graph-phase-{}-{id}",
-        std::process::id()
-    ));
+    let root = std::env::temp_dir().join(format!("candle-graph-phase-{}-{id}", std::process::id()));
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(
         root.join("Cargo.toml"),
@@ -204,7 +198,9 @@ fn runtime_v3_jsonl_roundtrip_includes_edge_timings() {
         build_id: None,
         phase: Some("infer".into()),
     };
-    let mut writer = runtime::RuntimeTraceWriter::new_with_schema(Cursor::new(Vec::new()), SCHEMA_V3, run).unwrap();
+    let mut writer =
+        runtime::RuntimeTraceWriter::new_with_schema(Cursor::new(Vec::new()), SCHEMA_V3, run)
+            .unwrap();
     writer
         .operation(OperationObservation {
             event_id: "op-1".into(),

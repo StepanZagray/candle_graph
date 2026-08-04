@@ -122,7 +122,12 @@ impl ProfileSession {
         inputs: &[String],
     ) -> Result<String> {
         self.event_counter += 1;
-        let event_id = format!("{}-op-{}-{}", self.phase.as_str(), self.step, self.event_counter);
+        let event_id = format!(
+            "{}-op-{}-{}",
+            self.phase.as_str(),
+            self.step,
+            self.event_counter
+        );
         self.active.insert(
             event_id.clone(),
             ActiveOp {

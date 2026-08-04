@@ -10,9 +10,10 @@ use anyhow::{Context, Result};
 use crate::model_ir::ModelIr;
 
 pub fn cache_enabled(explicit: bool) -> bool {
-    explicit || std::env::var("CANDLE_GRAPH_CACHE")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    explicit
+        || std::env::var("CANDLE_GRAPH_CACHE")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
 }
 
 pub fn cache_dir() -> PathBuf {
@@ -21,7 +22,10 @@ pub fn cache_dir() -> PathBuf {
         .or_else(|_| {
             std::env::var("XDG_CACHE_HOME")
                 .map(|home| PathBuf::from(home).join("candle-graph"))
-                .or_else(|_| std::env::var("HOME").map(|home| PathBuf::from(home).join(".cache/candle-graph")))
+                .or_else(|_| {
+                    std::env::var("HOME")
+                        .map(|home| PathBuf::from(home).join(".cache/candle-graph"))
+                })
         })
         .unwrap_or_else(|_| PathBuf::from("/tmp/candle-graph-cache"))
 }
@@ -40,8 +44,7 @@ pub fn load(path: &Path) -> Result<Option<ModelIr>> {
     }
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading analysis cache {}", path.display()))?;
-    let model: ModelIr =
-        serde_json::from_str(&text).context("parsing cached model IR")?;
+    let model: ModelIr = serde_json::from_str(&text).context("parsing cached model IR")?;
     Ok(Some(model))
 }
 
@@ -51,6 +54,7 @@ pub fn save(path: &Path, model: &ModelIr) -> Result<()> {
             .with_context(|| format!("creating cache dir {}", parent.display()))?;
     }
     let text = serde_json::to_string(model).context("serializing model IR for cache")?;
-    std::fs::write(path, text).with_context(|| format!("writing analysis cache {}", path.display()))?;
+    std::fs::write(path, text)
+        .with_context(|| format!("writing analysis cache {}", path.display()))?;
     Ok(())
 }

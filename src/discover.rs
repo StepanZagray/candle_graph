@@ -5,16 +5,16 @@
 //! flow; the former syntax/name-based implementation is quarantined until that frontend exists.
 //! Optional runtime traces refine (but never erase) static facts.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
 #[cfg(feature = "runtime")]
 use std::collections::BTreeMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 #[cfg(feature = "runtime")]
 use std::path::PathBuf;
 
-use anyhow::Result;
 #[cfg(feature = "runtime")]
 use anyhow::Context;
+use anyhow::Result;
 use quote::ToTokens;
 use syn::visit::{self, Visit};
 
@@ -27,12 +27,12 @@ use crate::model_ir::{
     ArchitectureEdge, Artifact, ArtifactKind, AssemblySite, BuilderNamespace, BuilderRole,
     BuilderSourceKind, CargoSummary, Component, Confidence, DeviceFact, Evidence, EvidenceKind,
     Finding, FindingSeverity, Function, FunctionParameter, LayoutFact, ModelIr, Module, Operation,
-    OptimizerMembership, Parameter, ParameterRole, PipelineStage, ShapeFact,
-    StableId, StageDispatchKind, StageKind, TensorContract, TensorRole, Visibility,
+    OptimizerMembership, Parameter, ParameterRole, PipelineStage, ShapeFact, StableId,
+    StageDispatchKind, StageKind, TensorContract, TensorRole, TimingStats, Visibility,
 };
 #[cfg(feature = "runtime")]
 use crate::model_ir::{EdgeTimingSummary, RuntimeSummary};
-use crate::op_semantics::{self, GradFlow};
+use crate::op_semantics::{self};
 #[cfg(feature = "runtime")]
 use crate::runtime::{self, ExpectedIdentity, GradientState, RuntimeTrace};
 
@@ -53,19 +53,31 @@ pub struct ScanOptions {
 /// Analyze a Cargo crate or source directory into the unified model IR.
 pub fn analyze(path: impl AsRef<Path>, options: &ScanOptions) -> Result<ModelIr> {
     let path = path.as_ref();
-    let cargo_result = CargoContext::discover(path, &options.cargo);
+    let scan_root = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf());
+    let mut options = options.clone();
+    let _stripped = options.cargo.strip_candle_graph_features();
+    let cargo_result = CargoContext::discover(&scan_root, &options.cargo);
     let mut krate = match cargo_result.as_ref() {
         Ok(context) => {
             let roots = context.selected_source_roots(options.cargo.package_target.as_deref())?;
-            load::load_from_roots(path, &roots)?
+            load::load_from_roots(&scan_root, &roots)?
         }
-        Err(_) => load::load(path)?,
+        Err(error) if manifest_discovery_failed(error) => load::load(&scan_root)?,
+        Err(error) => return Err(enrich_cargo_error(error)),
     };
     if let Ok(context) = cargo_result.as_ref() {
         krate.set_dependency_aliases(context.dependency_aliases.clone());
     }
     if krate.all_structs().next().is_none() {
-        anyhow::bail!("no Rust structs found under {}", path.display());
+        if let Err(error) = cargo_result.as_ref() {
+            anyhow::bail!(
+                "no Rust structs found under {} ({error:#})",
+                scan_root.display()
+            );
+        }
+        anyhow::bail!("no Rust structs found under {}", scan_root.display());
     }
 
     let analysis_id = match cargo_result.as_ref() {
@@ -76,7 +88,7 @@ pub fn analyze(path: impl AsRef<Path>, options: &ScanOptions) -> Result<ModelIr>
                 options.cargo.package_target.as_deref(),
             )],
         ),
-        Err(_) => StableId::new("analysis", [canonical_label(path)]),
+        Err(_) => StableId::new("analysis", [canonical_label(&scan_root)]),
     };
     let mut model = ModelIr::empty(analysis_id);
 
@@ -148,6 +160,8 @@ pub fn analyze(path: impl AsRef<Path>, options: &ScanOptions) -> Result<ModelIr>
 
     if options.dataflow {
         add_dataflow(&krate, &mut model);
+        let builder_dtypes = crate::dtype_propagate::infer_builder_default_dtypes(&krate);
+        crate::dtype_propagate::propagate_tensor_dtypes(&mut model, &builder_dtypes);
     }
 
     #[cfg(feature = "runtime")]
@@ -164,6 +178,28 @@ pub fn analyze(path: impl AsRef<Path>, options: &ScanOptions) -> Result<ModelIr>
     }
     model.normalize();
     Ok(model)
+}
+
+fn manifest_discovery_failed(error: &anyhow::Error) -> bool {
+    let msg = format!("{error:#}");
+    msg.contains("Cargo.toml not found") || msg.contains("failed to locate Cargo.toml")
+}
+
+fn enrich_cargo_error(error: &anyhow::Error) -> anyhow::Error {
+    let msg = format!("{error:#}");
+    if msg.contains("does not contain this feature") {
+        anyhow::Error::msg(format!(
+            "{error:#}\n\
+             `--features` selects Cargo features on the model crate being analyzed. \
+             Names like `static`, `visualizer`, `runtime`, and `all` refer to candle-graph itself \
+             (enable them when installing/building candle-graph, e.g. \
+             `cargo install --path ../candle_graph --features all`). \
+             For Tofy, use the `.cargo/config.toml` alias or match your GPU build with \
+             `--features cuda` / `--features cudnn`."
+        ))
+    } else {
+        anyhow::Error::msg(msg)
+    }
 }
 
 fn canonical_label(path: &Path) -> String {
@@ -1416,8 +1452,7 @@ fn discover_components(
             exported.contains(&def.name) || def.module_path.is_empty() && def.visibility == "pub";
         // Any public type with a VarBuilder constructor is a model component candidate
         // (e.g. `my_model::Model`), not only crate-root re-exports.
-        let is_varbuilder_component =
-            def.visibility == "pub" && !ctor.vb_params.is_empty();
+        let is_varbuilder_component = def.visibility == "pub" && !ctor.vb_params.is_empty();
         if selected_root.is_some() || is_api_boundary || is_varbuilder_component {
             candidates.push((def, ctor));
         }
@@ -1659,10 +1694,22 @@ fn add_contracts(krate: &Crate, model: &mut ModelIr) {
         };
         for mut tensor in contracts.tensors {
             tensor.owner_function = owner.clone();
-            tensor.id = StableId::new("tensor", [owner.0.as_str(), tensor.name.as_str()]);
-            if tensor.dtype.eq_ignore_ascii_case("unknown") {
+            if tensor.dtype.eq_ignore_ascii_case("unknown")
+                || tensor.dtype.starts_with("same_as(")
+                || tensor.dtype == "work_dtype"
+            {
                 tensor.dtype = "Unknown".to_string();
             }
+            if let Some(existing) = model.tensors.iter_mut().find(|existing| {
+                existing.owner_function == owner && existing.name == tensor.name
+            }) {
+                if existing.dtype == "Unknown" && tensor.dtype != "Unknown" {
+                    existing.dtype = tensor.dtype.clone();
+                    existing.evidence.extend(tensor.evidence.clone());
+                }
+                continue;
+            }
+            tensor.id = StableId::new("tensor", [owner.0.as_str(), tensor.name.as_str()]);
             let id = tensor.id.clone();
             let role = tensor.role.clone();
             if let Some(&index) = function_indices.get(&owner) {
@@ -2322,229 +2369,255 @@ fn add_dataflow(krate: &Crate, model: &mut ModelIr) {
             model.functions[function_index].execution_phases = phases.clone();
         }
         for phase in phases {
-        let graph = match dataflow::analyze_with_phase(
-            krate,
-            &entry,
-            candle_nn_version.as_deref(),
-            phase,
-        ) {
-            Ok(graph) => graph,
-            Err(error) => {
-                push_finding(
-                    model,
-                    "dataflow-entrypoint",
-                    FindingSeverity::Information,
-                    Confidence::Proven,
-                    format!("could not analyze `{entry}`: {error:#}"),
-                    None,
-                    vec![function_id.clone()],
+            let graph = match dataflow::analyze_with_phase(
+                krate,
+                &entry,
+                candle_nn_version.as_deref(),
+                phase,
+            ) {
+                Ok(graph) => graph,
+                Err(error) => {
+                    push_finding(
+                        model,
+                        "dataflow-entrypoint",
+                        FindingSeverity::Information,
+                        Confidence::Proven,
+                        format!("could not analyze `{entry}`: {error:#}"),
+                        None,
+                        vec![function_id.clone()],
+                    );
+                    continue;
+                }
+            };
+            let mut tensor_ids = vec![None; graph.nodes.len()];
+            for node_id in &graph.tensor_nodes {
+                let node = graph.node(*node_id);
+                let id = StableId::new(
+                    "tensor",
+                    [
+                        phase.as_str(),
+                        function_id.0.as_str(),
+                        node.id.0.to_string().as_str(),
+                    ],
                 );
-                continue;
+                let name = node_name(&node.kind);
+                let role = match &node.kind {
+                    NodeKind::Param { .. } => TensorRole::Input,
+                    NodeKind::Return => TensorRole::Output,
+                    _ if graph.loss_nodes.contains(&node.id) || is_loss => TensorRole::Loss,
+                    _ => TensorRole::Activation,
+                };
+                model.tensors.push(TensorContract {
+                    id: id.clone(),
+                    name,
+                    role,
+                    owner_function: function_id.clone(),
+                    parameter: None,
+                    shape: ShapeFact {
+                        rank: shape_rank(node.shape.as_deref()),
+                        dimensions: Vec::new(),
+                        source_expr: node.shape.clone(),
+                    },
+                    dtype: if node.dtype.is_known() {
+                        node.dtype.to_string()
+                    } else {
+                        "Unknown".to_string()
+                    },
+                    device: DeviceFact::Unknown,
+                    layout: layout_for_node(&node.kind),
+                    requires_grad: match node.grad {
+                        GradState::Trainable | GradState::Differentiable => Some(true),
+                        GradState::Frozen | GradState::Severed => Some(false),
+                        _ => None,
+                    },
+                    execution_phase: Some(phase),
+                    evidence: {
+                        let mut evidence = vec![source_evidence(
+                            krate.file_label(node.span),
+                            format!(
+                                "expression-level static dataflow; source type {}",
+                                node.type_name.as_deref().unwrap_or("Tensor")
+                            ),
+                        )];
+                        if node.dtype.is_known() {
+                            evidence.push(source_evidence(
+                                krate.file_label(node.span),
+                                format!("static dtype {}", node.dtype),
+                            ));
+                        }
+                        evidence
+                    },
+                });
+                tensor_ids[node.id.0] = Some(id);
             }
-        };
-        let mut tensor_ids = vec![None; graph.nodes.len()];
-        for node_id in &graph.tensor_nodes {
-            let node = graph.node(*node_id);
-            let id = StableId::new(
-                "tensor",
-                [
-                    phase.as_str(),
-                    function_id.0.as_str(),
-                    node.id.0.to_string().as_str(),
-                ],
-            );
-            let name = node_name(&node.kind);
-            let role = match &node.kind {
-                NodeKind::Param { .. } => TensorRole::Input,
-                NodeKind::Return => TensorRole::Output,
-                _ if graph.loss_nodes.contains(&node.id) || is_loss => TensorRole::Loss,
-                _ => TensorRole::Activation,
-            };
-            model.tensors.push(TensorContract {
-                id: id.clone(),
-                name,
-                role,
-                owner_function: function_id.clone(),
-                parameter: None,
-                shape: ShapeFact {
-                    rank: shape_rank(node.shape.as_deref()),
-                    dimensions: Vec::new(),
-                    source_expr: node.shape.clone(),
-                },
-                dtype: node.dtype.to_string(),
-                device: DeviceFact::Unknown,
-                layout: layout_for_node(&node.kind),
-                requires_grad: match node.grad {
-                    GradState::Trainable | GradState::Differentiable => Some(true),
-                    GradState::Frozen | GradState::Severed => Some(false),
-                    _ => None,
-                },
-                execution_phase: Some(phase),
-                evidence: vec![source_evidence(
-                    krate.file_label(node.span),
-                    format!(
-                        "expression-level static dataflow; source type {}",
-                        node.type_name.as_deref().unwrap_or("Tensor")
-                    ),
-                )],
-            });
-            tensor_ids[node.id.0] = Some(id);
-        }
-        if let Some(&function_index) = function_indices.get(&function_id) {
-            if phase == crate::phase::ExecutionPhase::Train {
-            model.functions[function_index].tensor_inputs = graph
-                .nodes
-                .iter()
-                .filter(|node| matches!(node.kind, NodeKind::Param { .. }))
-                .filter_map(|node| tensor_ids[node.id.0].clone())
-                .collect();
-            model.functions[function_index].tensor_outputs = graph
-                .entry_return
-                .and_then(|node| tensor_ids[node.0].clone())
-                .map(|tensor| vec![tensor])
-                .unwrap_or_default();
+            if let Some(&function_index) = function_indices.get(&function_id) {
+                if phase == crate::phase::ExecutionPhase::Train {
+                    model.functions[function_index].tensor_inputs = graph
+                        .nodes
+                        .iter()
+                        .filter(|node| matches!(node.kind, NodeKind::Param { .. }))
+                        .filter_map(|node| tensor_ids[node.id.0].clone())
+                        .collect();
+                    model.functions[function_index].tensor_outputs = graph
+                        .entry_return
+                        .and_then(|node| tensor_ids[node.0].clone())
+                        .map(|tensor| vec![tensor])
+                        .unwrap_or_default();
+                }
             }
-        }
-        for node in &graph.nodes {
-            let NodeKind::Call { callee } = &node.kind else {
-                continue;
-            };
-            let effect = op_semantics::lookup_resolved(callee, candle_nn_version.as_deref());
-            if matches!(effect.grad, GradFlow::Unknown)
-                && matches!(effect.dtype, crate::op_semantics::DtypeRule::Unknown)
-            {
-                continue;
+            for node in &graph.nodes {
+                let NodeKind::Call { callee } = &node.kind else {
+                    continue;
+                };
+                let short = callee.rsplit("::").next().unwrap_or(callee.as_str());
+                let mut effect =
+                    op_semantics::lookup_resolved(callee, candle_nn_version.as_deref());
+                if matches!(effect.dtype, op_semantics::DtypeRule::Unknown)
+                    && matches!(effect.grad, op_semantics::GradFlow::Unknown)
+                {
+                    effect = op_semantics::lookup_for(short, candle_nn_version.as_deref());
+                }
+                if matches!(effect.dtype, op_semantics::DtypeRule::Unknown)
+                    && matches!(effect.grad, op_semantics::GradFlow::Unknown)
+                {
+                    if node.dtype.is_known() {
+                        effect = op_semantics::OpEffect::inferred_preserve(short);
+                    } else {
+                        continue;
+                    }
+                }
+                let Some(output) = tensor_ids[node.id.0].clone() else {
+                    continue;
+                };
+                let inputs = graph
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.to == node.id)
+                    .filter_map(|edge| tensor_ids[edge.from.0].clone())
+                    .collect();
+                let operation_id = StableId::new(
+                    "operation",
+                    [
+                        phase.as_str(),
+                        function_id.0.as_str(),
+                        node.id.0.to_string().as_str(),
+                    ],
+                );
+                model.operations.push(Operation {
+                    id: operation_id.clone(),
+                    function: function_id.clone(),
+                    name: effect.name.clone(),
+                    qualified_name: callee.contains("::").then(|| callee.clone()),
+                    inputs,
+                    output,
+                    source: krate.file_label(node.span),
+                    dtype_rule: format!("{:?}", effect.dtype),
+                    gradient_rule: format!("{:?}", effect.grad),
+                    device_rule: if effect.name == "to_device" {
+                        "explicit".to_string()
+                    } else {
+                        "preserve".to_string()
+                    },
+                    shape_rule: shape_rule(&effect.name).to_string(),
+                    domain_rule: effect.domain_rule_label(),
+                    execution_phase: Some(phase),
+                    timing: None,
+                    evidence: vec![Evidence {
+                        kind: EvidenceKind::Source,
+                        confidence: Confidence::Proven,
+                        source: Some(krate.file_label(node.span)),
+                        detail: effect.note.unwrap_or("Candle operation rule").to_string(),
+                    }],
+                });
+                link_implicit_parameter_reads(model, &graph, node.id, &function_id, &operation_id);
             }
-            let Some(output) = tensor_ids[node.id.0].clone() else {
-                continue;
-            };
-            let inputs = graph
-                .edges
-                .iter()
-                .filter(|edge| edge.to == node.id)
-                .filter_map(|edge| tensor_ids[edge.from.0].clone())
-                .collect();
-            let operation_id = StableId::new(
-                "operation",
-                [
-                    phase.as_str(),
-                    function_id.0.as_str(),
-                    node.id.0.to_string().as_str(),
-                ],
-            );
-            model.operations.push(Operation {
-                id: operation_id.clone(),
-                function: function_id.clone(),
-                name: effect.name.clone(),
-                qualified_name: callee.contains("::").then(|| callee.clone()),
-                inputs,
-                output,
-                source: krate.file_label(node.span),
-                dtype_rule: format!("{:?}", effect.dtype),
-                gradient_rule: format!("{:?}", effect.grad),
-                device_rule: if effect.name == "to_device" {
-                    "explicit".to_string()
-                } else {
-                    "preserve".to_string()
-                },
-                shape_rule: shape_rule(&effect.name).to_string(),
-                domain_rule: effect.domain_rule_label(),
-                execution_phase: Some(phase),
-                avg_duration_ns: None,
-                timing_samples: None,
-                evidence: vec![Evidence {
-                    kind: EvidenceKind::Source,
-                    confidence: Confidence::Proven,
-                    source: Some(krate.file_label(node.span)),
-                    detail: effect.note.unwrap_or("Candle operation rule").to_string(),
-                }],
-            });
-            link_implicit_parameter_reads(model, &graph, node.id, &function_id, &operation_id);
-        }
-        let dead_params = graph.dead_params();
-        for conflict in &graph.dtype_conflicts {
-            push_finding(
-                model,
-                "dtype-conflict",
-                FindingSeverity::Error,
-                Confidence::Proven,
-                conflict.message.clone(),
-                Some(krate.file_label(conflict.span)),
-                vec![function_id.clone()],
-            );
-        }
-        for risk in &graph.dtype_risks {
-            push_finding(
-                model,
-                "dtype-risk",
-                FindingSeverity::Warning,
-                Confidence::Conditional,
-                risk.message.clone(),
-                Some(krate.file_label(risk.span)),
-                vec![function_id.clone()],
-            );
-        }
-        let inference_entrypoint = phase == crate::phase::ExecutionPhase::Infer;
-        for violation in &graph.numeric_domain_violations {
-            let (severity, confidence) =
-                numeric_finding_severity(violation.proven, violation.impact, inference_entrypoint);
-            push_finding(
-                model,
-                "numeric-domain-violation",
-                severity,
-                confidence,
-                violation.message.clone(),
-                Some(krate.file_label(violation.span)),
-                vec![function_id.clone()],
-            );
-        }
-        for nan_shape in &graph.zero_times_infinity {
-            let (severity, confidence) =
-                numeric_finding_severity(true, nan_shape.impact, inference_entrypoint);
-            push_finding(
-                model,
-                "zero-times-infinity",
-                severity,
-                confidence,
-                nan_shape.message.clone(),
-                Some(krate.file_label(nan_shape.span)),
-                vec![function_id.clone()],
-            );
-            if nan_shape.library_cite.is_some()
-                && matches!(
-                    nan_shape.impact,
-                    NumericImpact::TrainingLossNaN | NumericImpact::GradientPoison
-                )
-            {
+            let dead_params = graph.dead_params();
+            for conflict in &graph.dtype_conflicts {
                 push_finding(
                     model,
-                    "unstable-library-loss",
+                    "dtype-conflict",
                     FindingSeverity::Error,
                     Confidence::Proven,
+                    conflict.message.clone(),
+                    Some(krate.file_label(conflict.span)),
+                    vec![function_id.clone()],
+                );
+            }
+            for risk in &graph.dtype_risks {
+                push_finding(
+                    model,
+                    "dtype-risk",
+                    FindingSeverity::Warning,
+                    Confidence::Conditional,
+                    risk.message.clone(),
+                    Some(krate.file_label(risk.span)),
+                    vec![function_id.clone()],
+                );
+            }
+            let inference_entrypoint = phase == crate::phase::ExecutionPhase::Infer;
+            for violation in &graph.numeric_domain_violations {
+                let (severity, confidence) = numeric_finding_severity(
+                    violation.proven,
+                    violation.impact,
+                    inference_entrypoint,
+                );
+                push_finding(
+                    model,
+                    "numeric-domain-violation",
+                    severity,
+                    confidence,
+                    violation.message.clone(),
+                    Some(krate.file_label(violation.span)),
+                    vec![function_id.clone()],
+                );
+            }
+            for nan_shape in &graph.zero_times_infinity {
+                let (severity, confidence) =
+                    numeric_finding_severity(true, nan_shape.impact, inference_entrypoint);
+                push_finding(
+                    model,
+                    "zero-times-infinity",
+                    severity,
+                    confidence,
                     nan_shape.message.clone(),
                     Some(krate.file_label(nan_shape.span)),
                     vec![function_id.clone()],
                 );
+                if nan_shape.library_cite.is_some()
+                    && matches!(
+                        nan_shape.impact,
+                        NumericImpact::TrainingLossNaN | NumericImpact::GradientPoison
+                    )
+                {
+                    push_finding(
+                        model,
+                        "unstable-library-loss",
+                        FindingSeverity::Error,
+                        Confidence::Proven,
+                        nan_shape.message.clone(),
+                        Some(krate.file_label(nan_shape.span)),
+                        vec![function_id.clone()],
+                    );
+                }
             }
-        }
-        for dead in dead_params {
-            let mut related = vec![function_id.clone()];
-            if let Some(tensor) = tensor_ids[dead.0].clone() {
-                related.push(tensor);
+            for dead in dead_params {
+                let mut related = vec![function_id.clone()];
+                if let Some(tensor) = tensor_ids[dead.0].clone() {
+                    related.push(tensor);
+                }
+                push_finding(
+                    model,
+                    "dead-gradient-path",
+                    FindingSeverity::Warning,
+                    Confidence::Conditional,
+                    format!(
+                        "trainable expression `{}` has no differentiable path to a loss",
+                        node_name(&graph.node(dead).kind)
+                    ),
+                    Some(krate.file_label(graph.node(dead).span)),
+                    related,
+                );
             }
-            push_finding(
-                model,
-                "dead-gradient-path",
-                FindingSeverity::Warning,
-                Confidence::Conditional,
-                format!(
-                    "trainable expression `{}` has no differentiable path to a loss",
-                    node_name(&graph.node(dead).kind)
-                ),
-                Some(krate.file_label(graph.node(dead).span)),
-                related,
-            );
-        }
         } // execution phase
     }
 }
@@ -2625,20 +2698,22 @@ fn link_implicit_parameter_reads(
 
 #[cfg(feature = "runtime")]
 fn aggregate_edge_timings(trace: &RuntimeTrace) -> Vec<EdgeTimingSummary> {
-    let mut edge_totals: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
+    let mut edge_durations: BTreeMap<(String, String), Vec<u64>> = BTreeMap::new();
     for edge in &trace.edge_timings {
         let key = (edge.from_static_id.clone(), edge.to_static_id.clone());
-        let entry = edge_totals.entry(key).or_insert((0, 0));
-        entry.0 = entry.0.saturating_add(edge.duration_ns);
-        entry.1 += 1;
+        edge_durations
+            .entry(key)
+            .or_default()
+            .push(edge.duration_ns);
     }
-    edge_totals
+    edge_durations
         .into_iter()
-        .map(|((from, to), (total, samples))| EdgeTimingSummary {
-            from: StableId(from),
-            to: StableId(to),
-            avg_duration_ns: total.checked_div(samples).unwrap_or(0),
-            samples,
+        .filter_map(|((from, to), durations)| {
+            Some(EdgeTimingSummary {
+                from: StableId(from),
+                to: StableId(to),
+                timing: TimingStats::from_durations(&durations)?,
+            })
         })
         .collect()
 }
@@ -2743,7 +2818,7 @@ fn merge_runtime(model: &mut ModelIr, trace: &RuntimeTrace) {
                 });
             }
         }
-        let mut op_duration_totals: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        let mut op_durations: BTreeMap<String, Vec<u64>> = BTreeMap::new();
         for observation in &trace.operations {
             let Some(static_id) = observation.static_id.as_deref() else {
                 continue;
@@ -2751,23 +2826,21 @@ fn merge_runtime(model: &mut ModelIr, trace: &RuntimeTrace) {
             let Some(duration_ns) = observation.duration_ns else {
                 continue;
             };
-            let entry = op_duration_totals
+            op_durations
                 .entry(static_id.to_string())
-                .or_insert((0, 0));
-            entry.0 = entry.0.saturating_add(duration_ns);
-            entry.1 += 1;
+                .or_default()
+                .push(duration_ns);
         }
-        for (static_id, (total, samples)) in op_duration_totals {
-            if samples == 0 {
+        for (static_id, durations) in op_durations {
+            let Some(timing) = TimingStats::from_durations(&durations) else {
                 continue;
-            }
+            };
             if let Some(operation) = model
                 .operations
                 .iter_mut()
                 .find(|operation| operation.id.0 == static_id)
             {
-                operation.avg_duration_ns = Some(total / samples);
-                operation.timing_samples = Some(samples);
+                operation.timing = Some(timing);
             }
         }
         for identity in audit
@@ -2871,7 +2944,11 @@ fn merge_runtime(model: &mut ModelIr, trace: &RuntimeTrace) {
         .filter_map(|op| op.duration_ns)
         .reduce(|a, b| a.saturating_add(b))
         .and_then(|total| {
-            let count = trace.operations.iter().filter(|op| op.duration_ns.is_some()).count();
+            let count = trace
+                .operations
+                .iter()
+                .filter(|op| op.duration_ns.is_some())
+                .count();
             (count > 0).then_some(total / count as u64)
         });
     model.runtime = Some(RuntimeSummary {

@@ -421,6 +421,47 @@ fn cast(xs: Tensor) -> Result<Tensor> {
 }
 
 #[test]
+fn tensor_zeros_infers_literal_dtype() {
+    let fixture = Fixture::new(
+        r#"
+fn explicit() -> Result<Tensor> {
+    Tensor::zeros((2, 3), DType::F32, Device::Cpu)
+}
+"#,
+    );
+    let krate = load::load(fixture.path()).unwrap();
+    let graph = analyze(&krate, "explicit").unwrap();
+    assert!(graph.nodes.iter().any(|node| {
+        matches!(&node.kind, NodeKind::Call { callee } if callee == "Tensor::zeros")
+            && node.dtype == AbstractDtype::F32
+    }));
+}
+
+#[test]
+fn tensor_dtype_method_preserves_receiver_dtype() {
+    let fixture = Fixture::new(
+        r#"
+fn copy_dtype(x: Tensor) -> Result<Tensor> {
+    let _d = x.dtype();
+    Tensor::zeros((1,), x.dtype(), x.device())
+}
+"#,
+    );
+    let krate = load::load(fixture.path()).unwrap();
+    let graph = analyze(&krate, "copy_dtype").unwrap();
+    assert!(graph.nodes.iter().any(|node| {
+        matches!(&node.kind, NodeKind::Literal { text } if text == "dtype()")
+            && node.dtype == AbstractDtype::Unknown
+    }));
+    let param = graph
+        .nodes
+        .iter()
+        .find(|node| matches!(&node.kind, NodeKind::Param { name } if name == "x"))
+        .unwrap();
+    assert_eq!(param.dtype, AbstractDtype::Unknown);
+}
+
+#[test]
 fn interprocedural_detach_cannot_be_bypassed_by_callsite_edges() {
     const SRC: &str = r#"
 use candle_nn::loss::mse;

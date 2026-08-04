@@ -15,7 +15,8 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 
-use crate::ir::{Certainty, CheckpointMatch, Structure};
+use crate::ir::Key;
+use crate::model_ir::{Confidence, ModelIr, Parameter, ParameterRole};
 
 #[derive(Debug, Clone)]
 pub struct TensorInfo {
@@ -227,13 +228,11 @@ pub struct VerifyReport {
     pub checkpoint_tensors: usize,
 }
 
-/// Match every parameter under `root` against the header, annotating the structure in place.
+/// Match every parameter under `root` against the header, annotating parameters in place.
 ///
 /// Scoping to one builder root matters: a model may draw from several `VarBuilder`s — frozen
 /// mmapped base weights alongside a trainable `VarMap` — and each has its own checkpoint file.
-/// Comparing all of them against one file would report every trainable adapter as "missing"
-/// from the frozen base checkpoint, which is noise rather than a finding.
-pub fn verify(structure: &mut Structure, header: &Header, root: &str) -> VerifyReport {
+pub fn verify_model(model: &mut ModelIr, header: &Header, root: &str) -> VerifyReport {
     let mut report = VerifyReport {
         checkpoint_tensors: header.len(),
         root: root.to_string(),
@@ -242,12 +241,12 @@ pub fn verify(structure: &mut Structure, header: &Header, root: &str) -> VerifyR
     let mut claimed: Vec<bool> = vec![false; header.len()];
     let names: Vec<&String> = header.keys().collect();
 
-    for index in 0..structure.params.len() {
-        if structure.params[index].root != root {
+    for parameter in &mut model.parameters {
+        if parameter.builder_root != root {
             report.skipped_other_root += 1;
             continue;
         }
-        let key = structure.params[index].key.clone();
+        let key = Key::from_dotted(&parameter.key);
 
         if key.is_template() {
             let hits: Vec<usize> = names
@@ -257,40 +256,34 @@ pub fn verify(structure: &mut Structure, header: &Header, root: &str) -> VerifyR
                 .map(|(i, _)| i)
                 .collect();
             if hits.is_empty() {
-                structure.params[index].checkpoint = CheckpointMatch::Missing;
-                record_missing(
-                    &mut report,
-                    &structure.params[index].certainty,
-                    key.to_string(),
-                );
+                record_missing(&mut report, parameter, parameter.key.clone());
+                parameter.checkpoint_shape = None;
+                parameter.checkpoint_dtype = None;
             } else {
                 for hit in &hits {
                     claimed[*hit] = true;
                 }
-                structure.params[index].checkpoint = CheckpointMatch::FoundMany {
-                    count: hits.len(),
-                    sample: names[hits[0]].to_string(),
-                };
+                let info = &header[names[hits[0]]];
+                parameter.checkpoint_shape = Some(info.shape.clone());
+                parameter.checkpoint_dtype = Some(info.dtype.clone());
                 report.matched += 1;
             }
             continue;
         }
 
-        let exact = key.to_string();
+        let exact = parameter.key.clone();
         match names.iter().position(|n| **n == exact) {
             Some(hit) => {
                 claimed[hit] = true;
                 let info = &header[names[hit]];
-                structure.params[index].checkpoint = CheckpointMatch::Found {
-                    name: exact,
-                    shape: info.shape.clone(),
-                    dtype: info.dtype.clone(),
-                };
+                parameter.checkpoint_shape = Some(info.shape.clone());
+                parameter.checkpoint_dtype = Some(info.dtype.clone());
                 report.matched += 1;
             }
             None => {
-                structure.params[index].checkpoint = CheckpointMatch::Missing;
-                record_missing(&mut report, &structure.params[index].certainty, exact);
+                record_missing(&mut report, parameter, exact);
+                parameter.checkpoint_shape = None;
+                parameter.checkpoint_dtype = None;
             }
         }
     }
@@ -306,10 +299,20 @@ pub fn verify(structure: &mut Structure, header: &Header, root: &str) -> VerifyR
     report
 }
 
-/// A missing parameter is only a finding when the analyzer claimed it definitely exists.
-fn record_missing(report: &mut VerifyReport, certainty: &Certainty, key: String) {
-    match certainty {
-        Certainty::Certain => report.missing_certain.push(key),
-        _ => report.missing_conditional.push(key),
+fn record_missing(report: &mut VerifyReport, parameter: &Parameter, key: String) {
+    if missing_is_certain(parameter) {
+        report.missing_certain.push(key);
+    } else {
+        report.missing_conditional.push(key);
+    }
+}
+
+fn missing_is_certain(parameter: &Parameter) -> bool {
+    match parameter.role {
+        ParameterRole::Conditional | ParameterRole::Unknown | ParameterRole::Excluded => false,
+        ParameterRole::Optimized | ParameterRole::Frozen | ParameterRole::RunningState => parameter
+            .evidence
+            .iter()
+            .any(|evidence| evidence.confidence == Confidence::Proven),
     }
 }

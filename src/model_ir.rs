@@ -255,6 +255,36 @@ pub struct FunctionParameter {
     pub type_name: String,
 }
 
+/// Wall-time rollup for profiled operations and data-flow edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TimingStats {
+    pub samples: u64,
+    pub avg_ns: u64,
+    pub min_ns: u64,
+    pub max_ns: u64,
+}
+
+impl TimingStats {
+    /// Aggregate one or more duration samples into avg/min/max.
+    pub fn from_durations(durations: &[u64]) -> Option<Self> {
+        if durations.is_empty() {
+            return None;
+        }
+        let mut sorted = durations.to_vec();
+        sorted.sort_unstable();
+        let samples = sorted.len() as u64;
+        let min_ns = sorted[0];
+        let max_ns = sorted[sorted.len() - 1];
+        let total: u64 = sorted.iter().sum();
+        Some(Self {
+            samples,
+            avg_ns: total / samples,
+            min_ns,
+            max_ns,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Operation {
     pub id: StableId,
@@ -273,10 +303,9 @@ pub struct Operation {
     pub domain_rule: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_phase: Option<ExecutionPhase>,
+    /// Populated when a runtime v3 profile trace is merged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub avg_duration_ns: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timing_samples: Option<u64>,
+    pub timing: Option<TimingStats>,
     pub evidence: Vec<Evidence>,
 }
 
@@ -457,8 +486,7 @@ pub struct CargoSummary {
 pub struct EdgeTimingSummary {
     pub from: StableId,
     pub to: StableId,
-    pub avg_duration_ns: u64,
-    pub samples: u64,
+    pub timing: TimingStats,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -656,8 +684,11 @@ impl ModelIr {
             .iter()
             .filter(|t| t.shape.rank.is_some() || !t.shape.dimensions.is_empty())
             .count();
-        self.coverage.tensors_with_dtype =
-            self.tensors.iter().filter(|t| t.dtype != "Unknown").count();
+        self.coverage.tensors_with_dtype = self
+            .tensors
+            .iter()
+            .filter(|t| crate::dtype_propagate::tensor_dtype_is_proven_for_display(t))
+            .count();
         self.coverage.tensors_with_device = self
             .tensors
             .iter()
@@ -676,5 +707,19 @@ fn escape_id_part(part: &str, out: &mut String) {
             }
             _ => out.push(byte as char),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TimingStats;
+
+    #[test]
+    fn timing_stats_aggregate_min_max_and_avg() {
+        let stats = TimingStats::from_durations(&[100, 300, 200]).unwrap();
+        assert_eq!(stats.samples, 3);
+        assert_eq!(stats.min_ns, 100);
+        assert_eq!(stats.max_ns, 300);
+        assert_eq!(stats.avg_ns, 200);
     }
 }

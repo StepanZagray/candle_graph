@@ -1,6 +1,6 @@
 [package]
 name = "candle-graph"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2021"
 description = "Static structure and dataflow analysis for candle-rs models"
 readme = "README.md"
@@ -13,8 +13,14 @@ documentation = "https://docs.rs/candle-graph"
 exclude = ["/target/**", "/.git/**"]
 
 [features]
-default = []
+default = ["static"]
+# Agent-oriented static IR: structure, dtypes, gradient dataflow, bounded queries.
+static = []
+# Runtime profiler: merge v3 traces, operation/edge timings, gradient audit.
 runtime = []
+# Standalone HTML visualizer (`model.html`).
+visualizer = []
+all = ["runtime", "visualizer"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -48,3 +54,7 @@ required-features = ["runtime"]
 [[test]]
 name = "phase_profile"
 required-features = ["runtime"]
+
+[[test]]
+name = "viewer"
+required-features = ["visualizer"]

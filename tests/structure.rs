@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use candle_graph::{
     extract::Extractor,
     ir::{Key, KeySeg},
-    load, report, verify,
+    load, verify,
 };
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -107,30 +107,69 @@ fn extracts_formatted_prefixes_dtype_builders_and_builder_roots() {
 }
 
 #[test]
-fn agent_json_preserves_multi_root_identity() {
+fn unified_model_preserves_multi_root_identity() {
     let fixture = Fixture::new(MODEL);
     let krate = load::load(fixture.path()).unwrap();
     let structure = Extractor::new(&krate).run("Root", None).unwrap();
-    let json = report::json(&structure, &krate, None);
 
-    let params = json["parameters"].as_array().unwrap();
-    let adapter = params
+    let adapter = structure
+        .params
         .iter()
-        .find(|param| param["key"] == "adapter.weight")
+        .find(|param| param.key.to_string() == "adapter.weight")
         .unwrap();
-    assert_eq!(adapter["root"], "train_vb");
-
-    let modules = json["modules"].as_array().unwrap();
-    assert!(modules
-        .iter()
-        .all(|module| module.get("root").is_some() && module.get("prefix_derived").is_some()));
+    assert_eq!(adapter.root, "train_vb");
 }
 
 #[test]
 fn checkpoint_verification_separates_roots_and_conditional_absence() {
+    use candle_graph::ir::Certainty;
+    use candle_graph::model_ir::{
+        Confidence, Evidence, EvidenceKind, ModelIr, Parameter, ParameterRole, StableId,
+    };
+
     let fixture = Fixture::new(MODEL);
     let krate = load::load(fixture.path()).unwrap();
-    let mut structure = Extractor::new(&krate).run("Root", None).unwrap();
+    let structure = Extractor::new(&krate).run("Root", None).unwrap();
+    let mut model = ModelIr::empty(StableId::new("analysis", ["test"]));
+    model.parameters = structure
+        .params
+        .iter()
+        .map(|param| {
+            let role = match &param.certainty {
+                Certainty::Certain => ParameterRole::Optimized,
+                Certainty::Conditional(_) => ParameterRole::Conditional,
+                Certainty::Unknown(_) => ParameterRole::Unknown,
+            };
+            Parameter {
+                id: StableId::new(
+                    "parameter",
+                    ["test", param.root.as_str(), param.key.to_string().as_str()],
+                ),
+                component: StableId::new("component", ["Root"]),
+                module: StableId::new("module", ["Root"]),
+                key: param.key.to_string(),
+                builder_root: param.root.clone(),
+                role,
+                kind: String::new(),
+                symbolic_shape: None,
+                checkpoint_shape: None,
+                checkpoint_dtype: None,
+                source: String::new(),
+                uses: Vec::new(),
+                optimizer_memberships: Vec::new(),
+                evidence: vec![Evidence {
+                    kind: EvidenceKind::Source,
+                    confidence: match &param.certainty {
+                        Certainty::Certain => Confidence::Proven,
+                        Certainty::Conditional(_) => Confidence::Heuristic,
+                        Certainty::Unknown(_) => Confidence::Unknown,
+                    },
+                    source: None,
+                    detail: String::new(),
+                }],
+            }
+        })
+        .collect();
 
     let header = verify::Header::from([
         (
@@ -148,7 +187,7 @@ fn checkpoint_verification_separates_roots_and_conditional_absence() {
             },
         ),
     ]);
-    let result = verify::verify(&mut structure, &header, "base_vb");
+    let result = verify::verify_model(&mut model, &header, "base_vb");
 
     assert_eq!(result.root, "base_vb");
     assert_eq!(result.unclaimed, Vec::<String>::new());

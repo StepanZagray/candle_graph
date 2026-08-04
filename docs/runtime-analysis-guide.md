@@ -85,7 +85,7 @@ The audit checks:
 - gradient facts keyed by `(root, key)` — `present`, `missing`, `zero`, or `non_finite`;
 - optional tensor observations that refine shape/dtype/device when `static_id` is set.
 
-Use the same `--verify-root` / `--root` namespace the trainer uses for `VarBuilder` (e.g. `vb`).
+Use the same `--verify-root` / component `--root` namespace the trainer uses for `VarBuilder` (e.g. `vb`).
 
 ### 3. Phase-specific static graphs (no GPU required)
 
@@ -281,8 +281,8 @@ dependency**, not a training-time requirement:
 - Wire audit through Cargo (`cargo candle-graph audit …` or a thin wrapper subcommand).
 - Document which entrypoint and `verify-root` the trace used so agents can replay the audit.
 
-Example audit wrapper flags: `--checkpoint`, `--runtime-trace`, `--legacy-root WorldModel`,
-`--legacy-entry WorldModel::forward`, `--strict`, `--deny numeric-domain-violation,…`.
+Example audit wrapper flags: `--checkpoint`, `--runtime-trace`, `--verify-root vb`,
+`--strict`, `--deny numeric-domain-violation,…`.
 
 ## Related reading
 

@@ -7,9 +7,10 @@
 mod runtime;
 
 use runtime::{
-    parse, parse_json, parse_jsonl, ExpectedIdentity, GradientFact, GradientState, IdentityField,
-    ObservationConfidence, OperationObservation, ParamIdentity, RunMetadata, RuntimeTrace,
-    RuntimeTraceWriter, TensorConflictKind, TensorObservation, SCHEMA,
+    parse, parse_json, parse_jsonl, EdgeTimingObservation, ExpectedIdentity, GradientFact,
+    GradientState, IdentityField, ObservationConfidence, OperationObservation, ParamIdentity,
+    RunMetadata, RuntimeTrace, RuntimeTraceWriter, TensorConflictKind, TensorObservation,
+    ValueObservation, SCHEMA, SCHEMA_V3,
 };
 
 fn sample_document_json() -> String {
@@ -167,6 +168,20 @@ fn streaming_writer_emits_importable_static_ids_and_gradients() {
             step: None,
         })
         .unwrap();
+    writer
+        .value(ValueObservation {
+            event_id: "step-0-loss-range".into(),
+            static_id: Some("tensor:function%3Amodel%3Aoutput".into()),
+            source: Some("model::step loss".into()),
+            step: Some(0),
+            min: 0.0,
+            max: 1.0,
+            abs_max: 1.0,
+            nonfinite_count: 0,
+            saturated_count: 0,
+        })
+        .unwrap();
+    writer.flush().unwrap();
 
     let bytes = writer.finish().unwrap();
     let trace = parse_jsonl(std::str::from_utf8(&bytes).unwrap()).unwrap();
@@ -182,6 +197,35 @@ fn streaming_writer_emits_importable_static_ids_and_gradients() {
         trace.gradient("train_vb", "head.weight").unwrap().state,
         GradientState::Present
     );
+    assert_eq!(trace.values.len(), 1);
+}
+
+#[test]
+fn streaming_writer_emits_v3_edge_timings() {
+    let run = RunMetadata {
+        entrypoint: "model::forward".into(),
+        profile: "test".into(),
+        cargo_features: vec![],
+        cfg: vec![],
+        analysis_id: None,
+        build_id: None,
+        phase: Some("train".into()),
+    };
+    let mut writer = RuntimeTraceWriter::new_with_schema(Vec::new(), SCHEMA_V3, run).unwrap();
+    writer
+        .edge_timing(EdgeTimingObservation {
+            event_id: "edge-1".into(),
+            from_static_id: "tensor:train:forward:0".into(),
+            to_static_id: "operation:train:forward:1".into(),
+            duration_ns: 99,
+            step: Some(0),
+        })
+        .unwrap();
+    writer.flush().unwrap();
+    let bytes = writer.finish().unwrap();
+    let trace = parse_jsonl(std::str::from_utf8(&bytes).unwrap()).unwrap();
+    assert_eq!(trace.edge_timings.len(), 1);
+    assert_eq!(trace.edge_timings[0].duration_ns, 99);
 }
 
 #[test]

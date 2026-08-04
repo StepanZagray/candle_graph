@@ -11,12 +11,12 @@ use syn::spanned::Spanned;
 
 use crate::ir::SrcSpan;
 use crate::load::{self, Crate, ImplFn};
-use crate::phase::ExecutionPhase;
 use crate::op_semantics::{
     self, affine_domain, domain_includes_zero, domain_violation, library_body, AbstractDtype,
     BodyAtom, DomainRequirement, DomainViolationConfidence, DtypeRule, GradFlow, LibraryBody,
     NumericDomain, OpEffect,
 };
+use crate::phase::ExecutionPhase;
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -1247,6 +1247,75 @@ impl<'a> Analyzer<'a> {
         let method = m.method.to_string();
         let span = span_of(self.file_hint, m.method.span());
 
+        if method == "dtype"
+            && self
+                .node_type(receiver)
+                .is_some_and(is_candle_tensor_receiver)
+        {
+            let dtype = self.graph.node(receiver).dtype;
+            return Ok(self.add_node(
+                NodeKind::Literal {
+                    text: "dtype()".into(),
+                },
+                span,
+                dtype,
+                GradState::Frozen,
+                None,
+            ));
+        }
+
+        if self
+            .node_type(receiver)
+            .is_some_and(|receiver_type| receiver_type.contains("VarBuilder"))
+        {
+            if matches!(method.as_str(), "pp" | "push_prefix" | "clone") {
+                let dtype = self.graph.node(receiver).dtype;
+                let id = self.add_node(
+                    NodeKind::Call {
+                        callee: method.clone(),
+                    },
+                    span,
+                    dtype,
+                    GradState::Frozen,
+                    None,
+                );
+                self.set_node_type(id, "VarBuilder");
+                self.add_edge(receiver, id, EdgeKind::Data, Some("self".into()));
+                for (index, arg) in args.iter().enumerate() {
+                    self.add_edge(*arg, id, EdgeKind::Data, Some(format!("arg{index}")));
+                }
+                return Ok(id);
+            }
+            if matches!(
+                method.as_str(),
+                "get"
+                    | "get_with_hints"
+                    | "get_with_hints_dtype"
+                    | "get_unchecked"
+                    | "get_unchecked_dtype"
+                    | "get_with_dtype"
+            ) {
+                let dtype = self.graph.node(receiver).dtype;
+                if dtype.is_known() {
+                    let id = self.add_node(
+                        NodeKind::Call {
+                            callee: method.clone(),
+                        },
+                        span,
+                        dtype,
+                        GradState::Trainable,
+                        None,
+                    );
+                    self.set_node_type(id, "Tensor");
+                    self.add_edge(receiver, id, EdgeKind::Data, Some("builder".into()));
+                    for (index, arg) in args.iter().enumerate() {
+                        self.add_edge(*arg, id, EdgeKind::Data, Some(format!("arg{index}")));
+                    }
+                    return Ok(id);
+                }
+            }
+        }
+
         // Inherent crate-local method on a known type? Only when receiver looks like `self`
         // or we can recover a type name — keep interprocedural for `Self::` style via func_call.
         // For `self.foo(...)` try type of `self` from env naming: look up methods by scanning.
@@ -1444,6 +1513,39 @@ impl<'a> Analyzer<'a> {
                 .resolve_import_path(&self.module_path, &source_segments);
             let last = segs.last().cloned().unwrap_or_default();
 
+            if matches!(
+                last.as_str(),
+                "from_varmap" | "from_mmaped_safetensors" | "from_buffered_safetensors"
+            ) && segs.iter().any(|segment| segment == "VarBuilder")
+            {
+                let dtype = c
+                    .args
+                    .get(1)
+                    .map(|expression| self.expr(env, expression))
+                    .transpose()?
+                    .map(|node| self.graph.node(node).dtype)
+                    .filter(|dtype| dtype.is_known())
+                    .unwrap_or(AbstractDtype::Unknown);
+                let id = self.add_node(
+                    NodeKind::Call {
+                        callee: segs.join("::"),
+                    },
+                    span,
+                    dtype,
+                    GradState::Frozen,
+                    None,
+                );
+                self.set_node_type(id, "VarBuilder");
+                for (index, arg) in args.iter().enumerate() {
+                    self.add_edge(*arg, id, EdgeKind::Data, Some(format!("arg{index}")));
+                }
+                return Ok(id);
+            }
+
+            if is_tensor_constructor_name(&last) && segs.iter().any(|segment| segment == "Tensor") {
+                return self.tensor_constructor(&last, &args, &c.args, span);
+            }
+
             // Inherent Type::method
             if segs.len() >= 2 {
                 let type_name = normalize_qualified_segments(&segs[..segs.len() - 1]);
@@ -1539,6 +1641,71 @@ impl<'a> Analyzer<'a> {
         self.add_edge(callee, id, EdgeKind::Data, Some("callee".into()));
         for (i, a) in args.iter().enumerate() {
             self.add_edge(*a, id, EdgeKind::Data, Some(format!("arg{i}")));
+        }
+        Ok(id)
+    }
+
+    fn tensor_constructor(
+        &mut self,
+        name: &str,
+        arg_nodes: &[NodeId],
+        arg_exprs: &syn::punctuated::Punctuated<syn::Expr, syn::token::Comma>,
+        span: SrcSpan,
+    ) -> anyhow::Result<NodeId> {
+        let dtype = match name {
+            "zeros" | "ones" | "zeros_like" | "ones_like" => {
+                let from_syn = arg_exprs
+                    .iter()
+                    .nth(if name.ends_with("_like") { 0 } else { 1 })
+                    .and_then(dtype_from_syn_expr)
+                    .filter(|dtype| dtype.is_known());
+                let from_node = if name.ends_with("_like") {
+                    arg_nodes
+                        .first()
+                        .map(|node| self.graph.node(*node).dtype)
+                        .filter(|dtype| dtype.is_known())
+                } else {
+                    arg_nodes
+                        .get(1)
+                        .map(|node| self.graph.node(*node).dtype)
+                        .filter(|dtype| dtype.is_known())
+                };
+                from_node.or(from_syn).unwrap_or(AbstractDtype::Unknown)
+            }
+            "from_vec" | "new" => arg_exprs
+                .first()
+                .and_then(dtype_from_collection_expr)
+                .or_else(|| {
+                    arg_nodes
+                        .first()
+                        .map(|node| self.graph.node(*node).dtype)
+                })
+                .filter(|dtype| dtype.is_known())
+                .unwrap_or(AbstractDtype::Unknown),
+            "arange" | "arange_step" => arg_exprs
+                .first()
+                .and_then(dtype_from_scalar_expr)
+                .filter(|dtype| dtype.is_known())
+                .unwrap_or(AbstractDtype::Unknown),
+            "rand" | "randn" => arg_exprs
+                .first()
+                .and_then(dtype_from_scalar_expr)
+                .filter(|dtype| dtype.is_known())
+                .unwrap_or(AbstractDtype::Unknown),
+            _ => AbstractDtype::Unknown,
+        };
+        let id = self.add_node(
+            NodeKind::Call {
+                callee: format!("Tensor::{name}"),
+            },
+            span,
+            dtype,
+            GradState::Frozen,
+            None,
+        );
+        self.set_node_type(id, "Tensor");
+        for (index, arg) in arg_nodes.iter().enumerate() {
+            self.add_edge(*arg, id, EdgeKind::Data, Some(format!("arg{index}")));
         }
         Ok(id)
     }
@@ -2197,6 +2364,14 @@ fn result_inner_base(ty: &syn::Type) -> Option<String> {
     }
 }
 
+fn is_tensor_constructor_name(name: &str) -> bool {
+    matches!(
+        name,
+        "zeros" | "ones" | "from_vec" | "new" | "arange" | "arange_step" | "rand" | "randn"
+        | "zeros_like" | "ones_like"
+    )
+}
+
 fn is_candle_tensor_receiver(type_name: &str) -> bool {
     matches!(
         type_name.trim_start_matches('&').trim().rsplit("::").next(),
@@ -2425,5 +2600,57 @@ fn expr_kind_name(expr: &syn::Expr) -> &'static str {
         syn::Expr::Continue(_) => "continue",
         syn::Expr::Yield(_) => "yield",
         _ => "expr",
+    }
+}
+
+fn dtype_from_syn_expr(expression: &syn::Expr) -> Option<AbstractDtype> {
+    let expression = strip_dataflow_expr(expression);
+    if let syn::Expr::Path(path) = expression {
+        let segments: Vec<_> = path.path.segments.iter().collect();
+        if segments.len() >= 2 && segments[segments.len() - 2].ident == "DType" {
+            return Some(AbstractDtype::parse(
+                &segments[segments.len() - 1].ident.to_string(),
+            ));
+        }
+    }
+    None
+}
+
+fn dtype_from_scalar_expr(expression: &syn::Expr) -> Option<AbstractDtype> {
+    match strip_dataflow_expr(expression) {
+        syn::Expr::Lit(literal) => match &literal.lit {
+            syn::Lit::Float(value) => Some(match value.suffix() {
+                "" | "f64" => AbstractDtype::F64,
+                "f32" => AbstractDtype::F32,
+                _ => AbstractDtype::Unknown,
+            }),
+            syn::Lit::Int(value) => Some(match value.suffix() {
+                "" | "i64" => AbstractDtype::I64,
+                "i32" => AbstractDtype::I32,
+                "u32" => AbstractDtype::U32,
+                "u8" => AbstractDtype::U8,
+                _ => AbstractDtype::Unknown,
+            }),
+            _ => None,
+        },
+        other => dtype_from_syn_expr(other),
+    }
+}
+
+fn dtype_from_collection_expr(expression: &syn::Expr) -> Option<AbstractDtype> {
+    match strip_dataflow_expr(expression) {
+        syn::Expr::Array(array) => array.elems.first().and_then(dtype_from_scalar_expr),
+        syn::Expr::Repeat(repeat) => dtype_from_scalar_expr(&repeat.expr),
+        other => dtype_from_scalar_expr(other),
+    }
+}
+
+fn strip_dataflow_expr(expression: &syn::Expr) -> &syn::Expr {
+    match expression {
+        syn::Expr::Group(group) => strip_dataflow_expr(&group.expr),
+        syn::Expr::Paren(paren) => strip_dataflow_expr(&paren.expr),
+        syn::Expr::Reference(reference) => strip_dataflow_expr(&reference.expr),
+        syn::Expr::Try(value) => strip_dataflow_expr(&value.expr),
+        other => other,
     }
 }

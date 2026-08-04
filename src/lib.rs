@@ -1,22 +1,17 @@
 //! Static structure and dataflow analysis for candle-rs models.
 //!
-//! See `README.md` for the motivation. In short: candle's autograd graph is not inspectable at
-//! runtime (`Tensor::op()` is `pub(crate)`), and several candle-nn ops sever gradient flow
-//! silently, so the only way to answer "does this parameter receive a gradient" is to read the
-//! source.
+//! See `README.md` and `docs/features.md` for the feature split:
 //!
-//! It reconstructs module and parameter structure, expression-level dtype and gradient dataflow,
-//! deterministic CI baselines, and a standalone interactive report.
-//!
-//! Compile-time static analysis is always available. Enable the `runtime` feature for
-//! train/inference phase graphs, runtime trace import, gradient audit, and profiling.
+//! - **`static`** (default): agent-oriented IR, bounded queries, dtype/gradient dataflow
+//! - **`runtime`**: merge v3 profile traces; operation timings (avg/min/max) and gradient audit
+//! - **`visualizer`**: standalone `model.html` for human exploration
 
 pub mod analysis_cache;
-pub mod baseline;
 pub mod cargo_context;
 pub mod cli;
 pub mod contracts;
 pub mod dataflow;
+pub mod dtype_propagate;
 pub mod diagnostics;
 pub mod discover;
 pub mod extract;
@@ -30,11 +25,12 @@ pub mod phase;
 #[cfg(feature = "runtime")]
 pub mod profile;
 pub mod query;
-pub mod report;
 #[cfg(feature = "runtime")]
 pub mod runtime;
 pub mod verify;
+#[cfg(feature = "visualizer")]
 pub mod viewer;
+#[cfg(feature = "visualizer")]
+pub mod viewer_projection;
 
 pub use phase::ExecutionPhase;
-pub use ir::Structure;

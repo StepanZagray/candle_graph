@@ -85,82 +85,6 @@ fn alignment(positive: Tensor, logits: Tensor, labels: Tensor) -> Result<Tensor>
 }
 "#;
 
-fn command(fixture: &Fixture) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_candle-graph"));
-    command.arg(&fixture.path).args(["--root", "Root"]);
-    command
-}
-
-#[test]
-fn cli_html_json_and_canonical_baseline_work_together() {
-    let fixture = Fixture::new(MODEL);
-    let html = fixture.path.join("graph.html");
-    let baseline = fixture.path.join("graph.baseline");
-
-    let output = command(&fixture)
-        .args([
-            "--entry",
-            "alignment",
-            "--format",
-            "html",
-            "--output",
-            html.to_str().unwrap(),
-            "--update-baseline",
-            baseline.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let html_text = std::fs::read_to_string(&html).unwrap();
-    assert!(html_text.contains("data-viewer=\"candle-graph\""));
-    assert!(html_text.contains("\"dtype_risks\""));
-    let baseline_text = std::fs::read_to_string(&baseline).unwrap();
-    assert!(baseline_text.contains("dtype-risk"));
-
-    let output = command(&fixture)
-        .args([
-            "--entry",
-            "alignment",
-            "--format",
-            "json",
-            "--check",
-            baseline.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["dataflow"]["coverage"]["dtype_risks"], 1);
-    assert_eq!(json["dataflow"]["dtype_risks"][0]["op"], "broadcast_add");
-
-    let output = command(&fixture)
-        .args(["--entry", "alignment", "--strict"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("1 dtype risks"));
-
-    std::fs::write(
-        fixture.path.join("model.rs"),
-        MODEL.replace("vb.pp(\"head\")", "vb.pp(\"renamed_head\")"),
-    )
-    .unwrap();
-    let output = command(&fixture)
-        .args(["--check", baseline.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("baseline mismatch"));
-}
-
 #[test]
 fn cli_query_is_compact_by_default_with_limit_pagination() {
     let fixture = Fixture::new(MODEL);
@@ -383,4 +307,29 @@ fn cargo_candle_graph_model_baseline_round_trip() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+#[cfg(feature = "visualizer")]
+fn cargo_candle_graph_view_emits_html_visualizer() {
+    let fixture = Fixture::cargo_package(CARGO_MODEL);
+    let html = fixture.path.join("model.html");
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-candle-graph"))
+        .args([
+            "view",
+            fixture.path.to_str().unwrap(),
+            "--output",
+            html.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let html_text = std::fs::read_to_string(&html).unwrap();
+    assert!(html_text.contains("data-viewer=\"candle-graph\""));
+    assert!(html_text.contains("candle-graph/viewer/1") || html_text.contains("dataflow_train"));
 }

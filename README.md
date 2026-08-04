@@ -1,32 +1,17 @@
 # candle-graph
 
+> **Disclaimer:** `candle-graph` is an independent tool. It is **not**
+> official and is **not affiliated with, endorsed by, or maintained by** [candle-rs](https://github.com/huggingface/candle)
+> or [Hugging Face](https://huggingface.co).
+
 `candle-graph` reconstructs parameter structure, tensor contracts, and gradient connectivity of a
 [Candle](https://github.com/huggingface/candle) model crate. Its versioned,
 crate-wide model IR and bounded query API are designed so coding agents can answer focused
 questions without loading an entire source tree into context.
 
 The analyzer combines conservative Rust-source analysis with the Cargo configuration selected for
-the scan. With the optional `runtime` crate feature, a runtime trace can refine static tensor facts
-and audit gradients during training and inference. It never loads checkpoint tensor payloads or
-requires a GPU for static analysis.
-
-## Features
-
-- **Default (static)**: compile-time structure, dataflow, baselines, verification, and agent queries.
-- **`runtime`**: train/inference phase graphs, runtime trace import (`--runtime-trace`), gradient
-  audit, and the `profile` profiler / `cargo candle-graph profile` command.
-
-Enable runtime support when depending on this crate:
-
-```toml
-candle-graph = { version = "0.2.5", features = ["runtime"] }
-```
-
-Or when installing the CLI:
-
-```bash
-cargo install candle-graph --features runtime
-```
+the scan. An optional runtime trace can refine static tensor facts and audit gradients. It never
+loads checkpoint tensor payloads or requires a GPU for static analysis.
 
 - `candle-graph/model/1`: one unified IR for components, architecture edges, functions, modules,
   parameters, tensor contracts, stages, artifacts, optimizers, Cargo context, findings, and runtime
@@ -36,16 +21,18 @@ cargo install candle-graph --features runtime
 - `candle-graph/runtime/1`: JSON/JSONL tensor observations and per-parameter gradient facts;
   see [docs/runtime-analysis-guide.md](docs/runtime-analysis-guide.md) for the full workflow and
   v2 (time series) / v3 (profiler) extensions;
-- the original single-root tree, key list, baseline, checkpoint-header verification, dataflow
-  report, and standalone HTML viewer.
+- `candle-graph/viewer/1`: standalone interactive HTML visualizer (requires the `visualizer` feature).
+
+See [docs/features.md](docs/features.md) for the **`static`** / **`runtime`** / **`visualizer`**
+split: static IR for agents, runtime profiler timings, HTML for humans.
 
 ## Status
 
 Primary crate-wide UX is the Clippy-like Cargo subcommand `cargo candle-graph`
-(`check` / `report` / `query`) over the existing conservative analyzer. It is an explicit
+(`check` / `report` / `query` / `audit` / `view`) over the conservative analyzer. It is an explicit
 cargo command, not a rustc lint pass and not a silent `cargo build` hook.
 
-The agent-analysis path now supports:
+The agent-analysis path supports:
 
 - automatic component discovery from public API boundaries and `VarBuilder`/`VarBuilderArgs`
   constructors, with `--root` for private model roots;
@@ -54,7 +41,8 @@ The agent-analysis path now supports:
 - Cargo package, target, feature, Candle-version, active `cfg`, and per-function cfg-activity facts;
 - audited Candle 0.11.0 operation rules that distinguish similarly named APIs such as
   `RmsNorm::forward` and `RmsNorm::forward_diff`;
-- optional runtime tensor refinement and missing/zero/non-finite gradient findings.
+- optional runtime tensor refinement and missing/zero/non-finite gradient findings;
+- checkpoint-header verification and model-IR CI baselines.
 
 Analysis is deliberately conservative. Unsupported expressions remain `Unknown`; a same-dtype
 operation with one known and one unknown operand is a `dtype-risk`, while two known differing
@@ -74,7 +62,7 @@ Install once so Cargo discovers the Clippy-like subcommand (`cargo-candle-graph`
 `cargo candle-graph`):
 
 ```bash
-cargo install --path . --locked
+cargo install --path . --features all --locked
 ```
 
 Check a model crate the way you would run `cargo clippy` — an explicit cargo command, not a
@@ -98,10 +86,10 @@ Numeric domain: the analyzer expands audited candle-nn bodies (e.g. 0.11.0
 gradients or risk inference outputs. An `affine(mul>0, add>0)` epsilon guard discharges
 `StrictlyPositive` and must not false-positive.
 
-The legacy `candle-graph` binary remains available (including for existing audit scripts):
+The `candle-graph` binary mirrors the same model-mode engine for scripts:
 
 ```bash
-cargo run --release -- /path/to/model --model-ir --format json
+cargo run --release --features all -- /path/to/model --format json
 ```
 
 Ask focused questions. Listings are compact (counts/IDs, `drill_down` hints, no tensor evidence);
@@ -111,63 +99,77 @@ narrow with `--select` / singular kinds when you need contracts or evidence:
 cargo candle-graph query summary --path /path/to/model
 cargo candle-graph query doctor --path /path/to/model
 cargo candle-graph query components --path /path/to/model
-cargo run --release -- /path/to/model --query composition --format json
-cargo run --release -- /path/to/model --query assembly --select model --format json
-cargo run --release -- /path/to/model --query pipeline --format json
-cargo run --release -- /path/to/model --query entrypoints --format json
-cargo run --release -- /path/to/model \
-  --query tensors --select 'MyModel::forward' \
-  --limit 20 --offset 0 --format json
-cargo run --release -- /path/to/model \
-  --query tensor --select '<tensor-stable-id>' --format json
-cargo run --release -- /path/to/model --query cargo --format json
-cargo run --release -- /path/to/model --query findings --format json
+cargo candle-graph query composition --path /path/to/model --format json
+cargo candle-graph query assembly --select model --path /path/to/model --format json
+cargo candle-graph query pipeline --path /path/to/model --format json
+cargo candle-graph query entrypoints --path /path/to/model --format json
+cargo candle-graph query tensors --select 'MyModel::forward' \
+  --path /path/to/model --limit 20 --offset 0 --format json
+cargo candle-graph query tensor --select '<tensor-stable-id>' \
+  --path /path/to/model --format json
+cargo candle-graph query cargo --path /path/to/model --format json
+cargo candle-graph query findings --path /path/to/model --format json
+cargo candle-graph query graph-train --path /path/to/model --format json
+cargo candle-graph query graph-infer --path /path/to/model --format json
 ```
 
 Use fully qualified selectors when bare names collide:
 
 ```bash
-cargo run --release -- /path/to/model \
-  --query function --select 'model::MyModel::forward' \
-  --format json
+cargo candle-graph query function --select 'model::MyModel::forward' \
+  --path /path/to/model --format json
 ```
-
 
 Select Cargo features/target exactly as the analyzed build does:
 
 ```bash
-cargo run --release -- /path/to/model \
+cargo candle-graph query cargo \
+  --path /path/to/model \
   --features cuda,flash-attn \
   --target x86_64-unknown-linux-gnu \
-  --query cargo --format json
+  --format json
 ```
 
 The analyzer follows the selected Cargo crate root and reachable `mod` declarations. It defaults
 to the library target, then the first ordinary binary; use `--cargo-target <name>` for another
-binary/example/test target. The existing `--target` option selects a Rust target triple.
+binary/example/test target. The `--target` option selects a Rust target triple.
 
 Import an instrumented small-run trace:
 
 ```bash
-cargo run --release -- /path/to/model \
+cargo candle-graph query runtime \
+  --path /path/to/model \
   --runtime-trace run.runtime.jsonl \
-  --query runtime --format json
+  --format json
+```
+
+Open the interactive multi-view HTML visualizer (requires candle-graph built with the
+`visualizer` or `all` feature):
+
+```bash
+cargo candle-graph view --path /path/to/model --output model.html
+```
+
+`--features` on this command selects Cargo features on the **model crate** (e.g. `cuda`),
+not candle-graph. Names like `static`, `visualizer`, `runtime`, and `all` are candle-graph build flags
+and are ignored when passed here. See [docs/features.md](docs/features.md) and [docs/visualizer.md](docs/visualizer.md).
+
+Write a multi-file audit bundle (summary, doctor, findings, checkpoint verification, …):
+
+```bash
+cargo candle-graph audit runs/analyzer \
+  --path /path/to/model \
+  --checkpoint /path/to/model.safetensors \
+  --runtime-trace runs/train/runtime.json \
+  --verify-root vb \
+  --strict
 ```
 
 See [docs/agent-query-api.md](docs/agent-query-api.md) for the query map,
+[docs/visualizer.md](docs/visualizer.md) for the HTML visualizer,
 [docs/runtime-protocol.md](docs/runtime-protocol.md) for trace field definitions, and
 [docs/runtime-analysis-guide.md](docs/runtime-analysis-guide.md) for the recommended runtime workflow
 (gradient audit, phase graphs, offline profiling).
-
-The original single-component workflows remain available:
-
-```bash
-cargo run --release -- /path/to/model/src --root MyModel
-cargo run --release -- /path/to/model --root MyModel \
-  --entry MyModel::forward --format html --output model-graph.html
-cargo run --release -- /path/to/model/src --root MyModel \
-  --verify /path/to/model.safetensors --verify-root base_vb
-```
 
 Checkpoint verification reads only the safetensors length prefix and JSON header. A template such
 as `model.layers.{index}.self_attn.q_proj.weight` matches all concrete layer indices.
@@ -175,23 +177,19 @@ as `model.layers.{index}.self_attn.q_proj.weight` matches all concrete layer ind
 Create and check a canonical CI baseline:
 
 ```bash
-cargo run --release -- /path/to/model/src \
-  --root MyModel \
-  --entry train \
-  --update-baseline model.candle-graph
+cargo candle-graph check /path/to/model \
+  --update-baseline model.candle-graph-baseline
 
-cargo run --release -- /path/to/model/src \
-  --root MyModel \
-  --entry train \
-  --check model.candle-graph \
+cargo candle-graph check /path/to/model \
+  --check model.candle-graph-baseline \
   --strict
 ```
 
-`--strict` rejects unknown structural parameters, structure diagnostics, proven dtype conflicts,
-potential dtype risks, and dead trainable parameters. Known severing edges remain visible findings
-but do not fail strict mode by themselves because deliberate detaches are valid.
+`--strict` rejects proven dtype conflicts, numeric-domain violations, and other proven error
+findings. Coverage-gap warnings and heuristic architecture notes stay visible but do not fail the
+gate by themselves.
 
-Run `candle-graph --help` for all options.
+Run `cargo candle-graph --help` for all options.
 
 ## Supported source patterns
 

@@ -127,6 +127,25 @@ pub struct Key {
 }
 
 impl Key {
+    /// Parse a dotted checkpoint key string, treating `{…}` segments as templates.
+    pub fn from_dotted(text: &str) -> Self {
+        Key {
+            segs: text
+                .split('.')
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    if part.contains('{') && part.contains('}') {
+                        KeySeg::Template {
+                            text: part.to_string(),
+                        }
+                    } else {
+                        KeySeg::Literal(part.to_string())
+                    }
+                })
+                .collect(),
+        }
+    }
+
     /// Append a prefix as written at a `pp()` call. A single call may carry dots
     /// (`pp("lora_layers.0")`), so the text is split to keep key algebra uniform.
     pub fn push_literal(&self, text: &str) -> Self {

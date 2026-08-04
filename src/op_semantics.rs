@@ -1,7 +1,7 @@
 //! Transfer rules for candle Tensor ops and known candle-nn helpers.
 //!
 //! Rules are deliberate and incomplete by design: anything not listed returns
-//! [`OpEffect::Unknown`] rather than inventing behaviour.
+//! [`OpEffect::unknown`] rather than inventing behaviour.
 
 use serde::Serialize;
 
@@ -267,6 +267,17 @@ pub struct OpEffect {
 }
 
 impl OpEffect {
+    /// Dtype known from dataflow on the output but no catalog rule for the callee name.
+    pub fn inferred_preserve(name: &str) -> Self {
+        Self::known(
+            name,
+            DtypeRule::Preserve,
+            GradFlow::Unknown,
+            false,
+            Some("dataflow resolved output dtype; treat as dtype-preserving"),
+        )
+    }
+
     fn known(
         name: &str,
         dtype: DtypeRule,
@@ -723,6 +734,15 @@ pub fn lookup_for(op: &str, candle_nn_version: Option<&str>) -> OpEffect {
             Some("candle_nn softmax family; probabilities attain 0/1 after f32 rounding"),
         )
         .with_domain(NumericDomain::SaturatingUnit),
+
+        // Result/type wrappers and views preserve tensor metadata.
+        "map_err" | "ok" | "err" => OpEffect::known(
+            name,
+            DtypeRule::Preserve,
+            GradFlow::Propagates,
+            false,
+            Some("Result/type wrapper preserves tensor dtype"),
+        ),
 
         // device moves preserve dtype and grad
         "to_device" | "clone" => {

@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use std::{
+    collections::HashMap,
     io::{self, Write},
     path::{Path, PathBuf},
 };
@@ -11,8 +12,6 @@ use crate::{
     cargo_context::CargoOptions,
     diagnostics::{self, MessageFormat},
     discover::{self, ScanOptions},
-    extract::Extractor,
-    load,
     model_baseline,
     model_ir::ModelIr,
     query::{self, QueryKind},
@@ -24,6 +23,8 @@ use crate::{
 pub enum OutputFormat {
     Json,
     Tree,
+    #[cfg(feature = "visualizer")]
+    Html,
 }
 
 /// How to render analyzed model facts.
@@ -61,8 +62,6 @@ pub struct AuditBundle {
     pub output_dir: PathBuf,
     pub checkpoint: Option<PathBuf>,
     pub verify_root: Option<String>,
-    pub legacy_root: Option<String>,
-    pub legacy_entry: Option<String>,
     pub deny_rules: Vec<String>,
     pub strict: bool,
 }
@@ -82,6 +81,10 @@ pub struct ModelRun {
     pub check_baseline: Option<PathBuf>,
     pub update_baseline: Option<PathBuf>,
     pub audit: Option<AuditBundle>,
+    /// Optional safetensors checkpoint merged before report/audit (header verify only).
+    pub checkpoint: Option<PathBuf>,
+    /// VarBuilder root for safetensors checkpoint verification (default: first builder or `vb`).
+    pub verify_root: Option<String>,
 }
 
 /// Analyze a crate into the unified model IR, optionally reusing a disk cache.
@@ -124,6 +127,11 @@ pub fn render_report(model: &ModelIr, report: &ReportMode) -> Result<String> {
                 let request = query::QueryRequest::new(query::QueryKind::Summary);
                 Ok(query::render_text(&query::execute(model, &request)?))
             }
+            #[cfg(feature = "visualizer")]
+            OutputFormat::Html => {
+                let payload = crate::viewer_projection::project(model);
+                Ok(crate::viewer::render_html(&payload))
+            }
         },
         ReportMode::Query {
             kind,
@@ -142,6 +150,11 @@ pub fn render_report(model: &ModelIr, report: &ReportMode) -> Result<String> {
             match format {
                 OutputFormat::Json => Ok(serde_json::to_string_pretty(&response)? + "\n"),
                 OutputFormat::Tree => Ok(query::render_text(&response)),
+                #[cfg(feature = "visualizer")]
+                OutputFormat::Html => {
+                    let payload = crate::viewer_projection::project(model);
+                    Ok(crate::viewer::render_html(&payload))
+                }
             }
         }
     }
@@ -154,139 +167,85 @@ fn write_query(model: &ModelIr, kind: QueryKind, path: &Path) -> Result<()> {
     write_output(Some(path), rendered.as_bytes())
 }
 
-fn write_legacy_world_model(
-    request: &AnalyzeRequest,
-    legacy_root: &str,
-    legacy_entry: Option<&str>,
-    path: &Path,
-) -> Result<()> {
-    let cargo_context =
-        crate::cargo_context::CargoContext::discover(&request.path, &request.cargo).ok();
-    let mut krate = match cargo_context.as_ref() {
-        Some(context) => {
-            let roots = context.selected_source_roots(request.cargo.package_target.as_deref())?;
-            load::load_from_roots(&request.path, &roots)?
-        }
-        None => load::load(&request.path)?,
-    };
-    if let Some(context) = cargo_context.as_ref() {
-        krate.set_dependency_aliases(context.dependency_aliases.clone());
-    }
-    let candle_nn_version = cargo_context.as_ref().and_then(|context| {
-        crate::op_semantics::matched_candle_version(
-            context
-                .candle_versions
-                .get("candle-core")
-                .map(String::as_str),
-            context.candle_versions.get("candle-nn").map(String::as_str),
-        )
-        .map(str::to_string)
-    });
-    let structure =
-        Extractor::for_candle_version(&krate, candle_nn_version.as_deref()).run(legacy_root, None)?;
-    let mut payload = serde_json::json!({
-        "root": legacy_root,
-        "parameters": structure.params.len(),
-        "parameter_keys": structure.params.iter().map(|p| p.key.to_string()).collect::<Vec<_>>(),
-    });
-    if let Some(entry) = legacy_entry {
-        if let Ok(graph) =
-            crate::dataflow::analyze_with_candle_version(&krate, entry, candle_nn_version.as_deref())
-        {
-            payload["entry"] = entry.into();
-            payload["dataflow_nodes"] = graph.nodes.len().into();
-        }
-    }
-    write_output(
-        Some(path),
-        (serde_json::to_string_pretty(&payload)? + "\n").as_bytes(),
-    )
-}
-
 fn write_checkpoint_audit(
-    request: &AnalyzeRequest,
-    model: &ModelIr,
+    model: &mut ModelIr,
     checkpoint: &Path,
     verify_root: Option<&str>,
     path: &Path,
 ) -> Result<()> {
     let header = verify::read_header(checkpoint)?;
     let root = verify_root
+        .map(str::to_string)
         .or_else(|| {
             model
                 .components
                 .first()
-                .and_then(|c| c.builders.first().map(|b| b.name.as_str()))
+                .and_then(|c| c.builders.first().map(|b| b.name.clone()))
         })
-        .unwrap_or("vb");
-    let mut structure = legacy_structure_for_verify(request, root)?;
-    let report = verify::verify(&mut structure, &header, root);
+        .unwrap_or_else(|| "vb".to_string());
+    let report = verify::verify_model(model, &header, &root);
     write_output(
         Some(path),
         (serde_json::to_string_pretty(&report)? + "\n").as_bytes(),
     )
 }
 
-fn legacy_structure_for_verify(request: &AnalyzeRequest, root: &str) -> Result<crate::ir::Structure> {
-    let cargo_context =
-        crate::cargo_context::CargoContext::discover(&request.path, &request.cargo).ok();
-    let mut krate = match cargo_context.as_ref() {
-        Some(context) => {
-            let roots = context.selected_source_roots(request.cargo.package_target.as_deref())?;
-            load::load_from_roots(&request.path, &roots)?
-        }
-        None => load::load(&request.path)?,
-    };
-    if let Some(context) = cargo_context.as_ref() {
-        krate.set_dependency_aliases(context.dependency_aliases.clone());
-    }
-    let candle_nn_version = cargo_context.as_ref().and_then(|context| {
-        crate::op_semantics::matched_candle_version(
-            context
-                .candle_versions
-                .get("candle-core")
-                .map(String::as_str),
-            context.candle_versions.get("candle-nn").map(String::as_str),
-        )
-        .map(str::to_string)
-    });
-    Extractor::for_candle_version(&krate, candle_nn_version.as_deref()).run(root, None)
-}
-
-fn run_audit_bundle(model: &ModelIr, request: &AnalyzeRequest, audit: &AuditBundle) -> Result<()> {
+fn run_audit_bundle(
+    model: &mut ModelIr,
+    _request: &AnalyzeRequest,
+    audit: &AuditBundle,
+) -> Result<()> {
     std::fs::create_dir_all(&audit.output_dir)
         .with_context(|| format!("creating {}", audit.output_dir.display()))?;
-    write_query(model, QueryKind::Summary, &audit.output_dir.join("summary.json"))?;
-    write_query(model, QueryKind::Doctor, &audit.output_dir.join("doctor.json"))?;
+    write_query(
+        model,
+        QueryKind::Summary,
+        &audit.output_dir.join("summary.json"),
+    )?;
+    write_query(
+        model,
+        QueryKind::Doctor,
+        &audit.output_dir.join("doctor.json"),
+    )?;
     write_query(
         model,
         QueryKind::ModelImprovement,
         &audit.output_dir.join("model-improvement.json"),
     )?;
-    write_query(model, QueryKind::Findings, &audit.output_dir.join("findings.json"))?;
-    let rendered = render_report(model, &ReportMode::FullIr {
-        format: OutputFormat::Json,
-    })?;
+    write_query(
+        model,
+        QueryKind::Findings,
+        &audit.output_dir.join("findings.json"),
+    )?;
+    let rendered = render_report(
+        model,
+        &ReportMode::FullIr {
+            format: OutputFormat::Json,
+        },
+    )?;
     write_output(
         Some(&audit.output_dir.join("model-ir.json")),
         rendered.as_bytes(),
     )?;
     #[cfg(feature = "runtime")]
-    if let Some(runtime) = &request.runtime_trace {
-        write_query(model, QueryKind::Runtime, &audit.output_dir.join("runtime.json"))?;
+    if let Some(runtime) = &_request.runtime_trace {
+        write_query(
+            model,
+            QueryKind::Runtime,
+            &audit.output_dir.join("runtime.json"),
+        )?;
         let _ = runtime;
     }
-    if let Some(root) = audit.legacy_root.as_deref() {
-        write_legacy_world_model(
-            request,
-            root,
-            audit.legacy_entry.as_deref(),
-            &audit.output_dir.join("world-model.json"),
+    #[cfg(feature = "visualizer")]
+    {
+        let payload = crate::viewer_projection::project(model);
+        write_output(
+            Some(&audit.output_dir.join("model.html")),
+            crate::viewer::render_html(&payload).as_bytes(),
         )?;
     }
     if let Some(checkpoint) = &audit.checkpoint {
         write_checkpoint_audit(
-            request,
             model,
             checkpoint,
             audit.verify_root.as_deref(),
@@ -320,9 +279,30 @@ fn enforce_exit_policy(model: &ModelIr, run: &ModelRun) -> Result<()> {
     Ok(())
 }
 
+fn apply_checkpoint(
+    model: &mut ModelIr,
+    checkpoint: &Path,
+    verify_root: Option<&str>,
+) -> Result<()> {
+    let header = verify::read_header(checkpoint)?;
+    let root = verify_root
+        .map(str::to_string)
+        .or_else(|| {
+            model
+                .components
+                .first()
+                .and_then(|c| c.builders.first().map(|b| b.name.clone()))
+        })
+        .unwrap_or_else(|| "vb".to_string());
+    verify::verify_model(model, &header, &root);
+    crate::dtype_propagate::propagate_tensor_dtypes(model, &HashMap::new());
+    model.normalize();
+    Ok(())
+}
+
 /// Run a full model-mode invocation: analyze, optional baseline, report, diagnostics, exit policy.
 pub fn run_model(run: &ModelRun) -> Result<()> {
-    let model = analyze_model(&run.analyze)?;
+    let mut model = analyze_model(&run.analyze)?;
 
     if let Some(path) = &run.update_baseline {
         model_baseline::update(&model, path)
@@ -334,8 +314,14 @@ pub fn run_model(run: &ModelRun) -> Result<()> {
             .with_context(|| format!("checking model baseline {}", path.display()))?;
     }
 
+    if run.audit.is_none() {
+        if let Some(checkpoint) = &run.checkpoint {
+            apply_checkpoint(&mut model, checkpoint, run.verify_root.as_deref())?;
+        }
+    }
+
     if let Some(audit) = &run.audit {
-        run_audit_bundle(&model, &run.analyze, audit)?;
+        run_audit_bundle(&mut model, &run.analyze, audit)?;
     }
 
     let rendered = render_report(&model, &run.report)?;
@@ -369,7 +355,9 @@ pub fn resolve_package_path(path: Option<&Path>, manifest_path: Option<&Path>) -
         }
         return Ok(manifest.to_path_buf());
     }
-    Ok(path.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".")))
+    Ok(path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(".")))
 }
 
 pub fn write_output(path: Option<&Path>, bytes: &[u8]) -> Result<()> {
