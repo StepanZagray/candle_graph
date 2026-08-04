@@ -28,10 +28,10 @@ use crate::model_ir::{
     BuilderSourceKind, CargoSummary, Component, Confidence, DeviceFact, Evidence, EvidenceKind,
     Finding, FindingSeverity, Function, FunctionParameter, LayoutFact, ModelIr, Module, Operation,
     OptimizerMembership, Parameter, ParameterRole, PipelineStage, ShapeFact, StableId,
-    StageDispatchKind, StageKind, TensorContract, TensorRole, TimingStats, Visibility,
+    StageDispatchKind, StageKind, TensorContract, TensorRole, Visibility,
 };
 #[cfg(feature = "runtime")]
-use crate::model_ir::{EdgeTimingSummary, RuntimeSummary};
+use crate::model_ir::{EdgeTimingSummary, RuntimeSummary, TimingStats};
 use crate::op_semantics::{self};
 #[cfg(feature = "runtime")]
 use crate::runtime::{self, ExpectedIdentity, GradientState, RuntimeTrace};
