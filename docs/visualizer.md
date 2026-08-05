@@ -1,77 +1,55 @@
-# HTML visualizer
+# HTML trace visualizer
 
-The `visualizer` feature emits a standalone `model.html` file: one document with embedded
-CSS, JavaScript, and the `candle-graph/viewer/1` JSON payload. No CDN or network access
-required.
+Standalone `model.html`: embedded CSS, JavaScript, and `candle-graph/viewer/2` JSON. No CDN.
+
+```bash
+cargo candle-graph view profile.jsonl --output model.html
+```
 
 ## Build / install
 
-Enable the feature when building or installing candle-graph:
-
 ```bash
 cargo install --path . --features visualizer --locked
-# or
-cargo install --path . --features all --locked
 ```
-
-Open the visualizer:
-
-```bash
-cargo candle-graph view --path /path/to/model --output model.html
-```
-
-### `--features` on the command line
-
-`--features` on `cargo candle-graph …` selects **Cargo features on the model crate being
-analyzed** (e.g. `cuda`, `cudnn`), not candle-graph itself.
-
-| Name | Meaning |
-|------|---------|
-| `static`, `visualizer`, `runtime`, `all` | candle-graph build flags — **ignored** when passed to analyze commands |
-
-Build candle-graph with `visualizer` or `all` instead. For Tofy, the `.cargo/config.toml`
-alias already passes `--features all` when compiling the subcommand.
 
 ## UI
 
-| Tab | Content |
-|-----|---------|
-| **Architecture** | Module tree (sidebar) + L→R hierarchy graph with layer bands |
-| **Train / Infer** | Function-scoped dataflow — pick a function on large models |
-| **Pipeline** | Stage dependency graph (top-to-bottom) |
-| **Findings** | Click to jump to the suggested view and highlight nodes |
+| Area | Content |
+| --- | --- |
+| **Views tabs** | Call graph, timeline, gradient summary |
+| **Span hierarchy** | Nested function/module/op tree with self-time |
+| **Canvas** | Dagre layout; **ms label on every edge** |
+| **Inspector** | Selected span/op: self time, total time, shape, dtype |
 
-Graph nodes render as readable cards (wrapped labels, kind badges, color-coded borders)
-on a dot-grid canvas. Layer bands alternate by dagre rank for easier left-to-right scanning.
-
-Controls: resizable panes, node search (centers match), floating zoom (+/−/fit), keyboard
-(`+`/`−` zoom, `F` fit, `0` reset), hover tooltips, collapsible legend, Export SVG,
-Preview (print mode), Fit / Reset zoom.
+Controls: resizable panes, span search, floating zoom (+/−/fit), keyboard shortcuts, hover tooltips,
+collapsible legend, Export SVG, theme toggle.
 
 Fully offline: system fonts only, vendored dagre — no CDN or network fetches.
 
 ## Graph layout
 
-Graph layout uses **[dagre](https://github.com/dagrejs/dagre)** (`@dagrejs/dagre` 3.1),
-vendored as `src/viewer/dagre.min.js` (~48 KB). Dagre implements the Sugiyama layered DAG
-pipeline: rank assignment (network simplex), crossing minimization, coordinate assignment,
-and orthogonal edge routing with precomputed `points` polylines.
+Graph layout uses **[dagre](https://github.com/dagrejs/dagre)** vendored as `src/viewer/dagre.min.js`.
+Self-time heat colors nodes (cool = mostly waiting on children, hot = self work).
 
-| View | Dagre config |
-|------|----------------|
-| Architecture | `rankdir: LR`, network-simplex ranker |
-| Train / Infer | `rankdir: LR` |
-| Pipeline | `rankdir: TB` |
+## Payload schema
 
-Cycles are broken with dagre's greedy acyclic adjustment before layout.
+`candle-graph/viewer/2` — produced by [`trace_view::project`](../src/viewer/trace_view.rs) from an
+[`ExecutionGraph`](../src/graph/model.rs).
 
-### Agent payload
+Key fields:
 
-Embedded JSON includes `summary`, `agent_context`, and per-node `short_label` /
-`qualified_name`. Agents can read `<script id="cg-payload">` or use the query API.
+- `summary` — entrypoint, total ms, slowest spans
+- `views.call_graph` — nodes + edges with `duration_ms` on edges
+- `span_tree` — hierarchical sidebar data
 
-## Third-party
+## Source files
 
-| File | License |
-|------|---------|
-| `src/viewer/dagre.min.js` | MIT (@dagrejs/dagre) |
+| File | Role |
+| --- | --- |
+| `src/viewer.rs` | HTML shell + embed JSON |
+| `src/viewer/trace_view.rs` | Graph → viewer/2 projection |
+| `src/viewer/app_trace.js` | Trace viewer runtime |
+| `src/viewer/style.css` | Shared styles |
+| `src/viewer/layout.js` | Dagre wrapper |
+
+The legacy static-analysis viewer (`app.js`, viewer/1) was removed in v0.4.

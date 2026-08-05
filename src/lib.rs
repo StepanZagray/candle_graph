@@ -1,36 +1,21 @@
-//! Static structure and dataflow analysis for candle-rs models.
+//! TensorFlow Profiler-style execution graphs for [Candle](https://github.com/huggingface/candle) runs.
 //!
-//! See `README.md` and `docs/features.md` for the feature split:
+//! Record a post-run JSONL trace ([`instrument::TraceSession`]), build an [`graph::ExecutionGraph`],
+//! and inspect it via CLI or HTML ([`viewer::render_trace_html`]).
 //!
-//! - **`static`** (default): agent-oriented IR, bounded queries, dtype/gradient dataflow
-//! - **`runtime`**: merge v3 profile traces; operation timings (avg/min/max) and gradient audit
-//! - **`visualizer`**: standalone `model.html` for human exploration
+//! There is **no static Rust analysis** — the graph comes only from what executed.
 
-pub mod analysis_cache;
-pub mod cargo_context;
 pub mod cli;
-pub mod contracts;
-pub mod dataflow;
-pub mod dtype_propagate;
-pub mod diagnostics;
-pub mod discover;
-pub mod extract;
-pub mod ir;
-pub mod known;
-pub mod load;
-pub mod model_baseline;
-pub mod model_ir;
-pub mod op_semantics;
+pub mod graph;
+pub mod instrument;
 pub mod phase;
-#[cfg(feature = "runtime")]
-pub mod profile;
-pub mod query;
-#[cfg(feature = "runtime")]
-pub mod runtime;
-pub mod verify;
+pub mod trace;
 #[cfg(feature = "visualizer")]
 pub mod viewer;
-#[cfg(feature = "visualizer")]
-pub mod viewer_projection;
 
-pub use phase::ExecutionPhase;
+pub use graph::{build_from_trace, ExecutionGraph};
+pub use instrument::{MemoryRecord, OpRecord, SpanGuard, SpanId, SpanKind, TensorRecord, TraceSession};
+#[cfg(feature = "candle")]
+pub use instrument::candle;
+pub use phase::{ExecutionPhase, ExecutionStep};
+pub use trace::{parse_trace, write_jsonl, TraceDocument, TraceEvent, SCHEMA as TRACE_SCHEMA};

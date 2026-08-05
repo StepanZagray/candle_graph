@@ -432,8 +432,17 @@ window.CGLayout = (function () {
     return "";
   }
 
+  function edgeMidpoint(e) {
+    var pts = e._points;
+    if (!pts || pts.length === 0) return null;
+    var p = pts[Math.floor(pts.length / 2)];
+    return { x: p.x, y: p.y - 4 };
+  }
+
   function edgeClass(e) {
     if ((e.kind || "").indexOf("sever") >= 0 || e.grad_state === "Severed") return "edge-severed";
+    if (e.kind === "call") return "edge-call";
+    if (e.label && e.label.indexOf("ms") >= 0) return "edge-timed";
     if (e.label === "in") return "edge-in";
     if (e.label === "out") return "edge-out";
     if (e.kind === "composition") return "edge-composition";
@@ -450,6 +459,7 @@ window.CGLayout = (function () {
     layerBands: layerBands,
     assignEdgePorts: assignEdgePorts,
     routeEdge: routeEdge,
+    edgeMidpoint: edgeMidpoint,
     edgeClass: edgeClass,
   };
 })();

@@ -1,26 +1,22 @@
 [package]
 name = "candle-graph"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "Static structure and dataflow analysis for candle-rs models"
+description = "TensorFlow Profiler-style execution graphs for candle-rs (trace-only)"
 readme = "README.md"
 license = "MIT"
 authors = ["Stepan Zagray"]
-keywords = ["candle", "machine-learning", "static-analysis", "deep-learning"]
+keywords = ["candle", "machine-learning", "profiler", "deep-learning"]
 categories = ["development-tools", "science"]
 repository = "https://github.com/StepanZagray/candle_graph"
 documentation = "https://docs.rs/candle-graph"
 exclude = ["/target/**", "/.git/**"]
 
 [features]
-default = ["static"]
-# Agent-oriented static IR: structure, dtypes, gradient dataflow, bounded queries.
-static = []
-# Runtime profiler: merge v3 traces, operation/edge timings, gradient audit.
-runtime = []
-# Standalone HTML visualizer (`model.html`).
+default = ["visualizer"]
 visualizer = []
-all = ["runtime", "visualizer"]
+candle = ["dep:candle-core"]
+all = ["visualizer"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -28,12 +24,9 @@ all-features = true
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-proc-macro2 = { version = "1", features = ["span-locations"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-syn = { version = "2", features = ["full", "extra-traits", "visit", "parsing", "printing"] }
-quote = "1"
-walkdir = "2"
+candle-core = { version = "0.11", default-features = false, optional = true }
 
 [lib]
 name = "candle_graph"
@@ -48,13 +41,5 @@ name = "cargo-candle-graph"
 path = "src/cargo_candle_graph.rs"
 
 [[test]]
-name = "runtime"
-required-features = ["runtime"]
-
-[[test]]
-name = "phase_profile"
-required-features = ["runtime"]
-
-[[test]]
-name = "viewer"
+name = "trace_viewer"
 required-features = ["visualizer"]

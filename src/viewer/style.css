@@ -394,6 +394,15 @@ html, body {
   font: inherit;
   font-size: 13px;
 }
+.toolbar-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.toolbar-check input { accent-color: var(--accent); }
 
 .graph-banner {
   padding: 0.45rem 0.85rem;
@@ -710,6 +719,13 @@ html, body {
 .edge-composition { stroke: var(--edge-composition); }
 .edge-pipeline { stroke: var(--edge-pipeline); }
 .edge-severed { stroke: var(--edge-severed); }
+.edge-call, .edge-timed { stroke: #0d9488; stroke-width: 2.5; }
+.edge-label {
+  font-size: 10px;
+  font-weight: 600;
+  fill: #0d9488;
+  pointer-events: none;
+}
 
 .edge-group.dim .edge { opacity: 0.05; }
 .edge-group.highlight .edge { opacity: 1 !important; stroke-width: 2.5 !important; }

@@ -2,6 +2,7 @@
 
 - These rules apply to this repository.
 - Read this file before making edits.
+- Read [`CONTEXT.md`](CONTEXT.md): **trace-only** TensorFlow Profiler-style graphs for Candle.
 
 ## Chat
 
@@ -31,15 +32,15 @@ Single-context layout: `CONTEXT.md` at the repo root and ADRs under `docs/adr/`.
 
 | Feature | Use |
 | --- | --- |
-| `static` (default) | Agent IR + queries — no HTML, no runtime merge |
-| `runtime` | Profile traces, operation timings, gradient audit |
-| `visualizer` | `model.html` for humans |
+| `visualizer` (default) | `model.html` trace viewer |
+| `all` | Same as default today |
 
-Details: [`docs/features.md`](docs/features.md). Prefer the query API over full IR for agents.
+Details: [`docs/features.md`](docs/features.md), [`docs/runtime-analysis-guide.md`](docs/runtime-analysis-guide.md).
+Prefer bounded CLI queries (`summary`, `query --kind …`) over loading full graph JSON.
 
 ### UI / UX (HTML visualizer)
 
-This repo ships a standalone HTML visualizer (`src/viewer/`, emitted as `model.html`). Stack: embedded CSS + vanilla JavaScript + dagre — not React. Read [`docs/visualizer.md`](docs/visualizer.md) before changing layout, tabs, or graph views.
+Standalone HTML visualizer (`src/viewer/`, emitted as `model.html`). Stack: embedded CSS + vanilla JavaScript + dagre — not React. Read [`docs/visualizer.md`](docs/visualizer.md) before changing layout, tabs, or graph views.
 
 | Skill | When to use |
 |-------|-------------|
@@ -52,5 +53,16 @@ Prefer improving the existing visualizer over introducing a frontend framework.
 
 ## Related projects
 
-- Sibling crate used by [Tofy](../Tofy): path dependency for model analysis and audit workflows.
-- See `docs/agent-query-api.md` for the bounded query API agents should prefer over loading full source trees.
+- Sibling crate used by [Tofy](../Tofy): path dependency for post-run profiling and HTML inspection.
+
+## Module map
+
+| Module | Role |
+| --- | --- |
+| `trace/` | Parse/emit `candle-graph/trace/4` JSONL |
+| `instrument/` | `TraceSession`, `SpanGuard`, probe API |
+| `graph/` | `ExecutionGraph` from trace events |
+| `cli/trace_cli.rs` | `import`, `view`, `summary`, `query` |
+| `viewer/` | `render_trace_html` (`candle-graph/viewer/2`) |
+
+There is no static Rust analysis layer in this crate.

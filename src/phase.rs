@@ -1,8 +1,8 @@
-//! Train vs inference execution phase for static graphs and runtime traces.
+//! Train vs inference execution phase for trace metadata.
 
 use serde::{Deserialize, Serialize};
 
-/// Whether analysis or profiling targets training (autograd) or inference (no-grad).
+/// Whether profiling targets training (autograd) or inference (no-grad).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionPhase {
@@ -27,31 +27,30 @@ impl ExecutionPhase {
     }
 }
 
-/// Classify which static graphs to build for an entrypoint.
-pub fn entrypoint_phases(name: &str, qualified_name: &str, is_loss: bool) -> Vec<ExecutionPhase> {
-    if is_loss {
-        return vec![ExecutionPhase::Train];
+/// Training-step slice inside a probe run (PyTorch profiler timeline phases).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStep {
+    Forward,
+    Backward,
+    Optimizer,
+}
+
+impl ExecutionStep {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Forward => "forward",
+            Self::Backward => "backward",
+            Self::Optimizer => "optimizer",
+        }
     }
-    let lower = format!("{name} {qualified_name}").to_ascii_lowercase();
-    let infer_hint = lower.contains("eval")
-        || lower.contains("infer")
-        || lower.contains("predict")
-        || lower.contains("inference");
-    let train_hint = lower.contains("train")
-        || lower.contains("loss")
-        || lower.contains("backward")
-        || lower.contains("optim");
-    if name == "forward" || name == "forward_t" {
-        return vec![ExecutionPhase::Train, ExecutionPhase::Infer];
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.replace('-', "_").to_ascii_lowercase().as_str() {
+            "forward" | "fwd" => Some(Self::Forward),
+            "backward" | "backward_pass" | "bwd" | "backprop" => Some(Self::Backward),
+            "optimizer" | "optim" | "step" => Some(Self::Optimizer),
+            _ => None,
+        }
     }
-    if infer_hint && train_hint {
-        return vec![ExecutionPhase::Train, ExecutionPhase::Infer];
-    }
-    if infer_hint {
-        return vec![ExecutionPhase::Infer];
-    }
-    if train_hint {
-        return vec![ExecutionPhase::Train];
-    }
-    vec![ExecutionPhase::Train]
 }
