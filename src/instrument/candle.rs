@@ -4,8 +4,8 @@
 
 use candle_core::{DType, Device, DeviceLocation, Tensor};
 
-use crate::instrument::{MemoryRecord, OpRecord, TensorRecord, TraceSession};
 use crate::instrument::SpanId;
+use crate::instrument::{MemoryRecord, OpRecord, TensorRecord, TraceSession};
 use crate::phase::ExecutionStep;
 use crate::trace::memory::{category_for_step, storage_bytes};
 use crate::trace::MemoryCategory;
@@ -106,7 +106,11 @@ pub fn inputs_storage_bytes(tensors: &[&Tensor]) -> u64 {
 }
 
 /// Record a Candle tensor via [`TraceSession::record_tensor`].
-pub fn record_tensor(session: &TraceSession, span_id: SpanId, cap: &CandleCapture) -> anyhow::Result<()> {
+pub fn record_tensor(
+    session: &TraceSession,
+    span_id: SpanId,
+    cap: &CandleCapture,
+) -> anyhow::Result<()> {
     session.record_tensor(
         span_id,
         TensorRecord {
@@ -122,7 +126,11 @@ pub fn record_tensor(session: &TraceSession, span_id: SpanId, cap: &CandleCaptur
 }
 
 /// Record a timed op + memory alloc from a [`CandleOpCapture`].
-pub fn record_op(session: &TraceSession, span_id: SpanId, cap: &CandleOpCapture) -> anyhow::Result<()> {
+pub fn record_op(
+    session: &TraceSession,
+    span_id: SpanId,
+    cap: &CandleOpCapture,
+) -> anyhow::Result<()> {
     session.record_op(
         span_id,
         OpRecord {

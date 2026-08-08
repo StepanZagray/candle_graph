@@ -2,9 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::phase::ExecutionStep;
 use super::memory::{MemoryAction, MemoryCategory};
 use super::schema::{GradientState, SpanKind, TraceRunMeta, SCHEMA};
+use crate::phase::ExecutionStep;
 
 /// One JSONL record in a trace stream.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

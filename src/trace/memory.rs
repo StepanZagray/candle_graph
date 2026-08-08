@@ -8,9 +8,7 @@ use super::document::TraceDocument;
 use super::events::OpEvent;
 
 /// TensorFlow-profiler-style memory category for timeline breakdown.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryCategory {
     Parameter,
@@ -43,7 +41,9 @@ pub fn dtype_size_bytes(dtype: &str) -> Option<usize> {
 
 /// Product of shape dimensions; returns `0` for empty shape.
 pub fn elem_count(shape: &[usize]) -> u64 {
-    shape.iter().fold(1u64, |acc, dim| acc.saturating_mul(*dim as u64))
+    shape
+        .iter()
+        .fold(1u64, |acc, dim| acc.saturating_mul(*dim as u64))
 }
 
 /// Storage bytes for a dense tensor (`elem_count × dtype_bytes`).
@@ -63,7 +63,10 @@ pub fn resolve_storage_bytes(explicit: Option<u64>, shape: &[usize], dtype: &str
 }
 
 /// Map a training step (+ tensor flags) to a PyTorch-style memory category.
-pub fn category_for_step(step: Option<crate::phase::ExecutionStep>, requires_grad: bool) -> MemoryCategory {
+pub fn category_for_step(
+    step: Option<crate::phase::ExecutionStep>,
+    requires_grad: bool,
+) -> MemoryCategory {
     match step {
         Some(crate::phase::ExecutionStep::Backward) => MemoryCategory::Gradient,
         Some(crate::phase::ExecutionStep::Optimizer) => MemoryCategory::Optimizer,
@@ -195,9 +198,7 @@ pub fn analyze_memory(doc: &TraceDocument) -> MemoryProfile {
     for event in &events {
         let device = event.device.clone();
         let live = by_device_live.entry(device.clone()).or_insert(0);
-        let categories = by_device_category
-            .entry(device.clone())
-            .or_default();
+        let categories = by_device_category.entry(device.clone()).or_default();
         let cat_key = category_key(event.category);
 
         match event.action {
@@ -263,7 +264,11 @@ pub fn analyze_memory(doc: &TraceDocument) -> MemoryProfile {
             global_peak_ts = event.timestamp_ns;
             global_peak_device = device.clone();
             peak_breakdown = live_tensors.values().cloned().collect();
-            peak_breakdown.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.tensor_id.cmp(&b.tensor_id)));
+            peak_breakdown.sort_by(|a, b| {
+                b.bytes
+                    .cmp(&a.bytes)
+                    .then_with(|| a.tensor_id.cmp(&b.tensor_id))
+            });
             peak_by_category = categories.clone();
         }
 
@@ -282,22 +287,22 @@ pub fn analyze_memory(doc: &TraceDocument) -> MemoryProfile {
     }
 
     for snapshot in &doc.device_memory {
-        let entry = device_capacity
-            .entry(snapshot.device.clone())
-            .or_insert(0);
+        let entry = device_capacity.entry(snapshot.device.clone()).or_insert(0);
         *entry = (*entry).max(snapshot.used_bytes.saturating_add(snapshot.free_bytes));
     }
 
     let mut by_device: Vec<DeviceMemoryStats> = device_peaks
         .into_iter()
-        .map(|(device, (peak_bytes, peak_timestamp_ns))| DeviceMemoryStats {
-            device: device.clone(),
-            capacity_bytes: device_capacity.get(&device).copied().unwrap_or(0),
-            peak_bytes,
-            peak_timestamp_ns,
-            alloc_count: device_alloc_count.get(&device).copied().unwrap_or(0),
-            free_count: device_free_count.get(&device).copied().unwrap_or(0),
-        })
+        .map(
+            |(device, (peak_bytes, peak_timestamp_ns))| DeviceMemoryStats {
+                device: device.clone(),
+                capacity_bytes: device_capacity.get(&device).copied().unwrap_or(0),
+                peak_bytes,
+                peak_timestamp_ns,
+                alloc_count: device_alloc_count.get(&device).copied().unwrap_or(0),
+                free_count: device_free_count.get(&device).copied().unwrap_or(0),
+            },
+        )
         .collect();
     by_device.sort_by(|a, b| a.device.cmp(&b.device));
 
@@ -391,9 +396,9 @@ fn synthesize_from_ops(doc: &TraceDocument) -> Vec<TimelineEvent> {
             clock
         };
 
-        let bytes = op.storage_bytes.unwrap_or_else(|| {
-            resolve_storage_bytes(None, &op.shape, &op.dtype)
-        });
+        let bytes = op
+            .storage_bytes
+            .unwrap_or_else(|| resolve_storage_bytes(None, &op.shape, &op.dtype));
         if bytes == 0 {
             continue;
         }
@@ -499,9 +504,9 @@ pub fn node_memory_metrics(
         let index = *per_span_index.entry(op.span_id.clone()).or_insert(0);
         per_span_index.insert(op.span_id.clone(), index + 1);
 
-        let bytes = op.storage_bytes.unwrap_or_else(|| {
-            resolve_storage_bytes(None, &op.shape, &op.dtype)
-        });
+        let bytes = op
+            .storage_bytes
+            .unwrap_or_else(|| resolve_storage_bytes(None, &op.shape, &op.dtype));
         if bytes == 0 {
             continue;
         }

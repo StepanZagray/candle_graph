@@ -12,11 +12,11 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::phase::ExecutionPhase;
-use crate::trace::memory::category_for_step;
 use crate::trace::events::{
     DeviceMemoryEvent, GradientEvent, MemoryEvent, OpEvent, SpanEndEvent, SpanStartEvent,
     TensorEvent, TraceEvent,
 };
+use crate::trace::memory::category_for_step;
 use crate::trace::memory::{resolve_storage_bytes, MemoryAction};
 use crate::trace::schema::{GradientState, TraceRunMeta};
 
@@ -66,10 +66,7 @@ impl TraceSession {
             timestamp: utc_iso8601_now(),
             candle_version: None,
         };
-        write_event(
-            &mut writer,
-            &TraceEvent::meta(meta),
-        )?;
+        write_event(&mut writer, &TraceEvent::meta(meta))?;
         Ok(Self {
             path,
             inner: RefCell::new(SessionInner {
@@ -108,11 +105,7 @@ impl TraceSession {
         let mut inner = self.inner.borrow_mut();
         inner.next_span_id += 1;
         let span_id = inner.next_span_id;
-        let parent_id = inner
-            .span_stack
-            .last()
-            .copied()
-            .map(span_id_string);
+        let parent_id = inner.span_stack.last().copied().map(span_id_string);
 
         format_span_id(&mut inner.id_buf, span_id);
         let id_str = inner.id_buf.clone();
@@ -381,9 +374,7 @@ impl TraceSession {
 fn write_event<W: Write, T: Serialize>(writer: &mut W, event: &T) -> Result<()> {
     let mut line = serde_json::to_vec(event).context("serializing trace JSONL event")?;
     line.push(b'\n');
-    writer
-        .write_all(&line)
-        .context("writing trace JSONL event")
+    writer.write_all(&line).context("writing trace JSONL event")
 }
 
 fn format_span_id(buf: &mut String, id: u64) {
@@ -412,9 +403,7 @@ fn utc_iso8601_now() -> String {
     let secs = now.as_secs();
     let millis = now.subsec_millis();
     let (year, month, day, hour, minute, second) = unix_secs_to_utc(secs);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
 /// Convert Unix seconds to UTC calendar components (Gregorian).
@@ -444,8 +433,8 @@ mod tests {
     use super::*;
     use crate::trace::document::parse_trace;
     use crate::trace::events::SpanStartEvent;
-    use std::io::{BufRead, BufReader};
     use serde_json::Value;
+    use std::io::{BufRead, BufReader};
 
     fn temp_trace(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -494,8 +483,7 @@ mod tests {
     #[test]
     fn nested_spans_emit_parent_hierarchy_and_durations() {
         let path = temp_trace("nested");
-        let session =
-            TraceSession::open(&path, "model::forward", ExecutionPhase::Train).unwrap();
+        let session = TraceSession::open(&path, "model::forward", ExecutionPhase::Train).unwrap();
 
         let inner_id = {
             let _outer = session.begin_span("Model::forward", SpanKind::Function);
@@ -556,15 +544,9 @@ mod tests {
     #[test]
     fn record_gradient_round_trips_through_trace_parser() {
         let path = temp_trace("gradient");
-        let session =
-            TraceSession::open(&path, "train::loss", ExecutionPhase::Train).unwrap();
+        let session = TraceSession::open(&path, "train::loss", ExecutionPhase::Train).unwrap();
         session
-            .record_gradient(
-                "vb",
-                "encoder.weight",
-                GradientState::Present,
-                Some(0.42),
-            )
+            .record_gradient("vb", "encoder.weight", GradientState::Present, Some(0.42))
             .unwrap();
         session.finish().unwrap();
 

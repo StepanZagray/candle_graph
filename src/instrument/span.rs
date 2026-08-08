@@ -64,11 +64,7 @@ pub struct SpanGuard<'a> {
 
 impl Drop for SpanGuard<'_> {
     fn drop(&mut self) {
-        let duration_ns = self
-            .started
-            .elapsed()
-            .as_nanos()
-            .min(u64::MAX as u128) as u64;
+        let duration_ns = self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let _ = self.session.end_span(self.id, duration_ns);
     }
 }

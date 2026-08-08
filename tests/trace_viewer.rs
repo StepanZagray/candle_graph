@@ -7,8 +7,8 @@ use candle_graph::graph::{
 use candle_graph::trace::memory::MemorySummary;
 use candle_graph::trace::schema::{SpanKind, SpanRecord, TraceRunMeta, SCHEMA as TRACE_SCHEMA};
 use candle_graph::trace::TraceDocument;
-use candle_graph::viewer::{embed_json, escape_for_script, render_trace_html};
 use candle_graph::viewer::trace_view::{project, TRACE_VIEWER_SCHEMA};
+use candle_graph::viewer::{embed_json, escape_for_script, render_trace_html};
 
 fn minimal_trace() -> TraceDocument {
     TraceDocument {
@@ -71,7 +71,10 @@ fn trace_edges_carry_ms_labels() {
     for edge in edges {
         assert!(edge["duration_ms"].is_number());
         let label = edge["label"].as_str().unwrap();
-        assert!(label.contains("ms"), "expected ms on edge label, got {label}");
+        assert!(
+            label.contains("ms"),
+            "expected ms on edge label, got {label}"
+        );
     }
 }
 
@@ -151,7 +154,10 @@ fn manual_fixture_has_span_tree() {
         },
     };
     let payload = project(&graph);
-    assert_eq!(payload["views"]["trace"]["nodes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        payload["views"]["trace"]["nodes"].as_array().unwrap().len(),
+        1
+    );
     assert_eq!(payload["span_tree"].as_array().unwrap().len(), 1);
     assert_eq!(payload["gradients"].as_array().unwrap().len(), 1);
 }

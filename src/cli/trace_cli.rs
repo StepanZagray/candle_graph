@@ -19,8 +19,8 @@ pub enum TraceQueryKind {
 
 /// Parse a JSONL trace and build an [`ExecutionGraph`].
 pub fn load_graph(trace_path: &Path) -> Result<ExecutionGraph> {
-    let doc = parse_trace(trace_path)
-        .with_context(|| format!("parse trace {}", trace_path.display()))?;
+    let doc =
+        parse_trace(trace_path).with_context(|| format!("parse trace {}", trace_path.display()))?;
     Ok(build_from_trace(&doc))
 }
 

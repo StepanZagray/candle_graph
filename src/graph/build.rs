@@ -280,7 +280,9 @@ mod tests {
     use super::*;
     use crate::trace::events::{EdgeEvent, GradientEvent, MemoryEvent, OpEvent};
     use crate::trace::memory::{MemoryAction, MemoryCategory};
-    use crate::trace::schema::{GradientState, SpanKind, SpanRecord, TraceRunMeta, SCHEMA as TRACE_SCHEMA};
+    use crate::trace::schema::{
+        GradientState, SpanKind, SpanRecord, TraceRunMeta, SCHEMA as TRACE_SCHEMA,
+    };
 
     fn synthetic_trace() -> TraceDocument {
         TraceDocument {

@@ -89,10 +89,8 @@ fn main() -> Result<()> {
         Command::Summary(summary) => {
             trace_cli::run_summary(&summary.trace, summary.output.as_deref())
         }
-        Command::Query(query) => trace_cli::run_query(
-            &query.trace,
-            query.kind.into(),
-            query.output.as_deref(),
-        ),
+        Command::Query(query) => {
+            trace_cli::run_query(&query.trace, query.kind.into(), query.output.as_deref())
+        }
     }
 }

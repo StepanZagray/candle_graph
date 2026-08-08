@@ -14,8 +14,10 @@ pub mod trace;
 pub mod viewer;
 
 pub use graph::{build_from_trace, ExecutionGraph};
-pub use instrument::{MemoryRecord, OpRecord, SpanGuard, SpanId, SpanKind, TensorRecord, TraceSession};
 #[cfg(feature = "candle")]
 pub use instrument::candle;
+pub use instrument::{
+    MemoryRecord, OpRecord, SpanGuard, SpanId, SpanKind, TensorRecord, TraceSession,
+};
 pub use phase::{ExecutionPhase, ExecutionStep};
 pub use trace::{parse_trace, write_jsonl, TraceDocument, TraceEvent, SCHEMA as TRACE_SCHEMA};

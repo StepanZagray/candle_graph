@@ -20,7 +20,9 @@ pub fn render_trace_html(graph: &ExecutionGraph) -> String {
 fn render_trace_document(projection: &Value) -> String {
     let payload = embed_json(projection);
     let mut html = String::with_capacity(8192 + CSS.len() + TRACE_JS.len() + payload.len());
-    html.push_str("<!DOCTYPE html>\n<html lang=\"en\" data-viewer=\"candle-graph-trace\">\n<head>\n");
+    html.push_str(
+        "<!DOCTYPE html>\n<html lang=\"en\" data-viewer=\"candle-graph-trace\">\n<head>\n",
+    );
     html.push_str("<meta charset=\"utf-8\"/>\n");
     html.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"/>\n");
     html.push_str("<title>candle-graph trace</title>\n<style>");
@@ -46,7 +48,9 @@ fn render_trace_document(projection: &Value) -> String {
 
     html.push_str("<header class=\"top\" role=\"banner\">\n");
     html.push_str("  <div class=\"brand\"><span class=\"brand-mark\" aria-hidden=\"true\"></span>candle-graph trace</div>\n");
-    html.push_str("  <div class=\"cov\" data-coverage role=\"status\" aria-live=\"polite\"></div>\n");
+    html.push_str(
+        "  <div class=\"cov\" data-coverage role=\"status\" aria-live=\"polite\"></div>\n",
+    );
     html.push_str("  <div class=\"top-actions\">\n");
     html.push_str("    <button type=\"button\" class=\"btn primary\" id=\"export-btn\" aria-label=\"Export graph as SVG\">Export SVG</button>\n");
     html.push_str("    <button type=\"button\" class=\"btn\" id=\"theme-btn\" data-theme-toggle aria-label=\"Toggle color theme\">Theme</button>\n");
@@ -54,7 +58,9 @@ fn render_trace_document(projection: &Value) -> String {
     html.push_str("</header>\n");
 
     html.push_str("<div class=\"layout\" id=\"app\">\n");
-    html.push_str("  <nav class=\"pane pane-sidebar\" data-pane=\"sidebar\" aria-label=\"Navigation\">\n");
+    html.push_str(
+        "  <nav class=\"pane pane-sidebar\" data-pane=\"sidebar\" aria-label=\"Navigation\">\n",
+    );
     html.push_str("    <div class=\"pane-h\">Views</div>\n");
     html.push_str("    <div class=\"tabs\" data-view-tabs role=\"tablist\" aria-label=\"Trace views\"></div>\n");
     html.push_str("    <div class=\"pane-h sub\">Span hierarchy</div>\n");
@@ -64,7 +70,9 @@ fn render_trace_document(projection: &Value) -> String {
     html.push_str("    </div>\n");
     html.push_str("    <div id=\"span-tree\" class=\"scroll-area span-tree\" data-span-tree tabindex=\"0\" role=\"tree\" aria-label=\"Span hierarchy\"></div>\n");
     html.push_str("  </nav>\n");
-    html.push_str("  <div class=\"resize-handle\" data-side=\"left\" aria-hidden=\"true\"></div>\n");
+    html.push_str(
+        "  <div class=\"resize-handle\" data-side=\"left\" aria-hidden=\"true\"></div>\n",
+    );
 
     html.push_str("  <main class=\"pane pane-canvas\" data-pane=\"canvas\" id=\"canvas-pane\" aria-label=\"Trace canvas\">\n");
     html.push_str("    <div class=\"pane-h row\"><span data-canvas-title>Trace</span><span class=\"graph-stats\" data-graph-stats></span></div>\n");
@@ -80,13 +88,19 @@ fn render_trace_document(projection: &Value) -> String {
     html.push_str("      <div id=\"timeline-panel\" class=\"scroll-area\" hidden></div>\n");
     html.push_str("      <svg id=\"graph-canvas\" data-canvas role=\"img\" aria-label=\"Trace graph\" tabindex=\"0\"></svg>\n");
     html.push_str("      <div id=\"graph-tooltip\" class=\"graph-tooltip\" role=\"tooltip\" aria-hidden=\"true\"></div>\n");
-    html.push_str("      <div class=\"legend-float\" data-legend role=\"list\" aria-label=\"Heat legend\">\n");
+    html.push_str(
+        "      <div class=\"legend-float\" data-legend role=\"list\" aria-label=\"Heat legend\">\n",
+    );
     html.push_str("        <button type=\"button\" class=\"legend-toggle\" id=\"legend-toggle\" aria-expanded=\"true\">Legend</button>\n");
     html.push_str("        <div class=\"legend-body\">\n");
     html.push_str("          <span role=\"listitem\"><label><input type=\"radio\" name=\"heat-mode\" value=\"time\" checked> Self time heat</label></span>\n");
     html.push_str("          <span role=\"listitem\"><label><input type=\"radio\" name=\"heat-mode\" value=\"memory\"> Memory heat</label></span>\n");
-    html.push_str("          <span role=\"listitem\" class=\"lg kind-op\">Call edge (ms label)</span>\n");
-    html.push_str("          <span role=\"listitem\" class=\"lg kind-module\">Data edge (ms label)</span>\n");
+    html.push_str(
+        "          <span role=\"listitem\" class=\"lg kind-op\">Call edge (ms label)</span>\n",
+    );
+    html.push_str(
+        "          <span role=\"listitem\" class=\"lg kind-module\">Data edge (ms label)</span>\n",
+    );
     html.push_str("        </div>\n");
     html.push_str("      </div>\n");
     html.push_str("      <div class=\"canvas-controls\" aria-label=\"Zoom controls\">\n");
@@ -98,7 +112,9 @@ fn render_trace_document(projection: &Value) -> String {
     html.push_str("    </div>\n");
     html.push_str("  </main>\n");
 
-    html.push_str("  <div class=\"resize-handle\" data-side=\"right\" aria-hidden=\"true\"></div>\n");
+    html.push_str(
+        "  <div class=\"resize-handle\" data-side=\"right\" aria-hidden=\"true\"></div>\n",
+    );
     html.push_str("  <aside class=\"pane pane-inspector\" data-pane=\"inspector\" aria-label=\"Inspector\">\n");
     html.push_str("    <div class=\"pane-h\">Inspector</div>\n");
     html.push_str("    <dl id=\"inspector\" data-inspector>\n");

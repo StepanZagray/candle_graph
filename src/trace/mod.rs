@@ -14,7 +14,5 @@ pub use events::{
     DeviceMemoryEvent, EdgeEvent, GradientEvent, MemoryEvent, OpEvent, SpanEndEvent,
     SpanStartEvent, TensorEvent, TraceEvent,
 };
-pub use memory::{MemoryAction, MemoryCategory, category_for_step, storage_bytes};
-pub use schema::{
-    GradientState, SpanKind, SpanRecord, TraceRunMeta, TraceSummary, SCHEMA,
-};
+pub use memory::{category_for_step, storage_bytes, MemoryAction, MemoryCategory};
+pub use schema::{GradientState, SpanKind, SpanRecord, TraceRunMeta, TraceSummary, SCHEMA};

@@ -53,7 +53,10 @@ impl TraceDocument {
 
         for (index, event) in events.into_iter().enumerate() {
             match event {
-                TraceEvent::Meta { schema: s, run: meta } => {
+                TraceEvent::Meta {
+                    schema: s,
+                    run: meta,
+                } => {
                     if schema.is_some() || run.is_some() {
                         bail!(
                             "duplicate meta event at index {index}; only one meta record is allowed"
@@ -102,9 +105,7 @@ impl TraceDocument {
         let run = run.context("trace stream is missing a meta event with run metadata")?;
 
         if schema != SCHEMA {
-            bail!(
-                "unsupported trace schema {schema:?}; expected {SCHEMA:?}"
-            );
+            bail!("unsupported trace schema {schema:?}; expected {SCHEMA:?}");
         }
 
         let mut spans: Vec<SpanRecord> = span_starts
@@ -161,10 +162,7 @@ impl TraceDocument {
                     break;
                 }
                 depth += 1;
-                current_parent = parent_by_id
-                    .get(parent_id)
-                    .copied()
-                    .flatten();
+                current_parent = parent_by_id.get(parent_id).copied().flatten();
             }
             max_depth = max_depth.max(depth);
         }
@@ -242,14 +240,17 @@ impl TraceDocument {
 /// Parse a JSONL trace file into a [`TraceDocument`].
 pub fn parse_trace(path: impl AsRef<Path>) -> Result<TraceDocument> {
     let path = path.as_ref();
-    let file = File::open(path)
-        .with_context(|| format!("open trace file {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("open trace file {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut events = Vec::new();
 
     for (line_no, line) in reader.lines().enumerate() {
         let line = line.with_context(|| {
-            format!("read trace JSONL line {} from {}", line_no + 1, path.display())
+            format!(
+                "read trace JSONL line {} from {}",
+                line_no + 1,
+                path.display()
+            )
         })?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -275,8 +276,8 @@ pub fn write_jsonl(path: impl AsRef<Path>, events: &[TraceEvent]) -> Result<()> 
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create trace dir {}", parent.display()))?;
     }
-    let mut file = File::create(path)
-        .with_context(|| format!("create trace file {}", path.display()))?;
+    let mut file =
+        File::create(path).with_context(|| format!("create trace file {}", path.display()))?;
     for event in events {
         let mut line = serde_json::to_vec(event).context("serialize trace JSONL event")?;
         line.push(b'\n');
