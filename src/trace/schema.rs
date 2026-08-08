@@ -1,28 +1,48 @@
-//! Schema types for `candle-graph/trace/4` — TensorFlow-Profiler-style span traces.
+//! Schema types for the current candle-graph execution-evidence stream.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::phase::ExecutionPhase;
 use crate::phase::ExecutionStep;
 
 use serde::{Deserialize, Serialize};
 
 /// Schema identifier written into every trace document and expected on parse.
-pub const SCHEMA: &str = "candle-graph/trace/5";
+pub const SCHEMA: &str = "candle-graph/trace/6";
 
 /// Run metadata carried in the first JSONL `meta` event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceRunMeta {
     /// Stable identifier for this probe run (UUID, build id, or caller-defined key).
     pub run_id: String,
+    /// Stable caller-owned key shared with NVTX range labels and external artifacts.
+    pub correlation_id: String,
     /// Analyzed entrypoint, e.g. `train::leworld_loss` or `Model::forward`.
     pub entrypoint: String,
     /// Execution phase: `train` or `infer`.
-    pub phase: String,
+    pub phase: ExecutionPhase,
     /// ISO-8601 timestamp when the trace was captured.
     pub timestamp: String,
+    /// One-based optimizer update or inference invocation selected for capture.
+    pub capture_step: u64,
+    /// Completed invocations before the selected capture.
+    pub warmup_steps: u64,
+    /// Device requested by the caller (`cpu`, `cuda:0`, ...).
+    pub device: String,
+    pub timing_mode: TimingMode,
+    /// Workload-specific provenance such as lesson, batch size, and source revision.
+    pub tags: BTreeMap<String, String>,
     /// Optional candle crate version observed at probe time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candle_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimingMode {
+    Host,
+    DeviceSynchronized,
 }
 
 /// Span classification — mirrors profiler function / op / module hierarchy.
@@ -86,6 +106,10 @@ pub struct SpanRecord {
     pub parent_id: Option<String>,
     pub name: String,
     pub kind: SpanKind,
+    /// True only for the caller-controlled region used as the run's performance total.
+    pub measured: bool,
+    /// Monotonic timestamp in nanoseconds since the profile run started.
+    pub start_ns: u64,
     /// True when a matching `span_end` was observed.
     #[serde(default)]
     pub closed: bool,

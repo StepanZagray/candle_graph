@@ -1,94 +1,96 @@
 # candle-graph
 
-> Independent tool — **not** affiliated with [candle-rs](https://github.com/huggingface/candle) or Hugging Face.
+> Independent tool — not affiliated with candle-rs or Hugging Face.
 
-TensorFlow Profiler-style execution graphs for Candle: record a **post-run JSONL trace**, build an
-execution graph with **milliseconds on every edge**, and inspect it via CLI or HTML.
+candle-graph captures one representative Candle execution and turns it into trustworthy evidence
+for humans and building agents: semantic timing, tensor and gradient facts, explicit coverage gaps,
+baseline comparisons, and optional NVIDIA Nsight GPU evidence in one standalone HTML viewer.
 
-Read [`CONTEXT.md`](CONTEXT.md) for the product model.
+There is no static Rust analysis. Every claim comes from one concrete run.
 
-## What it does
+## What agents get
 
-There is **no static Rust analysis**. The graph comes only from what actually executed in one
-representative forward/loss/eval pass.
+- `summary`: bounded provenance, trace health, findings, gaps, and totals.
+- `query`: slow spans/ops, storage footprints, explicit memory lifecycle, span tree, tensors, or gradients.
+- `compare`: repeated semantic spans aggregated by path against an explicit baseline.
+- `report`: the same evidence packet as JSON and concise Markdown.
+- `view`: Evidence, Trace, Span costs, Memory, and GPU views in one offline HTML file.
 
-| Piece | Delivers |
-| --- | --- |
-| **`instrument::TraceSession`** | Emit `candle-graph/trace/4` JSONL from a probe binary |
-| **`graph::build_from_trace`** | Hierarchical span tree + self-time (TF profiler style) |
-| **CLI** | `import`, `summary`, `query`, `view` on trace files |
-| **`visualizer`** | Standalone `model.html` with ms labels on call/data edges |
+Invalid hierarchy, incomplete spans, cycles, and inconsistent timings fail before graph analysis.
+Missing optional evidence is reported as a gap rather than appearing as an empty result.
 
-Training hot loops stay clean: instrument **after** training or in a dedicated smoke binary, not
-inside every step.
-
-## Install
-
-```bash
-cargo install --path . --features all --locked
-```
-
-## Quick start
-
-### 1. Emit a trace from your probe binary
+## Capture one update
 
 ```rust
-use candle_graph::{ExecutionPhase, OpRecord, SpanKind, TraceSession};
+use candle_graph::{ExecutionStep, ProfileRun, SpanKind, TraceSession};
 
-let session = TraceSession::open("profile.jsonl", "my_crate::train::loss", ExecutionPhase::Train)?;
+let run = ProfileRun::training("my_crate::train::update", 1, "cuda:0")
+    .device_synchronized()
+    .tag("physical_batch", "128")
+    .tag("precision", "f32");
+let session = TraceSession::open("application.jsonl", run)?;
 
 {
-    let _forward = session.begin_span("Model::forward", SpanKind::Function);
-    // ... one representative forward ...
+    let _update = session.begin_measurement("my_crate/update-000000000001");
+    {
+        let _forward = session.begin_step_span(
+            "my_crate/update-000000000001/forward",
+            ExecutionStep::Forward,
+            SpanKind::Function,
+        );
+        // representative forward pass
+    }
+    // backward and optimizer use the corresponding ExecutionStep values.
 }
 
-session.record_gradient("vb", "encoder.weight", candle_graph::trace::schema::GradientState::Present, Some(0.42))?;
 session.finish()?;
 ```
 
-Use [`SpanGuard`](src/instrument/span.rs) (RAII) for nested spans; call [`record_op`](src/instrument/session.rs)
-for timed ops inside a span.
+`TraceSession` owns an outer envelope; `begin_measurement` marks the caller-controlled region used
+for comparisons, excluding trace finalization overhead. Capture exactly one selected update, not
+every hot-loop iteration.
 
-### 2. CLI
+## Analyze
 
 ```bash
-cargo candle-graph summary profile.jsonl
-cargo candle-graph import profile.jsonl --output graph.json
-cargo candle-graph query profile.jsonl --kind slowest
-cargo candle-graph view profile.jsonl --output model.html
+cargo candle-graph summary application.jsonl
+cargo candle-graph query application.jsonl --kind gradients
+cargo candle-graph query application.jsonl --kind tensors
+cargo candle-graph compare baseline.jsonl application.jsonl --output comparison.json
+cargo candle-graph report application.jsonl \
+  --json evidence.json --markdown EVIDENCE.md
+cargo candle-graph view application.jsonl --output viewer.html
 ```
 
-### 3. Library
+Add normalized official `nsys stats --format csv` reports without parsing Nsight's unstable SQLite
+export:
 
-```rust
-use candle_graph::{build_from_trace, parse_trace};
-
-let doc = parse_trace("profile.jsonl")?;
-// build_from_trace accepts the graph event stream; see trace_cli for the adapter
+```bash
+cargo candle-graph report application.jsonl --nsight-dir nsight \
+  --json evidence.json --markdown EVIDENCE.md
+cargo candle-graph view application.jsonl --nsight-dir nsight --output viewer.html
 ```
+
+The raw `.nsys-rep` remains the source artifact. Supported reports are `cuda_gpu_trace`,
+`cuda_gpu_kern_sum`, `cuda_api_sum`, `cuda_gpu_mem_time_sum`, and `nvtx_gpu_proj_trace`.
 
 ## Schemas
 
 | Schema | Role |
 | --- | --- |
-| `candle-graph/trace/4` | JSONL trace (meta, spans, ops, gradients, edges) |
-| `candle-graph/graph/1` | Execution graph JSON |
-| `candle-graph/viewer/2` | Embedded HTML payload |
-| `candle-graph/trace-query/1` | Bounded CLI query output |
+| `candle-graph/trace/6` | Execution JSONL with provenance, measured region, start times, and facts |
+| `candle-graph/graph/3` | Validated execution graph |
+| `candle-graph/evidence/1` | Agent/human packet: health, facts, gaps, graph, comparison, GPU evidence |
+| `candle-graph/comparison/1` | Baseline deltas by semantic path, memory, and gradient |
+| `candle-graph/viewer/4` | Offline unified viewer payload |
 
-## Docs
-
-| Doc | Contents |
-| --- | --- |
-| [CONTEXT.md](CONTEXT.md) | Product goals, trace-only model |
-| [docs/runtime-analysis-guide.md](docs/runtime-analysis-guide.md) | Probe + trace workflow |
-| [docs/features.md](docs/features.md) | Cargo features |
-| [docs/visualizer.md](docs/visualizer.md) | HTML trace viewer |
+See [CONTEXT.md](CONTEXT.md), [runtime guide](docs/runtime-analysis-guide.md),
+[features](docs/features.md), and [visualizer](docs/visualizer.md).
 
 ## Development
 
 ```bash
 cargo fmt -- --check
-cargo test --features all
-cargo clippy --features all -- -D warnings
+cargo test --all-features
+cargo clippy --all-features -- -D warnings
 ```

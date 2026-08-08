@@ -6,12 +6,14 @@
   const SUM = P.summary || {};
 
   const VIEW_META = [
+    { id: "evidence", label: "Evidence", graph: false },
     { id: "trace", label: "Trace", graph: true, layout: "layered", direction: "LR" },
-    { id: "timeline", label: "Timeline", graph: false },
+    { id: "span_costs", label: "Span costs", graph: false },
     { id: "memory", label: "Memory", graph: false },
+    { id: "gpu", label: "GPU", graph: false },
   ];
 
-  let currentView = P.default_view || "trace";
+  let currentView = P.default_view || "evidence";
   let heatMode = "time";
   let selectedId = null;
   let hoveredId = null;
@@ -48,6 +50,40 @@
   function fmtNsMs(ns) {
     if (ns == null || !Number.isFinite(ns)) return "—";
     return (Number(ns) / 1e6).toFixed(2) + " ms";
+  }
+  function isScalar(value) {
+    return value == null || ["string", "number", "boolean"].includes(typeof value);
+  }
+  function humanize(value) {
+    return String(value || "")
+      .replace(/_/g, " ")
+      .replace(/\b\w/g, function (ch) { return ch.toUpperCase(); });
+  }
+  function fmtValue(value) {
+    if (value == null || value === "") return "—";
+    if (typeof value === "boolean") return value ? "Yes" : "No";
+    if (Array.isArray(value)) {
+      return value.map(function (item) { return isScalar(item) ? fmtValue(item) : JSON.stringify(item); }).join(", ") || "—";
+    }
+    if (typeof value === "object") {
+      return Object.keys(value).map(function (key) {
+        return humanize(key) + ": " + fmtValue(value[key]);
+      }).join(" · ") || "—";
+    }
+    return String(value);
+  }
+  function safeStatus(value) {
+    return String(value || "unknown").toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+  }
+  function statusLabel(value) {
+    var status = safeStatus(value);
+    var marks = {
+      valid: "✓", trusted: "✓", available: "✓", captured: "✓", complete: "✓",
+      warning: "!", partial: "!", untrusted: "!", invalid: "×", unavailable: "—",
+      absent: "—", missing: "—", unknown: "?",
+    };
+    return '<span class="status-badge status-' + esc(status) + '"><span aria-hidden="true">' +
+      esc(marks[status] || "•") + '</span> ' + esc(humanize(status)) + "</span>";
   }
 
   function heatColor(n) {
@@ -117,7 +153,7 @@
     if (!panel) return;
     var rows = (SUM.peak_breakdown || P.views.memory && P.views.memory.peak_breakdown) || [];
     if (!rows.length) {
-      panel.innerHTML = "<p class=\"empty\">No peak allocations recorded.</p>";
+      panel.innerHTML = "<p class=\"section-empty\">No peak allocations recorded.</p>";
       return;
     }
     panel.innerHTML =
@@ -155,59 +191,199 @@
     var tabs = document.querySelector("[data-view-tabs]");
     if (!tabs) return;
     tabs.innerHTML = VIEW_META.map(function (m) {
-      return '<button type="button" role="tab" class="tab" data-view="' + esc(m.id) + '" aria-selected="false">' + esc(m.label) + "</button>";
+      return '<button type="button" role="tab" class="tab" id="view-tab-' + esc(m.id) +
+        '" data-view="' + esc(m.id) + '" aria-controls="view-panel-' + esc(m.id) +
+        '" aria-selected="false" tabindex="-1">' + esc(m.label) + "</button>";
     }).join("");
     tabs.onclick = function (e) {
       var btn = e.target.closest("[data-view]");
       if (!btn) return;
       selectView(btn.dataset.view, true);
     };
+    tabs.onkeydown = function (e) {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+      var buttons = Array.from(tabs.querySelectorAll('[role="tab"]'));
+      var active = buttons.indexOf(document.activeElement);
+      if (active < 0) return;
+      e.preventDefault();
+      var next = active;
+      if (e.key === "Home") next = 0;
+      else if (e.key === "End") next = buttons.length - 1;
+      else if (e.key === "ArrowLeft") next = (active - 1 + buttons.length) % buttons.length;
+      else next = (active + 1) % buttons.length;
+      selectView(buttons[next].dataset.view, true);
+      buttons[next].focus();
+    };
   }
 
   function selectView(id, push) {
-    currentView = id;
-    document.querySelectorAll("[data-view-tabs] [data-view]").forEach(function (b) {
-      b.setAttribute("aria-selected", b.dataset.view === id ? "true" : "false");
-    });
     var meta = VIEW_META.find(function (m) { return m.id === id; }) || VIEW_META[0];
+    currentView = meta.id;
+    document.querySelectorAll("[data-view-tabs] [data-view]").forEach(function (b) {
+      var selected = b.dataset.view === currentView;
+      b.setAttribute("aria-selected", selected ? "true" : "false");
+      b.setAttribute("tabindex", selected ? "0" : "-1");
+    });
+    document.querySelectorAll("[data-view-panel]").forEach(function (panel) {
+      panel.hidden = panel.dataset.viewPanel !== currentView;
+    });
+    document.querySelectorAll("[data-trace-only]").forEach(function (control) {
+      control.hidden = currentView !== "trace";
+    });
+    var traceNavigation = document.getElementById("trace-navigation");
+    if (traceNavigation) traceNavigation.hidden = currentView !== "trace";
+    var inspector = document.querySelector(".pane-inspector");
+    var inspectorVisible = currentView === "trace" || currentView === "span_costs";
+    if (inspector) inspector.hidden = !inspectorVisible;
+    var rightHandle = document.querySelector('.resize-handle[data-side="right"]');
+    if (rightHandle) rightHandle.hidden = !inspectorVisible;
     var title = document.querySelector("[data-canvas-title]");
     if (title) title.textContent = meta.label;
+    var stats = document.querySelector("[data-graph-stats]");
+    if (stats && currentView !== "trace") stats.textContent = "";
     refreshView();
     if (push) setInspector(null);
   }
 
   function refreshView() {
     var meta = VIEW_META.find(function (m) { return m.id === currentView; }) || VIEW_META[0];
-    var svg = document.getElementById("graph-canvas");
-    var timeline = document.getElementById("timeline-panel");
-    var empty = document.getElementById("empty-graph");
     if (meta.graph) {
-      if (svg) svg.hidden = false;
-      if (timeline) timeline.hidden = true;
       drawGraph(V.trace || { nodes: [], edges: [] }, meta);
-    } else if (meta.id === "memory") {
-      if (svg) { svg.hidden = true; svg.innerHTML = ""; }
-      if (timeline) timeline.hidden = false;
-      graphState = null;
-      renderMemoryView(V.memory || { timeline: [], peak_breakdown: [], summary: {} });
-      if (empty) empty.hidden = true;
-    } else {
-      if (svg) { svg.hidden = true; svg.innerHTML = ""; }
-      if (timeline) timeline.hidden = false;
-      graphState = null;
-      renderTimeline(V.timeline || { items: [] });
-      if (empty) empty.hidden = (V.timeline && V.timeline.items && V.timeline.items.length) > 0;
+      return;
     }
+    graphState = null;
+    if (meta.id === "evidence") renderEvidenceView(V.evidence || {});
+    else if (meta.id === "span_costs") renderSpanCosts(V.span_costs || { items: [] });
+    else if (meta.id === "memory") renderMemoryView(V.memory || { timeline: [], peak_breakdown: [], summary: {} });
+    else if (meta.id === "gpu") renderGpuView(V.gpu || {});
+  }
+
+  function panelFor(id) {
+    return document.querySelector('[data-view-panel="' + id + '"]');
+  }
+
+  function findSpanRow(tree, id) {
+    return Array.from(tree.querySelectorAll("[data-span-id]")).find(function (row) {
+      return row.dataset.spanId === id;
+    }) || null;
+  }
+
+  function formatCell(key, value) {
+    var lower = String(key || "").toLowerCase();
+    if (typeof value === "number" && lower.includes("bytes")) return fmtBytes(value);
+    if (typeof value === "number" && lower.endsWith("_ns")) return fmtNsMs(value);
+    if (typeof value === "number" && lower.endsWith("_ms")) return fmtMs(value);
+    if (typeof value === "number" && lower.includes("percent")) return value.toFixed(2) + "%";
+    return fmtValue(value);
+  }
+
+  function renderKeyValues(record, omitted) {
+    var skip = new Set(omitted || []);
+    var entries = Object.keys(record || {}).filter(function (key) {
+      return !skip.has(key) && !Array.isArray(record[key]);
+    });
+    if (!entries.length) return '<p class="section-empty">No details recorded.</p>';
+    return '<dl class="key-values">' + entries.map(function (key) {
+      return '<div><dt>' + esc(humanize(key)) + '</dt><dd>' + esc(formatCell(key, record[key])) + '</dd></div>';
+    }).join("") + "</dl>";
+  }
+
+  function renderNoticeList(items, kind, emptyText) {
+    items = Array.isArray(items) ? items : [];
+    if (!items.length) return '<p class="section-empty">' + esc(emptyText) + "</p>";
+    return '<ul class="notice-list" role="list">' + items.map(function (item) {
+      var record = isScalar(item) ? { message: item } : (item || {});
+      var severity = record.severity || record.status || kind;
+      var title = record.title || record.code || record.name || humanize(severity);
+      var message = record.message || record.detail || record.description || "";
+      return '<li class="notice notice-' + esc(safeStatus(severity)) + '">' +
+        '<div class="notice-title">' + statusLabel(severity) + '<strong>' + esc(title) + '</strong></div>' +
+        (message ? '<p>' + esc(message) + "</p>" : "") + "</li>";
+    }).join("") + "</ul>";
+  }
+
+  function renderDataTable(rows, caption, limit) {
+    rows = Array.isArray(rows) ? rows : [];
+    if (!rows.length) return '<p class="section-empty">No ' + esc(caption.toLowerCase()) + " recorded.</p>";
+    var capped = rows.slice(0, limit || 100);
+    var keys = [];
+    capped.forEach(function (row) {
+      var record = isScalar(row) ? { value: row } : (row || {});
+      Object.keys(record).forEach(function (key) {
+        if (!keys.includes(key)) keys.push(key);
+      });
+    });
+    var html = '<div class="table-wrap"><table class="data-table"><caption class="sr">' + esc(caption) +
+      '</caption><thead><tr>' + keys.map(function (key) { return "<th scope=\"col\">" + esc(humanize(key)) + "</th>"; }).join("") +
+      "</tr></thead><tbody>";
+    html += capped.map(function (row) {
+      var record = isScalar(row) ? { value: row } : (row || {});
+      return "<tr>" + keys.map(function (key) {
+        return "<td>" + esc(formatCell(key, record[key])) + "</td>";
+      }).join("") + "</tr>";
+    }).join("");
+    html += "</tbody></table></div>";
+    if (rows.length > capped.length) {
+      html += '<p class="table-note">Showing ' + capped.length + " of " + rows.length + " rows.</p>";
+    }
+    return html;
+  }
+
+  function renderComparison(comparison) {
+    if (!comparison || (typeof comparison === "object" && !Object.keys(comparison).length)) {
+      return '<p class="section-empty">No baseline comparison was requested for this run.</p>';
+    }
+    var rows = comparison.items || comparison.spans || comparison.span_deltas || comparison.deltas || [];
+    var omitted = ["items", "spans", "span_deltas", "deltas", "warnings"];
+    var html = renderKeyValues(comparison, omitted);
+    if (comparison.warnings) html += renderNoticeList(comparison.warnings, "warning", "No comparison warnings.");
+    if (rows.length) html += renderDataTable(rows, "Baseline comparison", 100);
+    return html;
+  }
+
+  function renderEvidenceView(data) {
+    var panel = panelFor("evidence");
+    if (!panel) return;
+    var provenance = data.provenance || {};
+    var health = data.health || {};
+    var healthStatus = health.status || health.state ||
+      (health.valid === false ? "invalid" : health.trusted === false ? "untrusted" :
+        (health.valid || health.trusted) ? "trusted" : "unknown");
+    var issues = health.issues || health.problems || [];
+    var findings = data.findings || [];
+    var gaps = data.gaps || [];
+    panel.innerHTML =
+      '<div class="evidence-header"><div><p class="eyebrow">Representative profile run</p>' +
+      '<h1>Profile evidence</h1><p>Start here to decide what this run can support before inspecting individual spans.</p></div>' +
+      '<div class="health-summary" role="status" aria-label="Trace health: ' + esc(humanize(healthStatus)) + '">' +
+      statusLabel(healthStatus) + '<span class="health-copy">' + esc(health.summary || health.message || "Trace health is recorded with this packet.") +
+      "</span></div></div>" +
+      '<div class="evidence-grid"><section class="evidence-card evidence-card-wide"><h2>Provenance</h2>' +
+      renderKeyValues(provenance) + '</section><section class="evidence-card"><h2>Trace health</h2>' +
+      renderKeyValues(health, ["status", "state", "summary", "message", "issues", "problems"]) +
+      renderNoticeList(issues, "warning", "No health issues were recorded.") + "</section>" +
+      '<section class="evidence-card"><h2>Trusted findings</h2>' +
+      renderNoticeList(findings, "information", "No trusted findings were derived from this profile.") + "</section>" +
+      '<section class="evidence-card"><h2>Evidence gaps</h2>' +
+      renderNoticeList(gaps, "missing", "No evidence gaps were reported.") + "</section>" +
+      '<section class="evidence-card evidence-card-wide"><h2>Structured facts</h2>' +
+      renderDataTable(data.facts, "Structured facts", 100) + "</section>" +
+      '<section class="evidence-card evidence-card-wide"><h2>Tensor checkpoints</h2>' +
+      renderDataTable(data.tensors, "Tensor checkpoints", 100) + "</section>" +
+      '<section class="evidence-card evidence-card-wide"><h2>Gradient evidence</h2>' +
+      renderDataTable(data.gradients, "Gradient evidence", 250) + "</section>" +
+      '<section class="evidence-card evidence-card-wide"><h2>Baseline comparison</h2>' +
+      renderComparison(data.comparison) + "</section></div>";
   }
 
   function renderMemoryView(data) {
-    var panel = document.getElementById("timeline-panel");
+    var panel = panelFor("memory");
     if (!panel) return;
     var timeline = data.timeline || [];
     var summary = data.summary || {};
     var html = "";
-    html += "<div class=\"pane-h sub\">Memory summary</div>";
-    html += "<p style=\"font-size:12px;margin:0 0 8px;color:var(--muted)\">";
+    html += '<div class="view-heading"><div><p class="eyebrow">Allocation evidence</p><h1>Memory</h1></div></div>';
+    html += '<p class="view-summary">';
     html += "Peak: <strong>" + esc(fmtBytes(summary.peak_bytes)) + "</strong>";
     if (summary.peak_timestamp_ns) html += " @ " + esc(fmtNsMs(summary.peak_timestamp_ns));
     html += " · allocs " + esc(String(summary.alloc_count || 0));
@@ -224,7 +400,7 @@
       html += "</p>";
     }
     if (!timeline.length) {
-      html += "<p class=\"empty\">No memory timeline events.</p>";
+      html += '<div class="content-empty" role="status"><strong>No memory timeline</strong><p>No allocation events were captured for this run.</p></div>';
       panel.innerHTML = html;
       return;
     }
@@ -245,59 +421,102 @@
     html += '<text x="' + (w - pad) + '" y="' + (h - 8) + '" fill="var(--muted)" font-size="10" text-anchor="end">' + esc(fmtNsMs(maxTs)) + "</text>";
     html += '<text x="8" y="' + pad + '" fill="var(--muted)" font-size="10">' + esc(fmtBytes(maxLive)) + "</text>";
     html += "</svg>";
-    html += '<table class="timeline-table"><thead><tr><th>Time</th><th>Device</th><th>Live</th><th>Heap</th></tr></thead><tbody>';
+    html += '<div class="table-wrap"><table class="timeline-table"><caption class="sr">Memory timeline events</caption><thead><tr><th scope="col">Time</th><th scope="col">Device</th><th scope="col">Live</th><th scope="col">Heap</th></tr></thead><tbody>';
     html += timeline.slice(-100).map(function (p) {
       return "<tr><td>" + esc(fmtNsMs(p.timestamp_ns)) + "</td><td>" + esc(p.device || "") +
         "</td><td>" + esc(fmtBytes(p.live_bytes)) + "</td><td>" + esc(fmtBytes(p.heap_bytes)) + "</td></tr>";
     }).join("");
-    html += "</tbody></table>";
+    html += "</tbody></table></div>";
     panel.innerHTML = html;
   }
 
-  function renderTimeline(data) {
-    var panel = document.getElementById("timeline-panel");
+  function renderSpanCosts(data) {
+    var panel = panelFor("span_costs");
     if (!panel) return;
     var items = data.items || [];
     if (!items.length) {
-      panel.innerHTML = "<p class=\"empty\">No timeline items.</p>";
+      panel.innerHTML = '<div class="view-heading"><div><p class="eyebrow">Aggregated semantic work</p><h1>Span costs</h1></div></div>' +
+        '<div class="content-empty" role="status"><strong>No span costs</strong><p>This profile contains no aggregated span timing rows.</p></div>';
       return;
     }
     panel.innerHTML =
-      '<table class="timeline-table"><thead><tr><th>Span</th><th>Kind</th><th>Self</th><th>Total</th><th>Memory</th></tr></thead><tbody>' +
+      '<div class="view-heading"><div><p class="eyebrow">Aggregated semantic work</p><h1>Span costs</h1></div><p>' +
+      items.length + ' measured spans</p></div><div class="table-wrap"><table class="timeline-table span-cost-table"><caption class="sr">Span cost ranking</caption>' +
+      '<thead><tr><th scope="col">Span</th><th scope="col">Kind</th><th scope="col">Self</th><th scope="col">Total</th><th scope="col">Memory</th></tr></thead><tbody>' +
       items.map(function (it) {
-        return '<tr data-id="' + esc(idStr(it.id)) + '"><td>' + esc(it.name) + '</td><td>' + esc(it.kind || "") +
+        return '<tr data-id="' + esc(idStr(it.id)) + '"><td><button type="button" class="table-row-action" data-span-cost-id="' +
+          esc(idStr(it.id)) + '">' + esc(it.name) + '</button></td><td>' + esc(it.kind || "") +
           "</td><td>" + esc(fmtMs(it.self_ms)) + "</td><td>" + esc(fmtMs(it.total_ms)) +
           "</td><td>" + esc(fmtBytes(it.peak_bytes || it.bytes)) + "</td></tr>";
       }).join("") +
-      "</tbody></table>";
-    panel.querySelectorAll("tbody tr").forEach(function (row) {
-      row.onclick = function () {
+      "</tbody></table></div>";
+    panel.querySelectorAll("[data-span-cost-id]").forEach(function (button) {
+      button.onclick = function () {
+        var row = button.closest("tr");
         panel.querySelectorAll("tbody tr.sel").forEach(function (x) { x.classList.remove("sel"); });
         row.classList.add("sel");
         selectedId = row.dataset.id;
         var it = items.find(function (x) { return idStr(x.id) === selectedId; });
         setInspector(it);
-        if (currentView === "trace") highlightNode(selectedId);
+      };
+      button.onkeydown = function (event) {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        button.click();
       };
     });
+  }
+
+  function renderGpuView(data) {
+    var panel = panelFor("gpu");
+    if (!panel) return;
+    var status = data.status || (data.available ? "available" : "unavailable");
+    var available = data.available === true || ["available", "captured", "complete"].includes(safeStatus(status));
+    var sources = Array.isArray(data.source_csv) ? data.source_csv : (data.source_csv ? [data.source_csv] : []);
+    var sourceHtml = '<dl class="key-values source-list"><div><dt>Raw report</dt><dd>' + esc(data.raw_report || "Not retained") +
+      '</dd></div><div><dt>Normalized CSV</dt><dd>' + esc(sources.length ? sources.join(", ") : "Not available") + "</dd></div></dl>";
+    var html = '<div class="view-heading"><div><p class="eyebrow">Nsight Systems correlation</p><h1>GPU evidence</h1></div>' +
+      statusLabel(status) + "</div>";
+    var trustHtml = '<section class="evidence-card gpu-sources"><h2>Coverage and correlation trust</h2>' +
+      renderKeyValues({ coverage: data.coverage, correlation: data.correlation, limits: data.limits }) +
+      renderNoticeList(data.diagnostics, "warning", "No normalization diagnostics.") + "</section>";
+    if (!available) {
+      html += '<div class="gpu-empty" role="status"><div class="gpu-empty-mark" aria-hidden="true">GPU</div>' +
+        '<div><h2>GPU evidence is not available</h2><p>' + esc(data.reason || "This profile was captured without Nsight Systems evidence.") +
+        "</p><p>Candle span and memory evidence remain available in the other views.</p></div></div>" + sourceHtml + trustHtml;
+      panel.innerHTML = html;
+      return;
+    }
+    html += '<section class="evidence-card gpu-sources"><h2>Capture sources</h2>' + sourceHtml + "</section>" + trustHtml;
+    [
+      ["NVTX projected ranges", data.nvtx_ranges],
+      ["CUDA kernels", data.kernels],
+      ["CUDA runtime calls", data.runtime_calls],
+      ["GPU memory operations", data.memory_operations],
+      ["GPU timeline", data.gpu_timeline],
+    ].forEach(function (section) {
+      html += '<section class="data-section"><h2>' + esc(section[0]) + "</h2>" + renderDataTable(section[1], section[0], 250) + "</section>";
+    });
+    panel.innerHTML = html;
   }
 
   function buildSpanTree() {
     var tree = document.getElementById("span-tree");
     if (!tree) return;
     var spans = P.span_tree || [];
+    var rootKey = "__candle_graph_root__";
     var q = (document.querySelector("[data-span-search]") || {}).value || "";
     q = q.trim().toLowerCase();
     var byParent = {};
     spans.forEach(function (s) {
-      var p = s.parent_id == null ? "root" : idStr(s.parent_id);
+      var p = s.parent_id == null ? rootKey : idStr(s.parent_id);
       (byParent[p] = byParent[p] || []).push(s);
     });
     Object.keys(byParent).forEach(function (k) {
       byParent[k].sort(function (a, b) { return (b.total_ms || 0) - (a.total_ms || 0); });
     });
-    if (!spanOpen.size && byParent.root) {
-      byParent.root.forEach(function (s) { spanOpen.add(idStr(s.id)); });
+    if (!spanOpen.size && byParent[rootKey]) {
+      byParent[rootKey].forEach(function (s) { spanOpen.add(idStr(s.id)); });
     }
 
     function render() {
@@ -312,18 +531,25 @@
           var row = document.createElement("div");
           row.className = "span-row";
           row.setAttribute("role", "treeitem");
+          row.setAttribute("aria-level", String(depth + 1));
           row.style.paddingLeft = depth * 14 + 8 + "px";
           row.dataset.spanId = id;
-          if (selectedId === id) row.setAttribute("aria-selected", "true");
+          row.tabIndex = selectedId === id ? 0 : -1;
+          row.setAttribute("aria-selected", selectedId === id ? "true" : "false");
+          if (has) row.setAttribute("aria-expanded", expanded ? "true" : "false");
           if (has) {
             var b = document.createElement("button");
             b.type = "button";
             b.className = "tw";
             b.textContent = expanded ? "▾" : "▸";
+            b.tabIndex = -1;
+            b.setAttribute("aria-label", (expanded ? "Collapse " : "Expand ") + s.name);
             b.onclick = function (e) {
               e.stopPropagation();
               if (spanOpen.has(id)) spanOpen.delete(id); else spanOpen.add(id);
               render();
+              var restored = findSpanRow(tree, id);
+              if (restored) restored.focus();
             };
             row.appendChild(b);
           } else {
@@ -342,20 +568,56 @@
           ms.textContent = fmtMs(s.self_ms) + " / " + fmtMs(s.total_ms) +
             (s.peak_bytes || s.bytes ? " · " + fmtBytes(s.peak_bytes || s.bytes) : "");
           row.appendChild(ms);
-          row.onclick = function () {
+          function activate() {
             tree.querySelectorAll("[aria-selected=true]").forEach(function (x) {
               x.setAttribute("aria-selected", "false");
+              x.tabIndex = -1;
             });
             row.setAttribute("aria-selected", "true");
+            row.tabIndex = 0;
             selectedId = id;
             setInspector(Object.assign({ label: s.name }, s));
             highlightNode(id);
+          }
+          row.onclick = activate;
+          row.onkeydown = function (event) {
+            var rows = Array.from(tree.querySelectorAll("[data-span-id]"));
+            var index = rows.indexOf(row);
+            var target = null;
+            if (event.key === "Enter" || event.key === " ") activate();
+            else if (event.key === "ArrowDown") target = rows[Math.min(rows.length - 1, index + 1)];
+            else if (event.key === "ArrowUp") target = rows[Math.max(0, index - 1)];
+            else if (event.key === "Home") target = rows[0];
+            else if (event.key === "End") target = rows[rows.length - 1];
+            else if (event.key === "ArrowRight" && has) {
+              if (!spanOpen.has(id)) {
+                spanOpen.add(id);
+                render();
+                target = findSpanRow(tree, id);
+              } else {
+                target = rows[index + 1];
+              }
+            } else if (event.key === "ArrowLeft") {
+              if (has && spanOpen.has(id)) {
+                spanOpen.delete(id);
+                render();
+                target = findSpanRow(tree, id);
+              } else if (s.parent_id != null) {
+                target = findSpanRow(tree, idStr(s.parent_id));
+              }
+            } else return;
+            event.preventDefault();
+            if (target) target.focus();
           };
           tree.appendChild(row);
           if (has && expanded) add(kids, depth + 1);
         });
       }
-      add(byParent.root, 0);
+      add(byParent[rootKey], 0);
+      if (!tree.querySelector('[tabindex="0"]')) {
+        var first = tree.querySelector("[data-span-id]");
+        if (first) first.tabIndex = 0;
+      }
     }
     var search = document.querySelector("[data-span-search]");
     if (search) search.oninput = render;
@@ -366,7 +628,9 @@
     selectedId = id;
     if (graphState) graphState.updateHighlight();
     document.querySelectorAll("#span-tree [data-span-id]").forEach(function (el) {
-      el.setAttribute("aria-selected", el.dataset.spanId === id ? "true" : "false");
+      var selected = el.dataset.spanId === id;
+      el.setAttribute("aria-selected", selected ? "true" : "false");
+      el.tabIndex = selected ? 0 : -1;
     });
   }
 
@@ -377,7 +641,7 @@
 
   function fitView(vis) {
     if (!vis.length) return;
-    var wrap = document.getElementById("canvas-wrap");
+    var wrap = document.getElementById("view-panel-trace");
     var pw = wrap.clientWidth || 800;
     var ph = wrap.clientHeight || 400;
     var coords = vis.filter(function (n) { return Number.isFinite(n._x) && Number.isFinite(n._y); });
@@ -426,7 +690,7 @@
 
   function showTooltip(n, clientX, clientY) {
     if (!tooltip || !n) return;
-    var wrap = document.getElementById("canvas-wrap");
+    var wrap = document.getElementById("view-panel-trace");
     var r = wrap.getBoundingClientRect();
     tooltip.innerHTML =
       '<div class="tt-title">' + esc(n.label || n.name || "") + "</div>" +
@@ -598,6 +862,8 @@
         gg.dataset.nodeId = n._id;
         gg.setAttribute("tabindex", "0");
         gg.setAttribute("role", "button");
+        gg.setAttribute("aria-label", (n.label || n.name || "Span") + ", self " +
+          fmtMs(n.self_time_ms) + ", total " + fmtMs(n.total_time_ms));
 
         var card = document.createElementNS(NS, "rect");
         card.setAttribute("class", "node-card");
@@ -637,8 +903,15 @@
           setInspector(n);
           updateClasses();
           document.querySelectorAll("#span-tree [data-span-id]").forEach(function (el) {
-            el.setAttribute("aria-selected", el.dataset.spanId === n._id ? "true" : "false");
+            var selected = el.dataset.spanId === n._id;
+            el.setAttribute("aria-selected", selected ? "true" : "false");
+            el.tabIndex = selected ? 0 : -1;
           });
+        };
+        gg.onkeydown = function (ev) {
+          if (ev.key !== "Enter" && ev.key !== " ") return;
+          ev.preventDefault();
+          gg.onclick(ev);
         };
         nodeG.appendChild(gg);
       });
@@ -684,7 +957,7 @@
   }
 
   function initCanvasControls() {
-    var wrap = document.getElementById("canvas-wrap");
+    var wrap = document.getElementById("view-panel-trace");
     document.getElementById("fit-btn").onclick = function () {
       if (!graphState) return;
       fitView(graphState.nodes);
@@ -722,6 +995,33 @@
     );
   }
 
+  function initTraceUtilities() {
+    var legend = document.querySelector("[data-legend]");
+    var legendToggle = document.getElementById("legend-toggle");
+    if (legend && legendToggle) {
+      legendToggle.onclick = function () {
+        var collapsed = legend.classList.toggle("collapsed");
+        legendToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      };
+    }
+    var exportButton = document.getElementById("export-btn");
+    if (exportButton) {
+      exportButton.onclick = function () {
+        var svg = document.getElementById("graph-canvas");
+        if (!svg || !svg.childNodes.length) return;
+        var clone = svg.cloneNode(true);
+        clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+        var blob = new Blob([new XMLSerializer().serializeToString(clone)], { type: "image/svg+xml" });
+        var href = URL.createObjectURL(blob);
+        var link = document.createElement("a");
+        link.href = href;
+        link.download = "candle-graph-trace.svg";
+        link.click();
+        setTimeout(function () { URL.revokeObjectURL(href); }, 0);
+      };
+    }
+  }
+
   document.getElementById("theme-btn").onclick = function () {
     var n = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
     root.setAttribute("data-theme", n);
@@ -740,6 +1040,7 @@
   initResizers();
   initTabs();
   initCanvasControls();
+  initTraceUtilities();
   renderCoverage();
   renderPeakBreakdown();
   buildSpanTree();

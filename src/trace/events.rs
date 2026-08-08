@@ -1,4 +1,4 @@
-//! JSONL event records for `candle-graph/trace/5`.
+//! JSONL event records for `candle-graph/trace/6`.
 
 use serde::{Deserialize, Serialize};
 
@@ -43,10 +43,14 @@ pub struct SpanStartEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     pub name: String,
+    /// Monotonic timestamp in nanoseconds since the profile run started.
+    pub start_ns: u64,
     /// Span classification (`function` / `op` / `module`). Serialized as `span_kind` because
     /// the JSONL event discriminator also uses the key `kind`.
     #[serde(rename = "span_kind")]
     pub kind: SpanKind,
+    #[serde(default)]
+    pub measured: bool,
     /// PyTorch-style training step (`forward` / `backward` / `optimizer`) for memory categories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<ExecutionStep>,
@@ -138,12 +142,9 @@ pub struct DeviceMemoryEvent {
 pub struct GradientEvent {
     pub event_id: String,
     pub root: String,
-    /// Parameter key under `root` (alias `param_key` for v4 emitters).
-    #[serde(alias = "param_key")]
+    /// Parameter key under `root`.
     pub key: String,
     pub state: GradientState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub step: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub norm: Option<f64>,
 }

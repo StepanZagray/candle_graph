@@ -55,6 +55,16 @@ impl SpanId {
     }
 }
 
+impl SpanGuard<'_> {
+    pub fn id(&self) -> SpanId {
+        self.id
+    }
+
+    pub fn elapsed_ns(&self) -> u64 {
+        self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+    }
+}
+
 /// RAII span: emits `span_start` on creation and `span_end` with wall duration on drop.
 pub struct SpanGuard<'a> {
     pub(crate) session: &'a super::session::TraceSession,

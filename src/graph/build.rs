@@ -2,17 +2,32 @@
 
 use std::collections::{HashMap, HashSet};
 
+use anyhow::{ensure, Result};
+
+use crate::trace::analyze_health;
 use crate::trace::memory::{analyze_memory, node_memory_metrics};
 use crate::trace::schema::GradientState as TraceGradientState;
 use crate::trace::TraceDocument;
 
 use super::model::{
     ExecutionGraph, GradientRecord, GradientRecordState, GraphEdge, GraphEdgeKind, GraphNode,
-    GraphNodeKind, GraphSummary, HeavySpan, SlowSpan, SCHEMA,
+    GraphNodeKind, GraphSummary, HeavySpan, SlowSpan, TensorRecord, SCHEMA,
 };
 
 /// Reconstruct span hierarchy, attach ops, infer call/data edges, and compute self times.
-pub fn build_from_trace(doc: &TraceDocument) -> ExecutionGraph {
+pub fn build_from_trace(doc: &TraceDocument) -> Result<ExecutionGraph> {
+    let health = analyze_health(doc);
+    ensure!(
+        health.trusted,
+        "trace is structurally untrusted: {}",
+        health
+            .issues
+            .iter()
+            .filter(|issue| matches!(issue.severity, crate::trace::HealthSeverity::Error))
+            .map(|issue| issue.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
     let memory = analyze_memory(doc);
     let mut nodes: Vec<GraphNode> = Vec::new();
     let mut op_counter: HashMap<String, usize> = HashMap::new();
@@ -26,6 +41,7 @@ pub fn build_from_trace(doc: &TraceDocument) -> ExecutionGraph {
             parent_id: span.parent_id.clone(),
             name: span.name.clone(),
             kind: span_node_kind(span.kind, is_root),
+            start_ns: span.start_ns,
             self_time_ns: total_time_ns,
             total_time_ns,
             shape: None,
@@ -49,6 +65,7 @@ pub fn build_from_trace(doc: &TraceDocument) -> ExecutionGraph {
             parent_id: Some(op.span_id.clone()),
             name: op.op_name.clone(),
             kind: GraphNodeKind::Op,
+            start_ns: op.timestamp_ns,
             self_time_ns: op.duration_ns,
             total_time_ns: op.duration_ns,
             shape: if op.shape.is_empty() {
@@ -178,18 +195,34 @@ pub fn build_from_trace(doc: &TraceDocument) -> ExecutionGraph {
             norm: gradient.norm,
         })
         .collect();
-
-    let root = nodes
+    let tensors = doc
+        .tensors
         .iter()
-        .find(|node| node.parent_id.is_none())
-        .or_else(|| nodes.first());
-    let total_ms = root
-        .map(|node| node.total_time_ns as f64 / 1_000_000.0)
-        .unwrap_or(0.0);
+        .map(|tensor| TensorRecord {
+            span_id: tensor.span_id.clone(),
+            tensor_id: tensor.tensor_id.clone(),
+            shape: tensor.shape.clone(),
+            dtype: tensor.dtype.clone(),
+            device: tensor.device.clone(),
+            requires_grad: tensor.requires_grad,
+            storage_bytes: tensor.storage_bytes.unwrap_or(0),
+            category: tensor.category,
+        })
+        .collect();
 
+    // Invalid multi-root traces remain diagnosable, but never silently report the first root as
+    // the whole run. Trace health marks them untrusted before analysis is consumed.
+    let total_ms = doc
+        .spans
+        .iter()
+        .filter(|span| span.measured)
+        .map(|span| span.duration_ns as f64 / 1_000_000.0)
+        .sum();
+
+    let measured_ids = measured_subtree_ids(doc);
     let mut slowest: Vec<SlowSpan> = nodes
         .iter()
-        .filter(|node| node.kind != GraphNodeKind::Op)
+        .filter(|node| node.kind != GraphNodeKind::Op && measured_ids.contains(&node.id))
         .map(|node| SlowSpan {
             id: node.id.clone(),
             name: node.name.clone(),
@@ -201,7 +234,7 @@ pub fn build_from_trace(doc: &TraceDocument) -> ExecutionGraph {
 
     let mut heaviest: Vec<HeavySpan> = nodes
         .iter()
-        .filter(|node| node.kind != GraphNodeKind::Op)
+        .filter(|node| node.kind != GraphNodeKind::Op && measured_ids.contains(&node.id))
         .map(|node| HeavySpan {
             id: node.id.clone(),
             name: node.name.clone(),
@@ -212,10 +245,11 @@ pub fn build_from_trace(doc: &TraceDocument) -> ExecutionGraph {
     heaviest.sort_by_key(|span| std::cmp::Reverse(span.bytes));
     heaviest.truncate(8);
 
-    ExecutionGraph {
-        schema: SCHEMA,
+    Ok(ExecutionGraph {
+        schema: SCHEMA.into(),
         spans: nodes,
         edges,
+        tensors,
         gradients,
         summary: GraphSummary {
             entrypoint: doc.run.entrypoint.clone(),
@@ -225,6 +259,30 @@ pub fn build_from_trace(doc: &TraceDocument) -> ExecutionGraph {
             memory: memory.summary.clone(),
         },
         memory,
+    })
+}
+
+fn measured_subtree_ids(doc: &TraceDocument) -> HashSet<String> {
+    let mut ids: HashSet<String> = doc
+        .spans
+        .iter()
+        .filter(|span| span.measured)
+        .map(|span| span.id.clone())
+        .collect();
+    loop {
+        let before = ids.len();
+        for span in &doc.spans {
+            if span
+                .parent_id
+                .as_ref()
+                .is_some_and(|parent| ids.contains(parent))
+            {
+                ids.insert(span.id.clone());
+            }
+        }
+        if ids.len() == before {
+            return ids;
+        }
     }
 }
 
@@ -289,9 +347,15 @@ mod tests {
             schema: TRACE_SCHEMA.to_string(),
             run: TraceRunMeta {
                 run_id: "run-1".into(),
+                correlation_id: "demo/update-1".into(),
                 entrypoint: "demo::train::loss".into(),
-                phase: "train".into(),
+                phase: crate::phase::ExecutionPhase::Train,
                 timestamp: "2026-08-04T18:00:00Z".into(),
+                capture_step: 1,
+                warmup_steps: 0,
+                device: "cpu".into(),
+                timing_mode: crate::trace::TimingMode::Host,
+                tags: Default::default(),
                 candle_version: None,
             },
             spans: vec![
@@ -300,6 +364,8 @@ mod tests {
                     parent_id: None,
                     name: "loss".into(),
                     kind: SpanKind::Function,
+                    measured: true,
+                    start_ns: 0,
                     closed: true,
                     duration_ns: 10_000_000,
                     step: None,
@@ -309,6 +375,8 @@ mod tests {
                     parent_id: Some("root".into()),
                     name: "Encoder::forward".into(),
                     kind: SpanKind::Function,
+                    measured: false,
+                    start_ns: 1_000_000,
                     closed: true,
                     duration_ns: 5_000_000,
                     step: Some(crate::phase::ExecutionStep::Forward),
@@ -318,6 +386,8 @@ mod tests {
                     parent_id: Some("root".into()),
                     name: "Head::forward".into(),
                     kind: SpanKind::Function,
+                    measured: false,
+                    start_ns: 6_000_000,
                     closed: true,
                     duration_ns: 1_000_000,
                     step: None,
@@ -384,12 +454,11 @@ mod tests {
                 root: "vb".into(),
                 key: "encoder.weight".into(),
                 state: GradientState::Present,
-                step: None,
                 norm: Some(0.5),
             }],
             edges: vec![EdgeEvent {
-                from_span: "h0".into(),
-                to_span: "logits".into(),
+                from_span: "encoder".into(),
+                to_span: "head".into(),
                 duration_ns: 800_000,
             }],
         }
@@ -397,7 +466,7 @@ mod tests {
 
     #[test]
     fn reconstructs_span_tree_and_self_times() {
-        let graph = build_from_trace(&synthetic_trace());
+        let graph = build_from_trace(&synthetic_trace()).unwrap();
 
         assert_eq!(graph.schema, SCHEMA);
         assert_eq!(graph.summary.entrypoint, "demo::train::loss");
@@ -419,7 +488,7 @@ mod tests {
 
     #[test]
     fn memory_summary_and_heaviest_spans() {
-        let graph = build_from_trace(&synthetic_trace());
+        let graph = build_from_trace(&synthetic_trace()).unwrap();
         assert!(graph.summary.memory.peak_bytes >= 8 * 64 * 4);
         assert_eq!(graph.summary.memory.alloc_count, 2);
         assert!(!graph.summary.heaviest_spans.is_empty());
@@ -428,7 +497,7 @@ mod tests {
 
     #[test]
     fn builds_call_and_data_edges() {
-        let graph = build_from_trace(&synthetic_trace());
+        let graph = build_from_trace(&synthetic_trace()).unwrap();
 
         assert!(
             graph.edges.iter().any(|edge| {
@@ -442,7 +511,7 @@ mod tests {
 
     #[test]
     fn records_gradients_and_slowest_spans() {
-        let graph = build_from_trace(&synthetic_trace());
+        let graph = build_from_trace(&synthetic_trace()).unwrap();
 
         assert_eq!(graph.gradients.len(), 1);
         assert_eq!(graph.summary.slowest_spans[0].id, "root");
@@ -454,9 +523,15 @@ mod tests {
             schema: TRACE_SCHEMA.to_string(),
             run: TraceRunMeta {
                 run_id: "run-2".into(),
+                correlation_id: "outer/update-1".into(),
                 entrypoint: "outer".into(),
-                phase: "train".into(),
+                phase: crate::phase::ExecutionPhase::Train,
                 timestamp: "2026-08-04T18:00:00Z".into(),
+                capture_step: 1,
+                warmup_steps: 0,
+                device: "cpu".into(),
+                timing_mode: crate::trace::TimingMode::Host,
+                tags: Default::default(),
                 candle_version: None,
             },
             spans: vec![
@@ -465,6 +540,8 @@ mod tests {
                     parent_id: None,
                     name: "a".into(),
                     kind: SpanKind::Function,
+                    measured: true,
+                    start_ns: 0,
                     closed: true,
                     duration_ns: 200,
                     step: None,
@@ -474,6 +551,8 @@ mod tests {
                     parent_id: Some("a".into()),
                     name: "b".into(),
                     kind: SpanKind::Function,
+                    measured: false,
+                    start_ns: 10,
                     closed: true,
                     duration_ns: 100,
                     step: None,
@@ -499,7 +578,7 @@ mod tests {
             edges: Vec::new(),
         };
 
-        let graph = build_from_trace(&doc);
+        let graph = build_from_trace(&doc).unwrap();
         let op = graph.node("b/op/0").expect("op under span b");
         assert_eq!(op.parent_id.as_deref(), Some("b"));
     }

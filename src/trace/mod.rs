@@ -1,4 +1,4 @@
-//! TensorFlow-Profiler-style trace protocol (`candle-graph/trace/5`).
+//! TensorFlow-Profiler-style trace protocol (`candle-graph/trace/6`).
 //!
 //! Trace-only evidence: spans, timed ops, tensor snapshots, memory events, gradient facts,
 //! and span edges. No static Rust analysis — importers aggregate JSONL into
@@ -6,6 +6,7 @@
 
 pub mod document;
 pub mod events;
+pub mod health;
 pub mod memory;
 pub mod schema;
 
@@ -14,5 +15,8 @@ pub use events::{
     DeviceMemoryEvent, EdgeEvent, GradientEvent, MemoryEvent, OpEvent, SpanEndEvent,
     SpanStartEvent, TensorEvent, TraceEvent,
 };
+pub use health::{analyze_health, EvidenceCoverage, HealthIssue, HealthSeverity, TraceHealth};
 pub use memory::{category_for_step, storage_bytes, MemoryAction, MemoryCategory};
-pub use schema::{GradientState, SpanKind, SpanRecord, TraceRunMeta, TraceSummary, SCHEMA};
+pub use schema::{
+    GradientState, SpanKind, SpanRecord, TimingMode, TraceRunMeta, TraceSummary, SCHEMA,
+};

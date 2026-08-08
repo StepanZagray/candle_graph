@@ -1,19 +1,19 @@
-//! Dependency-free interactive HTML visualizer for `candle-graph/viewer/3` trace payloads.
+//! Dependency-free interactive HTML visualizer for `candle-graph/viewer/4` evidence payloads.
 //!
 //! Embeds escaped JSON, CSS, and JS into one document. No CDN or network fetches.
 
 use serde_json::Value;
 
-use crate::graph::ExecutionGraph;
+use crate::evidence::EvidencePacket;
 
 pub mod trace_view;
 
 const CSS: &str = include_str!("viewer/style.css");
 const TRACE_JS: &str = include_str!("viewer/app_trace.js");
 
-/// Render a trace-only HTML document from an [`ExecutionGraph`].
-pub fn render_trace_html(graph: &ExecutionGraph) -> String {
-    let projection = trace_view::project(graph);
+/// Render application and GPU evidence in one standalone document.
+pub fn render_evidence_html(evidence: &EvidencePacket) -> String {
+    let projection = trace_view::project(evidence);
     render_trace_document(&projection)
 }
 
@@ -21,11 +21,11 @@ fn render_trace_document(projection: &Value) -> String {
     let payload = embed_json(projection);
     let mut html = String::with_capacity(8192 + CSS.len() + TRACE_JS.len() + payload.len());
     html.push_str(
-        "<!DOCTYPE html>\n<html lang=\"en\" data-viewer=\"candle-graph-trace\">\n<head>\n",
+        "<!DOCTYPE html>\n<html lang=\"en\" data-viewer=\"candle-graph-evidence\">\n<head>\n",
     );
     html.push_str("<meta charset=\"utf-8\"/>\n");
     html.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"/>\n");
-    html.push_str("<title>candle-graph trace</title>\n<style>");
+    html.push_str("<title>candle-graph evidence</title>\n<style>");
     html.push_str(CSS);
     html.push_str(
         "\n.span-tree .span-row{display:flex;align-items:baseline;gap:6px;padding:4px 8px;border-radius:var(--radius-sm);cursor:pointer;font-size:12px;line-height:1.35}\n\
@@ -39,20 +39,21 @@ fn render_trace_document(projection: &Value) -> String {
 .peak-table{font-size:11px}\n\
 .peak-table table{width:100%;border-collapse:collapse}\n\
 .peak-table th,.peak-table td{padding:4px 8px;border-bottom:1px solid var(--border);text-align:left;font-family:var(--font-mono)}\n\
-.timeline-table tbody tr{cursor:pointer}\n\
-.timeline-table tbody tr:hover,.timeline-table tbody tr.sel{background:var(--accent-soft)}\n\
+.span-cost-table tbody tr{cursor:pointer}\n\
+.span-cost-table tbody tr:hover,.span-cost-table tbody tr.sel{background:var(--accent-soft)}\n\
+.span-tree .span-row:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}\n\
 .node.function .node-card,.node.root .node-card,.node.module .node-card{stroke-width:2.5}\n",
     );
     html.push_str("</style>\n</head>\n<body>\n");
-    html.push_str("<a class=\"skip\" href=\"#canvas-pane\">Skip to canvas</a>\n");
+    html.push_str("<a class=\"skip\" href=\"#profile-viewer\">Skip to profile evidence</a>\n");
 
     html.push_str("<header class=\"top\" role=\"banner\">\n");
-    html.push_str("  <div class=\"brand\"><span class=\"brand-mark\" aria-hidden=\"true\"></span>candle-graph trace</div>\n");
+    html.push_str("  <div class=\"brand\"><span class=\"brand-mark\" aria-hidden=\"true\"></span>candle-graph evidence</div>\n");
     html.push_str(
         "  <div class=\"cov\" data-coverage role=\"status\" aria-live=\"polite\"></div>\n",
     );
     html.push_str("  <div class=\"top-actions\">\n");
-    html.push_str("    <button type=\"button\" class=\"btn primary\" id=\"export-btn\" aria-label=\"Export graph as SVG\">Export SVG</button>\n");
+    html.push_str("    <button type=\"button\" class=\"btn primary\" id=\"export-btn\" data-trace-only aria-label=\"Export trace graph as SVG\" hidden>Export SVG</button>\n");
     html.push_str("    <button type=\"button\" class=\"btn\" id=\"theme-btn\" data-theme-toggle aria-label=\"Toggle color theme\">Theme</button>\n");
     html.push_str("  </div>\n");
     html.push_str("</header>\n");
@@ -62,30 +63,34 @@ fn render_trace_document(projection: &Value) -> String {
         "  <nav class=\"pane pane-sidebar\" data-pane=\"sidebar\" aria-label=\"Navigation\">\n",
     );
     html.push_str("    <div class=\"pane-h\">Views</div>\n");
-    html.push_str("    <div class=\"tabs\" data-view-tabs role=\"tablist\" aria-label=\"Trace views\"></div>\n");
-    html.push_str("    <div class=\"pane-h sub\">Span hierarchy</div>\n");
-    html.push_str("    <div class=\"search-box\">\n");
-    html.push_str("      <label class=\"sr\" for=\"span-search\">Search spans</label>\n");
-    html.push_str("      <input id=\"span-search\" data-span-search type=\"search\" placeholder=\"Filter spans…\" autocomplete=\"off\"/>\n");
+    html.push_str("    <div class=\"tabs\" data-view-tabs role=\"tablist\" aria-label=\"Profile evidence views\"></div>\n");
+    html.push_str("    <div id=\"trace-navigation\" class=\"trace-navigation\" hidden>\n");
+    html.push_str("      <div class=\"pane-h sub\">Span hierarchy</div>\n");
+    html.push_str("      <div class=\"search-box\">\n");
+    html.push_str("        <label class=\"sr\" for=\"span-search\">Search spans</label>\n");
+    html.push_str("        <input id=\"span-search\" data-span-search type=\"search\" placeholder=\"Filter spans…\" autocomplete=\"off\"/>\n");
+    html.push_str("      </div>\n");
+    html.push_str("      <div id=\"span-tree\" class=\"scroll-area span-tree\" data-span-tree role=\"tree\" aria-label=\"Span hierarchy\"></div>\n");
     html.push_str("    </div>\n");
-    html.push_str("    <div id=\"span-tree\" class=\"scroll-area span-tree\" data-span-tree tabindex=\"0\" role=\"tree\" aria-label=\"Span hierarchy\"></div>\n");
     html.push_str("  </nav>\n");
     html.push_str(
         "  <div class=\"resize-handle\" data-side=\"left\" aria-hidden=\"true\"></div>\n",
     );
 
-    html.push_str("  <main class=\"pane pane-canvas\" data-pane=\"canvas\" id=\"canvas-pane\" aria-label=\"Trace canvas\">\n");
-    html.push_str("    <div class=\"pane-h row\"><span data-canvas-title>Trace</span><span class=\"graph-stats\" data-graph-stats></span></div>\n");
-    html.push_str("    <div class=\"graph-toolbar\" id=\"graph-toolbar\">\n");
+    html.push_str("  <main class=\"pane pane-canvas\" data-pane=\"canvas\" id=\"profile-viewer\" aria-label=\"Profile evidence\">\n");
+    html.push_str("    <div class=\"pane-h row\"><span data-canvas-title>Evidence</span><span class=\"graph-stats\" data-graph-stats></span></div>\n");
+    html.push_str(
+        "    <div class=\"graph-toolbar\" id=\"graph-toolbar\" data-trace-only hidden>\n",
+    );
     html.push_str("      <button type=\"button\" class=\"btn\" id=\"fit-btn\" aria-label=\"Fit graph to view\">Fit</button>\n");
     html.push_str("      <button type=\"button\" class=\"btn\" id=\"reset-btn\" aria-label=\"Reset zoom and pan\">Reset</button>\n");
     html.push_str("    </div>\n");
-    html.push_str("    <div class=\"canvas-wrap\" id=\"canvas-wrap\">\n");
+    html.push_str("    <section id=\"view-panel-evidence\" class=\"view-panel scroll-area evidence-view\" data-view-panel=\"evidence\" role=\"tabpanel\" aria-labelledby=\"view-tab-evidence\"></section>\n");
+    html.push_str("    <div class=\"canvas-wrap\" id=\"view-panel-trace\" data-view-panel=\"trace\" role=\"tabpanel\" aria-labelledby=\"view-tab-trace\" hidden>\n");
     html.push_str("      <div id=\"empty-graph\" class=\"empty\" data-empty-state hidden>\n");
     html.push_str("        <p><strong>No trace data</strong></p>\n");
     html.push_str("        <p>This trace has no spans to display.</p>\n");
     html.push_str("      </div>\n");
-    html.push_str("      <div id=\"timeline-panel\" class=\"scroll-area\" hidden></div>\n");
     html.push_str("      <svg id=\"graph-canvas\" data-canvas role=\"img\" aria-label=\"Trace graph\" tabindex=\"0\"></svg>\n");
     html.push_str("      <div id=\"graph-tooltip\" class=\"graph-tooltip\" role=\"tooltip\" aria-hidden=\"true\"></div>\n");
     html.push_str(
@@ -110,12 +115,15 @@ fn render_trace_document(projection: &Value) -> String {
     html.push_str("        <button type=\"button\" class=\"btn icon\" id=\"zoom-fit\" aria-label=\"Fit to view\">⤢</button>\n");
     html.push_str("      </div>\n");
     html.push_str("    </div>\n");
+    html.push_str("    <section id=\"view-panel-span_costs\" class=\"view-panel scroll-area\" data-view-panel=\"span_costs\" role=\"tabpanel\" aria-labelledby=\"view-tab-span_costs\" hidden></section>\n");
+    html.push_str("    <section id=\"view-panel-memory\" class=\"view-panel scroll-area\" data-view-panel=\"memory\" role=\"tabpanel\" aria-labelledby=\"view-tab-memory\" hidden></section>\n");
+    html.push_str("    <section id=\"view-panel-gpu\" class=\"view-panel scroll-area gpu-view\" data-view-panel=\"gpu\" role=\"tabpanel\" aria-labelledby=\"view-tab-gpu\" hidden></section>\n");
     html.push_str("  </main>\n");
 
     html.push_str(
         "  <div class=\"resize-handle\" data-side=\"right\" aria-hidden=\"true\"></div>\n",
     );
-    html.push_str("  <aside class=\"pane pane-inspector\" data-pane=\"inspector\" aria-label=\"Inspector\">\n");
+    html.push_str("  <aside class=\"pane pane-inspector\" data-pane=\"inspector\" aria-label=\"Inspector\" hidden>\n");
     html.push_str("    <div class=\"pane-h\">Inspector</div>\n");
     html.push_str("    <dl id=\"inspector\" data-inspector>\n");
     html.push_str("      <div><dt>Label</dt><dd data-field=\"label\">—</dd></div>\n");

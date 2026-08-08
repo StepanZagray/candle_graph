@@ -1,23 +1,37 @@
-//! Execution graph model (`candle-graph/graph/2`).
+//! Execution graph model (`candle-graph/graph/3`).
 
 use serde::{Deserialize, Serialize};
 
-use crate::trace::memory::{MemoryProfile, MemorySummary};
+use crate::trace::memory::{MemoryCategory, MemoryProfile, MemorySummary};
 
 /// Schema identifier for [`ExecutionGraph`] documents.
-pub const SCHEMA: &str = "candle-graph/graph/2";
+pub const SCHEMA: &str = "candle-graph/graph/3";
 
 /// Hierarchical execution graph built from a trace document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionGraph {
-    pub schema: &'static str,
+    pub schema: String,
     /// Flat list of span and op nodes (parent links encode the tree).
     pub spans: Vec<GraphNode>,
     /// Call hierarchy and tensor data-flow edges with timing.
     pub edges: Vec<GraphEdge>,
+    /// Semantic tensor checkpoints captured by the application.
+    pub tensors: Vec<TensorRecord>,
     pub gradients: Vec<GradientRecord>,
     pub summary: GraphSummary,
     pub memory: MemoryProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TensorRecord {
+    pub span_id: String,
+    pub tensor_id: String,
+    pub shape: Vec<usize>,
+    pub dtype: String,
+    pub device: String,
+    pub requires_grad: bool,
+    pub storage_bytes: u64,
+    pub category: MemoryCategory,
 }
 
 /// One span or attached operation in the execution tree.
@@ -27,6 +41,7 @@ pub struct GraphNode {
     pub parent_id: Option<String>,
     pub name: String,
     pub kind: GraphNodeKind,
+    pub start_ns: u64,
     /// Wall time excluding nested spans/ops (TensorFlow profiler style).
     pub self_time_ns: u64,
     /// Inclusive wall time for this node.

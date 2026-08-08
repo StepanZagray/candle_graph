@@ -10,7 +10,7 @@ use candle_graph::cli::trace_cli::{self, TraceQueryKind};
 #[command(
     name = "candle-graph",
     about = "Import and visualize Candle execution traces",
-    long_about = "TensorFlow Profiler-style graphs from post-run JSONL traces (candle-graph/trace/4)."
+    long_about = "Trustworthy evidence packets and unified HTML from candle-graph/trace/6 runs."
 )]
 struct Args {
     #[command(subcommand)]
@@ -24,6 +24,8 @@ enum Command {
     View(ViewArgs),
     Summary(SummaryArgs),
     Query(QueryArgs),
+    Compare(CompareArgs),
+    Report(ReportArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -39,6 +41,31 @@ struct ViewArgs {
     trace: PathBuf,
     #[arg(long, value_name = "FILE")]
     output: PathBuf,
+    #[arg(long, value_name = "TRACE")]
+    baseline: Option<PathBuf>,
+    #[arg(long, value_name = "DIR")]
+    nsight_dir: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
+struct CompareArgs {
+    baseline: PathBuf,
+    candidate: PathBuf,
+    #[arg(long, short, value_name = "FILE")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
+struct ReportArgs {
+    trace: PathBuf,
+    #[arg(long, value_name = "TRACE")]
+    baseline: Option<PathBuf>,
+    #[arg(long, value_name = "DIR")]
+    nsight_dir: Option<PathBuf>,
+    #[arg(long, value_name = "FILE")]
+    json: PathBuf,
+    #[arg(long, value_name = "FILE")]
+    markdown: PathBuf,
 }
 
 #[derive(Parser, Debug)]
@@ -64,6 +91,7 @@ enum CliTraceQueryKind {
     Memory,
     Efficiency,
     Spans,
+    Tensors,
     Gradients,
 }
 
@@ -75,6 +103,7 @@ impl From<CliTraceQueryKind> for TraceQueryKind {
             CliTraceQueryKind::Memory => Self::Memory,
             CliTraceQueryKind::Efficiency => Self::Efficiency,
             CliTraceQueryKind::Spans => Self::Spans,
+            CliTraceQueryKind::Tensors => Self::Tensors,
             CliTraceQueryKind::Gradients => Self::Gradients,
         }
     }
@@ -85,12 +114,29 @@ fn main() -> Result<()> {
     match args.command {
         Command::Import(import) => trace_cli::run_import(&import.trace, import.output.as_deref()),
         #[cfg(feature = "visualizer")]
-        Command::View(view) => trace_cli::run_view(&view.trace, &view.output),
+        Command::View(view) => trace_cli::run_view(
+            &view.trace,
+            &view.output,
+            view.baseline.as_deref(),
+            view.nsight_dir.as_deref(),
+        ),
         Command::Summary(summary) => {
             trace_cli::run_summary(&summary.trace, summary.output.as_deref())
         }
         Command::Query(query) => {
             trace_cli::run_query(&query.trace, query.kind.into(), query.output.as_deref())
         }
+        Command::Compare(compare) => trace_cli::run_compare(
+            &compare.baseline,
+            &compare.candidate,
+            compare.output.as_deref(),
+        ),
+        Command::Report(report) => trace_cli::run_report(
+            &report.trace,
+            report.baseline.as_deref(),
+            report.nsight_dir.as_deref(),
+            &report.json,
+            &report.markdown,
+        ),
     }
 }

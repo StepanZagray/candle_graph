@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 
 use super::document::TraceDocument;
-use super::events::OpEvent;
 
 /// TensorFlow-profiler-style memory category for timeline breakdown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -341,134 +340,6 @@ fn collect_timeline_events(doc: &TraceDocument) -> Vec<TimelineEvent> {
         });
     }
 
-    if !events.is_empty() {
-        events.sort_by(|a, b| {
-            a.timestamp_ns
-                .cmp(&b.timestamp_ns)
-                .then_with(|| a.tensor_id.cmp(&b.tensor_id))
-        });
-        return events;
-    }
-
-    synthesize_from_ops(doc)
-}
-
-fn synthesize_from_ops(doc: &TraceDocument) -> Vec<TimelineEvent> {
-    let mut ops: Vec<&OpEvent> = doc.ops.iter().collect();
-    ops.sort_by(|a, b| {
-        a.timestamp_ns
-            .cmp(&b.timestamp_ns)
-            .then_with(|| a.span_id.cmp(&b.span_id))
-            .then_with(|| a.op_name.cmp(&b.op_name))
-    });
-
-    let mut clock = 0u64;
-    let mut events = Vec::new();
-    let mut span_stack: Vec<(String, u64)> = Vec::new();
-    let span_end_ts: HashMap<String, u64> = doc
-        .spans
-        .iter()
-        .map(|span| {
-            let end = if span.duration_ns > 0 {
-                span.duration_ns
-            } else {
-                doc.ops
-                    .iter()
-                    .filter(|op| op.span_id == span.id)
-                    .map(|op| op.duration_ns)
-                    .sum()
-            };
-            (span.id.clone(), end)
-        })
-        .collect();
-
-    let span_steps: HashMap<String, crate::phase::ExecutionStep> = doc
-        .spans
-        .iter()
-        .filter_map(|span| span.step.map(|step| (span.id.clone(), step)))
-        .collect();
-
-    for op in ops {
-        let ts = if op.timestamp_ns > 0 {
-            op.timestamp_ns
-        } else {
-            clock = clock.saturating_add(op.duration_ns);
-            clock
-        };
-
-        let bytes = op
-            .storage_bytes
-            .unwrap_or_else(|| resolve_storage_bytes(None, &op.shape, &op.dtype));
-        if bytes == 0 {
-            continue;
-        }
-
-        let tensor_id = op
-            .output
-            .clone()
-            .unwrap_or_else(|| format!("{}:{}", op.span_id, op.op_name));
-        let step = span_steps.get(&op.span_id).copied();
-        let category = category_for_step(step, false);
-
-        events.push(TimelineEvent {
-            timestamp_ns: ts,
-            device: op.device.clone(),
-            action: MemoryAction::Alloc,
-            bytes,
-            category,
-            tensor_id: tensor_id.clone(),
-            span_id: op.span_id.clone(),
-            op_name: Some(op.op_name.clone()),
-            shape: op.shape.clone(),
-            dtype: op.dtype.clone(),
-        });
-
-        if let Some(end) = span_end_ts.get(&op.span_id) {
-            span_stack.push((tensor_id, ts.saturating_add(*end)));
-        }
-    }
-
-    for tensor in &doc.tensors {
-        let bytes = tensor.storage_bytes.unwrap_or(0);
-        if bytes == 0 {
-            continue;
-        }
-        let category = if tensor.requires_grad {
-            MemoryCategory::Gradient
-        } else {
-            tensor.category
-        };
-        events.push(TimelineEvent {
-            timestamp_ns: 0,
-            device: tensor.device.clone(),
-            action: MemoryAction::Alloc,
-            bytes,
-            category,
-            tensor_id: tensor.tensor_id.clone(),
-            span_id: tensor.span_id.clone(),
-            op_name: None,
-            shape: tensor.shape.clone(),
-            dtype: tensor.dtype.clone(),
-        });
-    }
-
-    for (tensor_id, free_ts) in span_stack {
-        if let Some(alloc) = events.iter().find(|e| e.tensor_id == tensor_id) {
-            events.push(TimelineEvent {
-                timestamp_ns: free_ts,
-                device: alloc.device.clone(),
-                action: MemoryAction::Free,
-                bytes: alloc.bytes,
-                category: alloc.category,
-                tensor_id,
-                span_id: alloc.span_id.clone(),
-                op_name: alloc.op_name.clone(),
-                shape: alloc.shape.clone(),
-                dtype: alloc.dtype.clone(),
-            });
-        }
-    }
-
     events.sort_by(|a, b| {
         a.timestamp_ns
             .cmp(&b.timestamp_ns)
@@ -571,9 +442,15 @@ mod tests {
             schema: SCHEMA.to_string(),
             run: TraceRunMeta {
                 run_id: "r".into(),
+                correlation_id: "test/update-1".into(),
                 entrypoint: "test".into(),
-                phase: "train".into(),
+                phase: crate::phase::ExecutionPhase::Train,
                 timestamp: "2026-01-01T00:00:00Z".into(),
+                capture_step: 1,
+                warmup_steps: 0,
+                device: "cpu".into(),
+                timing_mode: crate::trace::TimingMode::Host,
+                tags: Default::default(),
                 candle_version: None,
             },
             spans: vec![SpanRecord {
@@ -581,6 +458,8 @@ mod tests {
                 parent_id: None,
                 name: "forward".into(),
                 kind: SpanKind::Function,
+                measured: true,
+                start_ns: 0,
                 closed: true,
                 duration_ns: 1000,
                 step: None,
@@ -641,11 +520,11 @@ mod tests {
     }
 
     #[test]
-    fn synthesizes_from_ops_when_no_memory_events() {
+    fn does_not_invent_lifetimes_from_storage_metadata() {
         let mut doc = doc_with_ops_and_memory();
         doc.memory.clear();
         let profile = analyze_memory(&doc);
-        assert!(profile.summary.peak_bytes >= 100 * 100 * 4);
-        assert!(!profile.timeline.is_empty());
+        assert_eq!(profile.summary.peak_bytes, 0);
+        assert!(profile.timeline.is_empty());
     }
 }

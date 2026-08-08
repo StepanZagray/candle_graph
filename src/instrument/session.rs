@@ -1,8 +1,7 @@
-//! Post-run trace profiler session — emits `candle-graph/trace/5` JSONL.
-//!
-//! Not for hot training loops: run once after a representative forward/loss pass.
+//! Representative-run profiler session — emits `candle-graph/trace/6` JSONL.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -18,7 +17,7 @@ use crate::trace::events::{
 };
 use crate::trace::memory::category_for_step;
 use crate::trace::memory::{resolve_storage_bytes, MemoryAction};
-use crate::trace::schema::{GradientState, TraceRunMeta};
+use crate::trace::schema::{GradientState, TimingMode, TraceRunMeta};
 
 use super::span::{MemoryRecord, OpRecord, SpanGuard, SpanId, SpanKind, TensorRecord};
 
@@ -26,6 +25,55 @@ use super::span::{MemoryRecord, OpRecord, SpanGuard, SpanId, SpanKind, TensorRec
 pub struct TraceSession {
     path: PathBuf,
     inner: RefCell<SessionInner>,
+}
+
+/// Required provenance for one representative profile run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileRun {
+    pub entrypoint: String,
+    pub correlation_id: String,
+    pub phase: ExecutionPhase,
+    /// One-based selected update or inference invocation.
+    pub capture_step: u64,
+    pub warmup_steps: u64,
+    pub device: String,
+    pub timing_mode: TimingMode,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl ProfileRun {
+    pub fn training(
+        entrypoint: impl Into<String>,
+        capture_step: u64,
+        device: impl Into<String>,
+    ) -> Self {
+        let entrypoint = entrypoint.into();
+        Self {
+            correlation_id: format!("{entrypoint}/update-{capture_step}"),
+            entrypoint,
+            phase: ExecutionPhase::Train,
+            capture_step,
+            warmup_steps: capture_step.saturating_sub(1),
+            device: device.into(),
+            timing_mode: TimingMode::Host,
+            tags: BTreeMap::new(),
+        }
+    }
+
+    pub fn tag(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.tags.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn correlation_id(mut self, value: impl Into<String>) -> Self {
+        self.correlation_id = value.into();
+        self
+    }
+
+    pub fn device_synchronized(mut self) -> Self {
+        self.timing_mode = TimingMode::DeviceSynchronized;
+        self
+    }
 }
 
 struct SessionInner {
@@ -36,15 +84,16 @@ struct SessionInner {
     next_event_id: u64,
     id_buf: String,
     probe_started: Instant,
+    sticky_error: Option<String>,
 }
 
 impl TraceSession {
-    /// Open (or truncate) a JSONL trace at `path` and write the required `meta` event.
-    pub fn open(
-        path: impl AsRef<Path>,
-        entrypoint: impl Into<String>,
-        phase: ExecutionPhase,
-    ) -> Result<Self> {
+    /// Open a trace and own its single root span until [`Self::finish`].
+    pub fn open(path: impl AsRef<Path>, run: ProfileRun) -> Result<Self> {
+        anyhow::ensure!(
+            run.capture_step > 0,
+            "capture_step must be one-based and greater than zero"
+        );
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -57,33 +106,56 @@ impl TraceSession {
             .open(&path)
             .with_context(|| format!("open trace {}", path.display()))?;
         let mut writer = io::BufWriter::new(file);
-        let entrypoint = entrypoint.into();
         let run_id = new_run_id();
         let meta = TraceRunMeta {
             run_id: run_id.clone(),
-            entrypoint: entrypoint.clone(),
-            phase: phase.as_str().to_string(),
+            correlation_id: run.correlation_id,
+            entrypoint: run.entrypoint.clone(),
+            phase: run.phase,
             timestamp: utc_iso8601_now(),
+            capture_step: run.capture_step,
+            warmup_steps: run.warmup_steps,
+            device: run.device,
+            timing_mode: run.timing_mode,
+            tags: run.tags,
             candle_version: None,
         };
         write_event(&mut writer, &TraceEvent::meta(meta))?;
+        write_event(
+            &mut writer,
+            &TraceEvent::SpanStart(SpanStartEvent {
+                id: span_id_string(1),
+                parent_id: None,
+                name: run.entrypoint,
+                start_ns: 0,
+                kind: SpanKind::Function,
+                measured: false,
+                step: None,
+            }),
+        )?;
         Ok(Self {
             path,
             inner: RefCell::new(SessionInner {
                 writer,
-                span_stack: Vec::with_capacity(16),
-                span_steps: Vec::with_capacity(16),
-                next_span_id: 0,
+                span_stack: vec![1],
+                span_steps: vec![None],
+                next_span_id: 1,
                 next_event_id: 0,
                 id_buf: String::with_capacity(24),
                 probe_started: Instant::now(),
+                sticky_error: None,
             }),
         })
     }
 
     /// Begin a nested span; parent is the top of the session span stack (TF Profiler call tree).
     pub fn begin_span(&self, name: impl Into<String>, kind: SpanKind) -> SpanGuard<'_> {
-        self.begin_span_inner(name, kind, None)
+        self.begin_span_inner(name, kind, None, false)
+    }
+
+    /// Begin the single caller-controlled region used for total-time comparisons.
+    pub fn begin_measurement(&self, name: impl Into<String>) -> SpanGuard<'_> {
+        self.begin_span_inner(name, SpanKind::Function, None, true)
     }
 
     /// Begin a span tagged with a PyTorch-style training step (`forward` / `backward` / `optimizer`).
@@ -93,7 +165,7 @@ impl TraceSession {
         step: crate::phase::ExecutionStep,
         kind: SpanKind,
     ) -> SpanGuard<'_> {
-        self.begin_span_inner(name, kind, Some(step))
+        self.begin_span_inner(name, kind, Some(step), false)
     }
 
     fn begin_span_inner(
@@ -101,7 +173,10 @@ impl TraceSession {
         name: impl Into<String>,
         kind: SpanKind,
         step: Option<crate::phase::ExecutionStep>,
+        measured: bool,
     ) -> SpanGuard<'_> {
+        let started = Instant::now();
+        let start_ns = self.elapsed_ns();
         let mut inner = self.inner.borrow_mut();
         inner.next_span_id += 1;
         let span_id = inner.next_span_id;
@@ -110,17 +185,20 @@ impl TraceSession {
         format_span_id(&mut inner.id_buf, span_id);
         let id_str = inner.id_buf.clone();
 
-        write_event(
+        if let Err(error) = write_event(
             &mut inner.writer,
             &TraceEvent::SpanStart(SpanStartEvent {
                 id: id_str,
                 parent_id,
                 name: name.into(),
+                start_ns,
                 kind,
+                measured,
                 step,
             }),
-        )
-        .expect("span_start write");
+        ) {
+            inner.sticky_error.get_or_insert_with(|| error.to_string());
+        }
 
         inner.span_stack.push(span_id);
         inner.span_steps.push(step);
@@ -128,7 +206,7 @@ impl TraceSession {
         SpanGuard {
             session: self,
             id: SpanId(span_id),
-            started: Instant::now(),
+            started,
         }
     }
 
@@ -145,28 +223,34 @@ impl TraceSession {
         let mut inner = self.inner.borrow_mut();
         let expected = inner
             .span_stack
-            .pop()
+            .last()
+            .copied()
             .with_context(|| format!("span stack underflow closing span {}", id.0))?;
-        inner.span_steps.pop();
         anyhow::ensure!(
             expected == id.0,
             "span_end id `{}` does not match open span `{}`",
             id.0,
             expected
         );
+        inner.span_stack.pop();
+        inner.span_steps.pop();
 
         format_span_id(&mut inner.id_buf, id.0);
         let span_id = inner.id_buf.clone();
-        write_event(
+        if let Err(error) = write_event(
             &mut inner.writer,
             &TraceEvent::SpanEnd(SpanEndEvent {
                 id: span_id,
                 duration_ns,
             }),
-        )
+        ) {
+            inner.sticky_error.get_or_insert_with(|| error.to_string());
+            return Err(error);
+        }
+        Ok(())
     }
 
-    fn elapsed_ns(&self) -> u64 {
+    pub fn elapsed_ns(&self) -> u64 {
         self.inner
             .borrow()
             .probe_started
@@ -206,30 +290,13 @@ impl TraceSession {
             )?;
         }
 
-        if storage_bytes > 0 {
-            if let Some(output) = op.output {
-                self.record_memory_alloc(
-                    span_id,
-                    MemoryRecord {
-                        tensor_id: output,
-                        device: op.device,
-                        bytes: storage_bytes,
-                        dtype: op.dtype,
-                        category,
-                        timestamp_ns: Some(timestamp_ns),
-                        op_name: Some(op.op_name),
-                        shape: op.shape,
-                    },
-                )?;
-            }
-        }
+        let _ = category;
         Ok(())
     }
 
     /// Record tensor metadata and an allocation event.
     pub fn record_tensor(&self, span_id: SpanId, tensor: TensorRecord<'_>) -> Result<()> {
         let storage_bytes = resolve_storage_bytes(tensor.storage_bytes, tensor.shape, tensor.dtype);
-        let timestamp_ns = self.elapsed_ns();
         let mut inner = self.inner.borrow_mut();
         write_event(
             &mut inner.writer,
@@ -244,23 +311,6 @@ impl TraceSession {
                 category: tensor.category,
             }),
         )?;
-        drop(inner);
-
-        if storage_bytes > 0 {
-            self.record_memory_alloc(
-                span_id,
-                MemoryRecord {
-                    tensor_id: tensor.tensor_id,
-                    device: tensor.device,
-                    bytes: storage_bytes,
-                    dtype: tensor.dtype,
-                    category: tensor.category,
-                    timestamp_ns: Some(timestamp_ns),
-                    op_name: None,
-                    shape: tensor.shape,
-                },
-            )?;
-        }
         Ok(())
     }
 
@@ -346,27 +396,43 @@ impl TraceSession {
                 root: root.into(),
                 key: key.into(),
                 state,
-                step: Some(0),
                 norm,
             }),
         )
     }
 
     pub fn flush(&self) -> Result<()> {
-        self.inner
-            .borrow_mut()
-            .writer
-            .flush()
-            .context("flushing trace JSONL")
+        let mut inner = self.inner.borrow_mut();
+        if let Some(error) = &inner.sticky_error {
+            anyhow::bail!("trace session previously failed: {error}");
+        }
+        inner.writer.flush().context("flushing trace JSONL")
     }
 
-    /// Flush and return the trace path.
+    /// Close the owned root span, flush, and return the trace path.
     pub fn finish(self) -> Result<PathBuf> {
-        self.inner
-            .borrow_mut()
-            .writer
-            .flush()
-            .context("flushing trace JSONL")?;
+        let duration_ns = self.elapsed_ns();
+        {
+            let mut inner = self.inner.borrow_mut();
+            if let Some(error) = &inner.sticky_error {
+                anyhow::bail!("trace session previously failed: {error}");
+            }
+            anyhow::ensure!(
+                inner.span_stack.as_slice() == [1],
+                "cannot finish trace with {} nested spans still open",
+                inner.span_stack.len().saturating_sub(1)
+            );
+            inner.span_stack.pop();
+            inner.span_steps.pop();
+            write_event(
+                &mut inner.writer,
+                &TraceEvent::SpanEnd(SpanEndEvent {
+                    id: span_id_string(1),
+                    duration_ns,
+                }),
+            )?;
+            inner.writer.flush().context("flushing trace JSONL")?;
+        }
         Ok(self.path)
     }
 }
@@ -483,10 +549,11 @@ mod tests {
     #[test]
     fn nested_spans_emit_parent_hierarchy_and_durations() {
         let path = temp_trace("nested");
-        let session = TraceSession::open(&path, "model::forward", ExecutionPhase::Train).unwrap();
+        let session =
+            TraceSession::open(&path, ProfileRun::training("model::forward", 1, "cpu")).unwrap();
 
         let inner_id = {
-            let _outer = session.begin_span("Model::forward", SpanKind::Function);
+            let _outer = session.begin_measurement("Model::forward");
             std::thread::sleep(std::time::Duration::from_micros(50));
             let inner = session.begin_span("matmul", SpanKind::Op);
             std::thread::sleep(std::time::Duration::from_micros(50));
@@ -524,27 +591,33 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(starts.len(), 2);
-        assert_eq!(starts[0].name, "Model::forward");
+        assert_eq!(starts.len(), 3);
+        assert_eq!(starts[0].name, "model::forward");
         assert!(starts[0].parent_id.is_none());
-        assert_eq!(starts[1].name, "matmul");
+        assert_eq!(starts[1].name, "Model::forward");
         assert_eq!(starts[1].parent_id.as_deref(), Some("s1"));
+        assert_eq!(starts[2].name, "matmul");
+        assert_eq!(starts[2].parent_id.as_deref(), Some("s2"));
 
         let ends = span_end_durations(&path);
-        assert_eq!(ends.len(), 2);
+        assert_eq!(ends.len(), 3);
         assert!(ends[0].1 > 0);
 
         let doc = parse_trace(&path).unwrap();
         assert_eq!(doc.run.entrypoint, "model::forward");
         assert_eq!(doc.ops.len(), 1);
         assert_eq!(doc.ops[0].storage_bytes, Some(8 * 8 * 4));
-        assert!(!doc.memory.is_empty());
+        assert!(
+            doc.memory.is_empty(),
+            "op metadata must not fabricate tensor lifetime"
+        );
     }
 
     #[test]
     fn record_gradient_round_trips_through_trace_parser() {
         let path = temp_trace("gradient");
-        let session = TraceSession::open(&path, "train::loss", ExecutionPhase::Train).unwrap();
+        let session =
+            TraceSession::open(&path, ProfileRun::training("train::loss", 1, "cpu")).unwrap();
         session
             .record_gradient("vb", "encoder.weight", GradientState::Present, Some(0.42))
             .unwrap();

@@ -1,139 +1,65 @@
-# Runtime trace guide
+# Runtime evidence guide
 
-candle-graph is **trace-only**. There is no static Rust analysis. Follow this workflow to produce
-trustworthy execution graphs.
+## Select one representative invocation
 
-## When to trace
+Capture a configurable one-based update, defaulting to update 1. Record `capture_step`, warmup
+count, device, timing mode, batch/accumulation, precision, workload, and source revision so an agent
+can decide whether two runs are comparable. Instrumentation is inactive outside the selected run.
 
-| Moment | Overhead | What to emit |
-| --- | --- | --- |
-| **Training hot loop** | None | Nothing (optional: step-0 gradient audit only) |
-| **After training / CI smoke** | One extra forward+backward+optim pass | Full span + op + memory trace |
-| **Benchmark binary** | Acceptable | Timed ops + nested spans |
+On CUDA, synchronize before and after semantic phases and set `device_synchronized`; host-only
+durations must not be presented as completed GPU work.
 
-Never wrap every optimizer step in spans.
+## Required shape
 
-## Minimal probe
-
-```rust
-use candle_graph::{
-    ExecutionPhase, ExecutionStep, OpRecord, SpanKind, TraceSession,
-};
-use candle_graph::trace::schema::GradientState;
-
-fn profile_one_step() -> anyhow::Result<()> {
-    let session = TraceSession::open(
-        "profile.jsonl",
-        "my_crate::train::training_loss",
-        ExecutionPhase::Train,
-    )?;
-
-    {
-        let _loss = session.begin_span("training_loss", SpanKind::Function);
-        {
-            let _fwd = session.begin_step_span("forward", ExecutionStep::Forward, SpanKind::Function);
-            // forward pass + record_op per op
-        }
-        {
-            let _bwd = session.begin_step_span("backward", ExecutionStep::Backward, SpanKind::Function);
-            // backward pass
-        }
-        {
-            let _opt = session.begin_step_span("optimizer", ExecutionStep::Optimizer, SpanKind::Function);
-            // optimizer.step + zero_grad
-        }
-    }
-
-    session.record_gradient("vb", "encoder.weight", GradientState::Present, Some(0.42))?;
-    session.finish()?;
-    Ok(())
-}
-```
-
-## Candle helpers (`candle` feature)
-
-With `candle-graph = { features = ["candle"] }`:
+Every trace contains one session envelope and exactly one measured region. Training captures tag
+forward, backward, and optimizer spans with `ExecutionStep`. Use the same stable semantic labels in
+NVTX, for example `tofy.p2/update-000000000001/forward`.
 
 ```rust
-use candle_graph::candle::{inputs_storage_bytes, record_op, CandleOpCapture};
-use candle_graph::{ExecutionStep, TraceSession};
-
-let cap = CandleOpCapture::new(
-    "matmul",
-    vec![candle_graph::candle::tensor_id(&a), candle_graph::candle::tensor_id(&b)],
-    &y,
-    inputs_storage_bytes(&[&a, &b]),
-    duration_ns,
-    0,
-    Some(ExecutionStep::Forward),
-);
-record_op(&session, span.id, &cap)?;
-```
-
-This mirrors PyTorch `record_shapes=True` + `profile_memory=True` without pulling Candle into the default build.
-
-## Nested spans
-
-```rust
-let _model = session.begin_step_span("Model::forward", ExecutionStep::Forward, SpanKind::Function);
+let session = TraceSession::open(path, ProfileRun::training("train::update", 1, "cpu"))?;
 {
-    let matmul = session.begin_span("matmul", SpanKind::Op);
-    session.record_op(
-        matmul.id,
-        OpRecord {
-            op_name: "matmul",
-            inputs: &["x".into(), "w".into()],
-            output: Some("y"),
-            shape: &[32, 768],
-            dtype: "f32",
-            device: "cuda:0",
-            duration_ns: 1_200_000,
-            timestamp_ns: 0,
-            storage_bytes: None,
-            input_storage_bytes: 32 * 768 * 4 + 768 * 768 * 4,
-            category: None, // inferred from forward step
-        },
-    )?;
+    let _update = session.begin_measurement("workload/update-000000000001");
+    let _forward = session.begin_step_span(
+        "workload/update-000000000001/forward",
+        ExecutionStep::Forward,
+        SpanKind::Function,
+    );
+    // forward
 }
+session.finish()?;
 ```
 
-## Inspect the trace
+`SpanGuard::id()` attaches op or tensor metadata. Tensor/storage metadata does not imply allocation
+lifetime. Only explicit paired `record_memory_alloc`/`record_memory_free` events drive live and peak
+memory; `record_device_memory` supplies allocator/device checkpoints.
+
+With feature `candle`, `CandleCapture::from_tensor` and `candle::record_tensor` capture shape,
+dtype, device, storage footprint, and variable status without inventing frees.
+
+## Publish evidence
 
 ```bash
-cargo candle-graph summary profile.jsonl
-cargo candle-graph query profile.jsonl --kind slowest
-cargo candle-graph query profile.jsonl --kind heaviest
-cargo candle-graph query profile.jsonl --kind memory
-cargo candle-graph query profile.jsonl --kind efficiency
-cargo candle-graph view profile.jsonl --output model.html
+cargo candle-graph summary application.jsonl
+cargo candle-graph query application.jsonl --kind slowest
+cargo candle-graph report application.jsonl \
+  --baseline baseline.jsonl \
+  --nsight-dir nsight \
+  --json evidence.json \
+  --markdown EVIDENCE.md
+cargo candle-graph view application.jsonl \
+  --baseline baseline.jsonl \
+  --nsight-dir nsight \
+  --output viewer.html
 ```
 
-## Trace schema (`candle-graph/trace/5`)
+The packet declares structural trust, section coverage, known gaps, structured numeric facts,
+comparison compatibility, and per-report Nsight coverage/truncation. Absence of Nsight never
+invalidates application evidence.
 
-JSONL events (one JSON object per line):
+## Nsight normalization
 
-| Event | Purpose |
-| --- | --- |
-| `meta` | Schema, entrypoint, phase, timestamp |
-| `span_start` / `span_end` | Nested hierarchy + optional `step` (`forward`/`backward`/`optimizer`) |
-| `op` | Timed op with shape/dtype, output + input bytes |
-| `memory` | Explicit alloc/free (PyTorch memory timeline) |
-| `device_memory` | Device checkpoint (`used` / `free` / optional `reserved`) |
-| `tensor` | Tensor snapshot with category |
-| `gradient` | Parameter gradient fact |
-| `edge` | Call or data edge timing between spans |
+Retain `.nsys-rep`, then export supported reports with NVIDIA's `nsys stats --format csv`. Pass the
+directory to candle-graph. Exact semantic NVTX labels join projected GPU ranges to Candle phases;
+the packet explicitly states that Candle and Nsight clocks are not overlaid as one clock.
 
-Parse in Rust with `parse_trace(path)` or build a graph with the CLI `import` command.
-
-## Tofy integration
-
-Tofy should:
-
-1. Run one post-training probe with forward **and** backward in `TraceSession`.
-2. Use `begin_step_span` for forward/backward/optimizer slices.
-3. Write `profile.jsonl` next to checkpoints.
-4. Open `cargo candle-graph view profile.jsonl --output model.html` for human review.
-
-## Migration from v0.3
-
-v0.4 removed static Rust analysis and the old `static` / `runtime` Cargo features. Use trace files and the commands above instead.
+Do not parse exported SQLite: its schema is not the candle-graph interface.

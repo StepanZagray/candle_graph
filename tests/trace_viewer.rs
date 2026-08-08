@@ -1,23 +1,32 @@
-//! Trace HTML visualizer tests (`candle-graph/viewer/3`).
+//! Unified evidence visualizer tests (`candle-graph/viewer/4`).
 
+use candle_graph::evidence::{EvidencePacket, EVIDENCE_SCHEMA};
 use candle_graph::graph::{
     build_from_trace, ExecutionGraph, GradientRecord, GradientRecordState, GraphEdge,
     GraphEdgeKind, GraphNode, GraphNodeKind, GraphSummary, SlowSpan, SCHEMA,
 };
+use candle_graph::nsight::NsightEvidence;
+use candle_graph::trace::analyze_health;
 use candle_graph::trace::memory::MemorySummary;
 use candle_graph::trace::schema::{SpanKind, SpanRecord, TraceRunMeta, SCHEMA as TRACE_SCHEMA};
 use candle_graph::trace::TraceDocument;
 use candle_graph::viewer::trace_view::{project, TRACE_VIEWER_SCHEMA};
-use candle_graph::viewer::{embed_json, escape_for_script, render_trace_html};
+use candle_graph::viewer::{embed_json, escape_for_script, render_evidence_html};
 
 fn minimal_trace() -> TraceDocument {
     TraceDocument {
         schema: TRACE_SCHEMA.to_string(),
         run: TraceRunMeta {
             run_id: "run-1".into(),
+            correlation_id: "demo/update-1".into(),
             entrypoint: "demo::train::loss".into(),
-            phase: "train".into(),
+            phase: candle_graph::ExecutionPhase::Train,
             timestamp: "2026-08-04T18:00:00Z".into(),
+            capture_step: 1,
+            warmup_steps: 0,
+            device: "cpu".into(),
+            timing_mode: candle_graph::TimingMode::Host,
+            tags: Default::default(),
             candle_version: None,
         },
         spans: vec![
@@ -26,6 +35,8 @@ fn minimal_trace() -> TraceDocument {
                 parent_id: None,
                 name: "loss".into(),
                 kind: SpanKind::Function,
+                measured: true,
+                start_ns: 0,
                 closed: true,
                 duration_ns: 5_000_000,
                 step: None,
@@ -35,6 +46,8 @@ fn minimal_trace() -> TraceDocument {
                 parent_id: Some("root".into()),
                 name: "forward".into(),
                 kind: SpanKind::Function,
+                measured: false,
+                start_ns: 1_000_000,
                 closed: true,
                 duration_ns: 2_000_000,
                 step: None,
@@ -50,14 +63,29 @@ fn minimal_trace() -> TraceDocument {
 }
 
 fn minimal_graph() -> ExecutionGraph {
-    build_from_trace(&minimal_trace())
+    build_from_trace(&minimal_trace()).unwrap()
+}
+
+fn packet(graph: ExecutionGraph) -> EvidencePacket {
+    let trace = minimal_trace();
+    EvidencePacket {
+        schema: EVIDENCE_SCHEMA.into(),
+        provenance: trace.run.clone(),
+        health: analyze_health(&trace),
+        findings: vec!["forward dominates self time".into()],
+        facts: vec![],
+        gaps: vec!["GPU evidence is unavailable".into()],
+        graph,
+        gpu: NsightEvidence::unavailable("not captured"),
+        comparison: None,
+    }
 }
 
 #[test]
 fn project_trace_viewer_schema() {
-    let payload = project(&minimal_graph());
+    let payload = project(&packet(minimal_graph()));
     assert_eq!(payload["schema"], TRACE_VIEWER_SCHEMA);
-    assert_eq!(payload["default_view"], "trace");
+    assert_eq!(payload["default_view"], "evidence");
     assert_eq!(payload["summary"]["entrypoint"], "demo::train::loss");
     assert!(payload["summary"]["total_ms"].as_f64().unwrap() > 0.0);
     assert!(payload["views"]["memory"].is_object());
@@ -65,7 +93,7 @@ fn project_trace_viewer_schema() {
 
 #[test]
 fn trace_edges_carry_ms_labels() {
-    let payload = project(&minimal_graph());
+    let payload = project(&packet(minimal_graph()));
     let edges = payload["views"]["trace"]["edges"].as_array().unwrap();
     assert!(!edges.is_empty());
     for edge in edges {
@@ -79,10 +107,12 @@ fn trace_edges_carry_ms_labels() {
 }
 
 #[test]
-fn render_trace_html_is_standalone() {
-    let html = render_trace_html(&minimal_graph());
+fn render_evidence_html_is_standalone() {
+    let html = render_evidence_html(&packet(minimal_graph()));
     assert!(html.starts_with("<!DOCTYPE html>"));
-    assert!(html.contains("data-viewer=\"candle-graph-trace\""));
+    assert!(html.contains("data-viewer=\"candle-graph-evidence\""));
+    assert!(html.contains("view-panel-evidence"));
+    assert!(html.contains("view-panel-gpu"));
     assert!(html.contains("span-tree"));
     assert!(html.contains("peak-breakdown"));
     assert!(html.contains("heat-mode"));
@@ -106,12 +136,13 @@ fn escape_for_script_handles_unicode_separators() {
 #[test]
 fn manual_fixture_has_span_tree() {
     let graph = ExecutionGraph {
-        schema: SCHEMA,
+        schema: SCHEMA.into(),
         spans: vec![GraphNode {
             id: "a".into(),
             parent_id: None,
             name: "root".into(),
             kind: GraphNodeKind::Root,
+            start_ns: 0,
             self_time_ns: 500_000,
             total_time_ns: 2_000_000,
             shape: None,
@@ -129,6 +160,7 @@ fn manual_fixture_has_span_tree() {
             duration_ns: 100_000,
             label: None,
         }],
+        tensors: vec![],
         gradients: vec![GradientRecord {
             root: "vb".into(),
             key: "w".into(),
@@ -153,7 +185,7 @@ fn manual_fixture_has_span_tree() {
             by_device: vec![],
         },
     };
-    let payload = project(&graph);
+    let payload = project(&packet(graph));
     assert_eq!(
         payload["views"]["trace"]["nodes"].as_array().unwrap().len(),
         1

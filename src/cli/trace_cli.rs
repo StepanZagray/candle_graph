@@ -1,9 +1,10 @@
-//! Trace-file CLI engine (`import`, `view`, `summary`, `query`).
+//! Evidence CLI engine (`import`, `view`, `summary`, `query`, `compare`, `report`).
 
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use crate::graph::{build_from_trace, ExecutionGraph, GraphNode};
+use crate::evidence::{build_evidence, compare_documents, EvidencePacket};
+use crate::graph::{ExecutionGraph, GraphNode};
 use crate::trace::parse_trace;
 
 /// Bounded query kinds for trace-derived execution graphs.
@@ -14,51 +15,94 @@ pub enum TraceQueryKind {
     Memory,
     Efficiency,
     Spans,
+    Tensors,
     Gradients,
 }
 
-/// Parse a JSONL trace and build an [`ExecutionGraph`].
-pub fn load_graph(trace_path: &Path) -> Result<ExecutionGraph> {
-    let doc =
-        parse_trace(trace_path).with_context(|| format!("parse trace {}", trace_path.display()))?;
-    Ok(build_from_trace(&doc))
+/// Parse a trace and build its bounded application evidence.
+pub fn load_evidence(trace_path: &Path) -> Result<EvidencePacket> {
+    build_evidence(trace_path, None, None)
 }
 
-/// `import` — emit full execution graph JSON.
+/// `import` — emit the full evidence packet JSON.
 pub fn run_import(trace_path: &Path, output: Option<&Path>) -> Result<()> {
-    let graph = load_graph(trace_path)?;
-    let rendered = serde_json::to_string_pretty(&graph)? + "\n";
+    let evidence = load_evidence(trace_path)?;
+    let rendered = serde_json::to_string_pretty(&evidence)? + "\n";
     super::write_output(output, rendered.as_bytes())
 }
 
-/// `summary` — emit graph summary JSON.
+/// `summary` — emit provenance, health, gaps, and graph summary JSON.
 pub fn run_summary(trace_path: &Path, output: Option<&Path>) -> Result<()> {
-    let graph = load_graph(trace_path)?;
-    let rendered = serde_json::to_string_pretty(&graph.summary)? + "\n";
+    let evidence = load_evidence(trace_path)?;
+    let rendered = serde_json::to_string_pretty(&serde_json::json!({
+        "schema": "candle-graph/summary/1",
+        "provenance": evidence.provenance,
+        "health": evidence.health,
+        "findings": evidence.findings,
+        "gaps": evidence.gaps,
+        "summary": evidence.graph.summary,
+    }))? + "\n";
     super::write_output(output, rendered.as_bytes())
 }
 
 /// `query` — emit a bounded slice of graph facts.
 pub fn run_query(trace_path: &Path, kind: TraceQueryKind, output: Option<&Path>) -> Result<()> {
-    let graph = load_graph(trace_path)?;
+    let evidence = load_evidence(trace_path)?;
+    let graph = &evidence.graph;
     let payload = match kind {
-        TraceQueryKind::Slowest => query_slowest(&graph),
-        TraceQueryKind::Heaviest => query_heaviest(&graph),
-        TraceQueryKind::Memory => query_memory(&graph),
-        TraceQueryKind::Efficiency => query_efficiency(&graph),
-        TraceQueryKind::Spans => query_spans(&graph),
-        TraceQueryKind::Gradients => query_gradients(&graph),
+        TraceQueryKind::Slowest => query_slowest(graph),
+        TraceQueryKind::Heaviest => query_heaviest(graph),
+        TraceQueryKind::Memory => query_memory(graph),
+        TraceQueryKind::Efficiency => query_efficiency(graph),
+        TraceQueryKind::Spans => query_spans(graph),
+        TraceQueryKind::Tensors => query_tensors(graph),
+        TraceQueryKind::Gradients => query_gradients(graph),
     };
+    let payload = serde_json::json!({
+        "health": evidence.health,
+        "gaps": evidence.gaps,
+        "result": payload,
+    });
     let rendered = serde_json::to_string_pretty(&payload)? + "\n";
     super::write_output(output, rendered.as_bytes())
 }
 
 /// `view` — render standalone HTML from a trace (requires `visualizer` feature).
 #[cfg(feature = "visualizer")]
-pub fn run_view(trace_path: &Path, output: &Path) -> Result<()> {
-    let graph = load_graph(trace_path)?;
-    let html = crate::viewer::render_trace_html(&graph);
+pub fn run_view(
+    trace_path: &Path,
+    output: &Path,
+    baseline: Option<&Path>,
+    nsight_dir: Option<&Path>,
+) -> Result<()> {
+    let evidence = build_evidence(trace_path, baseline, nsight_dir)?;
+    let html = crate::viewer::render_evidence_html(&evidence);
     super::write_output(Some(output), html.as_bytes())
+}
+
+/// `compare` — aggregate repeated semantic spans and compare candidate to baseline.
+pub fn run_compare(baseline: &Path, candidate: &Path, output: Option<&Path>) -> Result<()> {
+    let baseline_doc =
+        parse_trace(baseline).with_context(|| format!("parse baseline {}", baseline.display()))?;
+    let candidate_doc = parse_trace(candidate)
+        .with_context(|| format!("parse candidate {}", candidate.display()))?;
+    let comparison = compare_documents(&baseline_doc, &candidate_doc);
+    let rendered = serde_json::to_string_pretty(&comparison)? + "\n";
+    super::write_output(output, rendered.as_bytes())
+}
+
+/// `report` — publish durable JSON and concise Markdown from one profile run.
+pub fn run_report(
+    trace: &Path,
+    baseline: Option<&Path>,
+    nsight_dir: Option<&Path>,
+    json_output: &Path,
+    markdown_output: &Path,
+) -> Result<()> {
+    let evidence = build_evidence(trace, baseline, nsight_dir)?;
+    let json = serde_json::to_string_pretty(&evidence)? + "\n";
+    super::write_output(Some(json_output), json.as_bytes())?;
+    super::write_output(Some(markdown_output), evidence.markdown().as_bytes())
 }
 
 fn query_slowest(graph: &ExecutionGraph) -> serde_json::Value {
@@ -163,5 +207,14 @@ fn query_gradients(graph: &ExecutionGraph) -> serde_json::Value {
         "kind": "gradients",
         "entrypoint": graph.summary.entrypoint,
         "gradients": graph.gradients,
+    })
+}
+
+fn query_tensors(graph: &ExecutionGraph) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "candle-graph/trace-query/1",
+        "kind": "tensors",
+        "entrypoint": graph.summary.entrypoint,
+        "tensors": graph.tensors,
     })
 }

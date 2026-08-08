@@ -2,86 +2,68 @@
 
 ## Goal
 
-Help people and agents understand **what a Candle model actually did** in one concrete run — span
-hierarchy, op timings, tensor metadata, and gradient facts — without reading all the Rust and
-without pretending static source analysis can reconstruct tensor flow.
+Help people and building agents understand what a Candle model actually did in one representative
+run without pretending static source inspection can reconstruct tensor execution.
 
-This is the same contract as **TensorFlow Profiler**: the graph is built from **execution evidence**,
-not from parsing arbitrary Rust.
+## Language
 
-## Trace-only model
+**Profile run**: one selected model update or inference invocation, with enough provenance and
+timing semantics to judge representativeness.
 
-```
-┌─────────────────────────────────────┐
-│  Probe binary (post-run / smoke)    │
-│  TraceSession + SpanGuard           │
-│  one forward / loss / eval pass     │
-└──────────────────┬──────────────────┘
-                   │  profile.jsonl (candle-graph/trace/5)
-                   ▼
-┌─────────────────────────────────────┐
-│  build_from_trace → ExecutionGraph  │
-│  self_time = total − children       │
-└──────────────────┬──────────────────┘
-                   │
-         ┌─────────┴─────────┐
-         ▼                   ▼
-   CLI (summary/query)   model.html (viewer/2)
-```
+**Measured region**: the caller-controlled part of a profile run used for totals and comparisons;
+session setup and evidence publication are outside it.
 
-| Question | Answer from |
-| --- | --- |
-| Which functions ran and for how long? | **Trace spans** |
-| Which ops were slow on this batch shape? | **Trace ops + self-time** |
-| Which ops/spans used the most memory? | **Trace memory events + bytes rollup** |
-| Peak live tensors at OOM timestamp? | **Memory timeline + peak breakdown** |
-| How long did each call/data edge take? | **Trace edges (ms labels in viewer)** |
-| Did trainable params get gradients? | **Trace gradient events** |
-| Module/parameter inventory from source alone? | **Out of scope** — use checkpoint tools or your trainer |
+**GPU evidence**: optional normalized Nsight kernel, runtime, transfer, timeline, and projected NVTX
+facts. Its absence never invalidates application evidence.
 
-## Profiler UX targets
+**Evidence packet**: the single deep interface for agents, reports, comparisons, and the HTML
+viewer: provenance, structural health, coverage, structured facts, explicit gaps, graph, optional
+baseline, and optional GPU evidence.
 
-1. **Zero hot-loop overhead** — never wrap every training step; run the probe once after training or in CI smoke.
-2. **Nested spans** — `Function` → `Module` → `Op` hierarchy like TF profiler.
-3. **Self vs total time** — hot nodes highlight actual work, not time spent in children.
-4. **Milliseconds on edges** — every call/data edge in HTML shows wall time.
-5. **Bounded queries** — `slowest`, `heaviest`, `memory`, `spans`, `gradients` for agents without loading full graph JSON.
+## Evidence flow
 
-## Primary workflows
-
-### Model authors (emit trace)
-
-```rust
-use candle_graph::{ExecutionPhase, SpanKind, TraceSession};
+```text
+representative update
+  ├─ TraceSession envelope
+  ├─ one measured semantic region
+  └─ matching NVTX labels (optional)
+            │
+            ▼
+ application.jsonl (trace/6) ── validate ── graph/3
+            │                                │
+ official nsys stats CSV ── normalize ───────┤
+            │                                ▼
+            └──────────────────── evidence/1 packet
+                                      ├─ bounded JSON / Markdown for agents
+                                      └─ viewer/4 HTML for humans
 ```
 
-See [`docs/runtime-analysis-guide.md`](docs/runtime-analysis-guide.md).
+Analysis never proceeds through an invalid hierarchy. Optional evidence is represented by coverage
+and reasons, never silent empty arrays. Tensor footprint and observed memory lifetime are distinct.
 
-### Humans (HTML)
+## Product targets
 
-```bash
-cargo candle-graph view profile.jsonl --output model.html
-```
-
-### Agents / CI (JSON)
-
-```bash
-cargo candle-graph summary profile.jsonl
-cargo candle-graph query profile.jsonl --kind slowest
-cargo candle-graph query profile.jsonl --kind heaviest
-cargo candle-graph query profile.jsonl --kind memory
-cargo candle-graph query profile.jsonl --kind efficiency
-```
-
-## Related repos
-
-- **Tofy** — sibling consumer; should emit `profile.jsonl` from a post-run probe and open with `cargo candle-graph view`.
+1. Zero overhead outside one selected invocation.
+2. One caller-owned measured region with forward/backward/optimizer semantics.
+3. Required provenance and typed timing mode before comparisons.
+4. Structural trust before graph construction or findings.
+5. Bounded agent queries and durable JSON/Markdown evidence.
+6. Baseline deltas by semantic path, memory, and gradient facts.
+7. One accessible offline UI for application and optional GPU evidence.
+8. Stable normalization from official Nsight CSV, retaining raw `.nsys-rep`.
 
 ## Schemas
 
 | Schema | Role |
 | --- | --- |
-| `candle-graph/trace/5` | JSONL execution trace (spans, ops, memory events) |
-| `candle-graph/graph/2` | Derived execution graph + memory profile |
-| `candle-graph/viewer/3` | HTML visualizer payload |
-| `candle-graph/trace-query/1` | Bounded query responses |
+| `candle-graph/trace/6` | Execution evidence stream |
+| `candle-graph/graph/3` | Validated semantic graph |
+| `candle-graph/evidence/1` | Unified agent/human packet |
+| `candle-graph/comparison/1` | Explicit baseline comparison |
+| `candle-graph/viewer/4` | Embedded offline UI payload |
+
+## Related project
+
+Tofy is the primary consumer. It captures update 1 by default, publishes an atomic per-update
+bundle, emits the same semantic labels to candle-graph and NVTX, and exposes the packet to repair
+agents and humans.

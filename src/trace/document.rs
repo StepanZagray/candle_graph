@@ -1,4 +1,4 @@
-//! Aggregate trace document and JSONL I/O for `candle-graph/trace/5`.
+//! Aggregate trace document and JSONL I/O for `candle-graph/trace/6`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -57,6 +57,9 @@ impl TraceDocument {
                     schema: s,
                     run: meta,
                 } => {
+                    if index != 0 {
+                        bail!("meta event must be the first non-empty trace record, found at index {index}");
+                    }
                     if schema.is_some() || run.is_some() {
                         bail!(
                             "duplicate meta event at index {index}; only one meta record is allowed"
@@ -74,6 +77,9 @@ impl TraceDocument {
                 TraceEvent::SpanEnd(SpanEndEvent { id, duration_ns }) => {
                     if !span_starts.contains_key(&id) {
                         bail!("span_end for unknown span `{id}` at index {index}");
+                    }
+                    if span_closed.contains(&id) {
+                        bail!("duplicate span_end for `{id}` at index {index}");
                     }
                     span_closed.insert(id.clone());
                     span_durations.insert(id, duration_ns);
@@ -115,6 +121,8 @@ impl TraceDocument {
                 parent_id: start.parent_id,
                 name: start.name,
                 kind: start.kind,
+                measured: start.measured,
+                start_ns: start.start_ns,
                 closed: span_closed.contains(&id),
                 duration_ns: span_durations.get(&id).copied().unwrap_or(0),
                 step: start.step,
@@ -138,7 +146,12 @@ impl TraceDocument {
     /// Profiler summary: op count, total wall time, span tree shape, memory totals.
     pub fn build_summary(&self) -> TraceSummary {
         let op_count = self.ops.len();
-        let total_ns = self.ops.iter().map(|op| op.duration_ns).sum();
+        let total_ns = self
+            .spans
+            .iter()
+            .filter(|span| span.measured)
+            .map(|span| span.duration_ns)
+            .sum();
         let span_count = self.spans.len();
         let root_span_count = self
             .spans
@@ -212,6 +225,8 @@ impl TraceDocument {
                 parent_id: span.parent_id.clone(),
                 name: span.name.clone(),
                 kind: span.kind,
+                measured: span.measured,
+                start_ns: span.start_ns,
                 step: span.step,
             }));
             if span.closed {
@@ -299,9 +314,15 @@ mod tests {
     fn sample_meta() -> TraceRunMeta {
         TraceRunMeta {
             run_id: "run-1".into(),
+            correlation_id: "demo/update-1".into(),
             entrypoint: "demo::train::loss".into(),
-            phase: "train".into(),
+            phase: crate::phase::ExecutionPhase::Train,
             timestamp: "2026-08-04T18:00:00Z".into(),
+            capture_step: 1,
+            warmup_steps: 0,
+            device: "cpu".into(),
+            timing_mode: crate::trace::TimingMode::Host,
+            tags: Default::default(),
             candle_version: Some("0.8.0".into()),
         }
     }
@@ -313,14 +334,18 @@ mod tests {
                 id: "span-root".into(),
                 parent_id: None,
                 name: "demo::train::loss".into(),
+                start_ns: 0,
                 kind: SpanKind::Function,
+                measured: true,
                 step: None,
             }),
             TraceEvent::SpanStart(SpanStartEvent {
                 id: "span-op".into(),
                 parent_id: Some("span-root".into()),
                 name: "matmul".into(),
+                start_ns: 10,
                 kind: SpanKind::Op,
+                measured: false,
                 step: None,
             }),
             TraceEvent::Op(OpEvent {
@@ -358,16 +383,15 @@ mod tests {
                 root: "vb".into(),
                 key: "encoder.weight".into(),
                 state: GradientState::Present,
-                step: Some(0),
                 norm: Some(0.42),
             }),
             TraceEvent::SpanEnd(SpanEndEvent {
                 id: "span-op".into(),
-                duration_ns: 0,
+                duration_ns: 1_200,
             }),
             TraceEvent::SpanEnd(SpanEndEvent {
                 id: "span-root".into(),
-                duration_ns: 0,
+                duration_ns: 2_000,
             }),
         ]
     }
@@ -388,7 +412,7 @@ mod tests {
 
         let summary = doc.build_summary();
         assert_eq!(summary.op_count, 1);
-        assert_eq!(summary.total_ns, 1200);
+        assert_eq!(summary.total_ns, 2_000);
         assert_eq!(summary.span_count, 2);
         assert_eq!(summary.root_span_count, 1);
         assert_eq!(summary.max_depth, 1);
@@ -399,7 +423,7 @@ mod tests {
     #[test]
     fn jsonl_roundtrip_via_temp_file() {
         let dir = std::env::temp_dir().join(format!(
-            "candle-graph-trace5-{}-{}",
+            "candle-graph-trace6-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -418,19 +442,15 @@ mod tests {
     }
 
     #[test]
-    fn gradient_accepts_param_key_alias() {
+    fn gradient_rejects_removed_param_key_alias() {
         let line = r#"{"kind":"gradient","event_id":"g1","root":"vb","param_key":"w","state":"present","norm":1.0}"#;
-        let event: TraceEvent = serde_json::from_str(line).unwrap();
-        let TraceEvent::Gradient(g) = event else {
-            panic!("expected gradient event");
-        };
-        assert_eq!(g.key, "w");
+        assert!(serde_json::from_str::<TraceEvent>(line).is_err());
     }
 
     #[test]
     fn rejects_unknown_schema() {
         let events = vec![TraceEvent::Meta {
-            schema: "candle-graph/trace/4".into(),
+            schema: "not-candle-graph".into(),
             run: sample_meta(),
         }];
         let err = TraceDocument::from_events(events).unwrap_err();
