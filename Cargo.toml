@@ -10,7 +10,18 @@ keywords = ["candle", "machine-learning", "profiler", "deep-learning"]
 categories = ["development-tools", "science"]
 repository = "https://github.com/StepanZagray/candle_graph"
 documentation = "https://docs.rs/candle-graph"
-exclude = ["/target/**", "/.git/**"]
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE-MIT",
+    "/CONTEXT.md",
+    "/docs/features.md",
+    "/docs/runtime-analysis-guide.md",
+    "/docs/visualizer.md",
+    "/src/**",
+    "/tests/**",
+]
 
 [features]
 default = ["visualizer"]

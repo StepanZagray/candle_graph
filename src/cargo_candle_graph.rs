@@ -1,7 +1,7 @@
 //! Cargo subcommand entrypoint: `cargo candle-graph …`.
 //!
 //! Installed as `cargo-candle-graph` so Cargo discovers it as `cargo candle-graph`.
-//! Trace-only commands: import JSONL traces into execution graphs, summarize, query, and view.
+//! Trace-only commands: import, summarize, query, compare, report, and view execution evidence.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};

@@ -32,15 +32,16 @@ Single-context layout: `CONTEXT.md` at the repo root and ADRs under `docs/adr/`.
 
 | Feature | Use |
 | --- | --- |
-| `visualizer` (default) | `model.html` trace viewer |
-| `all` | Same as default today |
+| `visualizer` (default) | Standalone `viewer.html` evidence viewer |
+| `candle` | Candle tensor and storage capture helpers |
+| `all` | `visualizer` plus `candle` |
 
 Details: [`docs/features.md`](docs/features.md), [`docs/runtime-analysis-guide.md`](docs/runtime-analysis-guide.md).
 Prefer bounded CLI queries (`summary`, `query --kind …`) over loading full graph JSON.
 
 ### UI / UX (HTML visualizer)
 
-Standalone HTML visualizer (`src/viewer/`, emitted as `model.html`). Stack: embedded CSS + vanilla JavaScript + dagre — not React. Read [`docs/visualizer.md`](docs/visualizer.md) before changing layout, tabs, or graph views.
+Standalone HTML visualizer (`src/viewer/`, normally emitted as `viewer.html`). Stack: embedded CSS + vanilla JavaScript + dagre — not React. Read [`docs/visualizer.md`](docs/visualizer.md) before changing layout, tabs, or graph views.
 
 | Skill | When to use |
 |-------|-------------|
@@ -59,10 +60,12 @@ Prefer improving the existing visualizer over introducing a frontend framework.
 
 | Module | Role |
 | --- | --- |
-| `trace/` | Parse/emit `candle-graph/trace/4` JSONL |
+| `trace/` | Parse/emit `candle-graph/trace/6` JSONL |
 | `instrument/` | `TraceSession`, `SpanGuard`, probe API |
 | `graph/` | `ExecutionGraph` from trace events |
-| `cli/trace_cli.rs` | `import`, `view`, `summary`, `query` |
-| `viewer/` | `render_trace_html` (`candle-graph/viewer/2`) |
+| `evidence.rs` | Unified evidence and baseline comparison packets |
+| `nsight.rs` | Normalize supported official Nsight CSV reports |
+| `cli/trace_cli.rs` | `import`, `view`, `summary`, `query`, `compare`, `report` |
+| `viewer/` | `render_evidence_html` (`candle-graph/viewer/4`) |
 
 There is no static Rust analysis layer in this crate.
