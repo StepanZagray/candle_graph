@@ -336,6 +336,7 @@ mod tests {
                 capture_step: 1,
                 warmup_steps: 0,
                 device: "cpu".into(),
+                measured_region_device_synchronized: false,
                 timing_mode: TimingMode::Host,
                 tags: Default::default(),
                 candle_version: None,

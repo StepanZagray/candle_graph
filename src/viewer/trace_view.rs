@@ -326,6 +326,7 @@ mod tests {
                 capture_step: 1,
                 warmup_steps: 0,
                 device: "cpu".into(),
+                measured_region_device_synchronized: false,
                 timing_mode: crate::trace::TimingMode::Host,
                 tags: BTreeMap::new(),
                 candle_version: None,

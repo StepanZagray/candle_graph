@@ -1,6 +1,6 @@
 [package]
 name = "candle-graph"
-version = "0.5.0"
+version = "0.7.0"
 edition = "2021"
 description = "TensorFlow Profiler-style execution graphs for candle-rs (trace-only)"
 readme = "README.md"

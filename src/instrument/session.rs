@@ -37,6 +37,7 @@ pub struct ProfileRun {
     pub capture_step: u64,
     pub warmup_steps: u64,
     pub device: String,
+    pub measured_region_device_synchronized: bool,
     pub timing_mode: TimingMode,
     pub tags: BTreeMap<String, String>,
 }
@@ -55,6 +56,7 @@ impl ProfileRun {
             capture_step,
             warmup_steps: capture_step.saturating_sub(1),
             device: device.into(),
+            measured_region_device_synchronized: false,
             timing_mode: TimingMode::Host,
             tags: BTreeMap::new(),
         }
@@ -72,6 +74,14 @@ impl ProfileRun {
 
     pub fn device_synchronized(mut self) -> Self {
         self.timing_mode = TimingMode::DeviceSynchronized;
+        self.measured_region_device_synchronized = true;
+        self
+    }
+
+    /// Mark only the caller-controlled measured region as device-synchronized.
+    /// Nested semantic spans remain host-timed.
+    pub fn measured_region_device_synchronized(mut self) -> Self {
+        self.measured_region_device_synchronized = true;
         self
     }
 }
@@ -116,6 +126,7 @@ impl TraceSession {
             capture_step: run.capture_step,
             warmup_steps: run.warmup_steps,
             device: run.device,
+            measured_region_device_synchronized: run.measured_region_device_synchronized,
             timing_mode: run.timing_mode,
             tags: run.tags,
             candle_version: None,
@@ -611,6 +622,15 @@ mod tests {
             doc.memory.is_empty(),
             "op metadata must not fabricate tensor lifetime"
         );
+    }
+
+    #[test]
+    fn measured_region_sync_does_not_overstate_nested_span_timing() {
+        let run = ProfileRun::training("train::update", 2, "cuda:0")
+            .measured_region_device_synchronized();
+
+        assert!(run.measured_region_device_synchronized);
+        assert_eq!(run.timing_mode, TimingMode::Host);
     }
 
     #[test]

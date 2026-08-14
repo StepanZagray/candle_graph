@@ -198,12 +198,14 @@ impl EvidencePacket {
             "UNTRUSTED"
         };
         let mut out = format!(
-            "# candle-graph evidence\n\n- Status: **{trust}**\n- Entrypoint: `{}`\n- Capture update: {} ({} warmup update{})\n- Device: `{}`\n- Total: {:.2} ms\n\n## Findings\n\n",
+            "# candle-graph evidence\n\n- Status: **{trust}**\n- Entrypoint: `{}`\n- Capture update: {} ({} warmup update{})\n- Device: `{}`\n- Timing mode: `{:?}`\n- Measured region device-synchronized: {}\n- Total: {:.2} ms\n\n## Findings\n\n",
             self.provenance.entrypoint,
             self.provenance.capture_step,
             self.provenance.warmup_steps,
             if self.provenance.warmup_steps == 1 { "" } else { "s" },
             self.provenance.device,
+            self.provenance.timing_mode,
+            self.provenance.measured_region_device_synchronized,
             self.graph.summary.total_ms,
         );
         push_list(
@@ -290,6 +292,12 @@ pub fn compare_documents(baseline: &TraceDocument, candidate: &TraceDocument) ->
     if baseline.run.timing_mode != candidate.run.timing_mode {
         comparable = false;
         warnings.push("timing mode differs".into());
+    }
+    if baseline.run.measured_region_device_synchronized
+        != candidate.run.measured_region_device_synchronized
+    {
+        comparable = false;
+        warnings.push("measured-region device synchronization differs".into());
     }
     if baseline.run.warmup_steps != candidate.run.warmup_steps {
         comparable = false;
@@ -528,6 +536,7 @@ mod tests {
                 capture_step: 1,
                 warmup_steps: 0,
                 device: "cpu".into(),
+                measured_region_device_synchronized: false,
                 timing_mode: TimingMode::Host,
                 tags: [("physical_batch".into(), "2".into())].into(),
                 candle_version: None,
@@ -607,6 +616,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_different_measured_region_synchronization_contracts() {
+        let baseline = document("base", 100, 60);
+        let mut candidate = document("candidate", 80, 40);
+        candidate.run.measured_region_device_synchronized = true;
+
+        let comparison = compare_documents(&baseline, &candidate);
+
+        assert!(!comparison.comparable);
+        assert!(comparison
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("measured-region device synchronization differs")));
+    }
+
+    #[test]
     fn packet_markdown_exposes_trust_gaps_and_coverage() {
         let packet = EvidencePacket::from_document(
             document("candidate", 80, 40),
@@ -616,6 +640,7 @@ mod tests {
         .unwrap();
         let markdown = packet.markdown();
         assert!(markdown.contains("Status: **TRUSTED**"));
+        assert!(markdown.contains("Measured region device-synchronized: false"));
         assert!(markdown.contains("nsys not installed"));
         assert!(markdown.contains("optimizer_spans"));
         assert!(!packet.facts.is_empty());

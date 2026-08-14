@@ -25,7 +25,7 @@ Missing optional evidence is reported as a gap rather than appearing as an empty
 use candle_graph::{ExecutionStep, ProfileRun, SpanKind, TraceSession};
 
 let run = ProfileRun::training("my_crate::train::update", 1, "cuda:0")
-    .device_synchronized()
+    .measured_region_device_synchronized()
     .tag("physical_batch", "128")
     .tag("precision", "f32");
 let session = TraceSession::open("application.jsonl", run)?;

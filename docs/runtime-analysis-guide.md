@@ -6,8 +6,11 @@ Capture a configurable one-based update, defaulting to update 1. Record `capture
 count, device, timing mode, batch/accumulation, precision, workload, and source revision so an agent
 can decide whether two runs are comparable. Instrumentation is inactive outside the selected run.
 
-On CUDA, synchronize before and after semantic phases and set `device_synchronized`; host-only
-durations must not be presented as completed GPU work.
+On CUDA, use `device_synchronized` only when every reported semantic span is bounded by device
+synchronization. If only the single measured region is synchronized, use
+`measured_region_device_synchronized`; `timing_mode` then remains `host`, so nested host spans are
+not presented as completed GPU work. Nsight or another device profiler is still required for
+kernel-level attribution.
 
 ## Required shape
 

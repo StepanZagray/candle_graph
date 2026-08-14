@@ -30,6 +30,10 @@ pub struct TraceRunMeta {
     pub warmup_steps: u64,
     /// Device requested by the caller (`cpu`, `cuda:0`, ...).
     pub device: String,
+    /// Whether the single measured region is bounded by device synchronizations.
+    /// Nested span durations remain governed by `timing_mode`.
+    #[serde(default)]
+    pub measured_region_device_synchronized: bool,
     pub timing_mode: TimingMode,
     /// Workload-specific provenance such as lesson, batch size, and source revision.
     pub tags: BTreeMap<String, String>,

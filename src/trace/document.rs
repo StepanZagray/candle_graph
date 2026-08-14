@@ -321,6 +321,7 @@ mod tests {
             capture_step: 1,
             warmup_steps: 0,
             device: "cpu".into(),
+            measured_region_device_synchronized: false,
             timing_mode: crate::trace::TimingMode::Host,
             tags: Default::default(),
             candle_version: Some("0.8.0".into()),
