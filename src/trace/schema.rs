@@ -8,8 +8,25 @@ use crate::phase::ExecutionStep;
 
 use serde::{Deserialize, Serialize};
 
+use crate::capability::CaptureContract;
+
 /// Schema identifier written into every trace document and expected on parse.
-pub const SCHEMA: &str = "candle-graph/trace/6";
+pub const SCHEMA: &str = "candle-graph/trace/7";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonIdentity {
+    pub workload_id: String,
+    pub model_id: String,
+    pub config_id: String,
+    pub data_id: String,
+    pub seed_policy: String,
+    pub physical_batch: u64,
+    pub accumulation_steps: u64,
+    pub precision: String,
+    pub device_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_id: Option<String>,
+}
 
 /// Run metadata carried in the first JSONL `meta` event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +52,9 @@ pub struct TraceRunMeta {
     #[serde(default)]
     pub measured_region_device_synchronized: bool,
     pub timing_mode: TimingMode,
+    pub capture_contract: CaptureContract,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison_identity: Option<ComparisonIdentity>,
     /// Workload-specific provenance such as lesson, batch size, and source revision.
     pub tags: BTreeMap<String, String>,
     /// Optional candle crate version observed at probe time.
@@ -47,6 +67,13 @@ pub struct TraceRunMeta {
 pub enum TimingMode {
     Host,
     DeviceSynchronized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOutcome {
+    Complete,
+    Failed,
 }
 
 /// Span classification — mirrors profiler function / op / module hierarchy.
@@ -99,7 +126,7 @@ pub struct TraceSummary {
     pub max_depth: usize,
     pub alloc_count: usize,
     pub free_count: usize,
-    pub peak_bytes: u64,
+    pub logical_peak_bytes: Option<u64>,
 }
 
 /// Resolved span node assembled from `span_start` / `span_end` events.

@@ -1,4 +1,4 @@
-//! Aggregate trace document and JSONL I/O for `candle-graph/trace/6`.
+//! Aggregate trace document and JSONL I/O for `candle-graph/trace/7`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -9,11 +9,11 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::events::{
-    DeviceMemoryEvent, EdgeEvent, GradientEvent, MemoryEvent, OpEvent, SpanEndEvent,
-    SpanStartEvent, TensorEvent, TraceEvent,
+    DeviceIntervalEvent, DeviceMemoryEvent, EdgeEvent, GradientEvent, MemoryEvent, OpEvent,
+    SpanEndEvent, SpanStartEvent, TensorEvent, TerminalEvent, TraceEvent,
 };
-use super::memory::{resolve_storage_bytes, MemoryAction};
-use super::schema::{SpanRecord, TraceRunMeta, TraceSummary, SCHEMA};
+use super::memory::{resolve_dense_tensor_bytes, MemoryAction};
+use super::schema::{RunOutcome, SpanRecord, TraceRunMeta, TraceSummary, SCHEMA};
 
 /// Full trace document assembled from JSONL events.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -31,9 +31,12 @@ pub struct TraceDocument {
     #[serde(default)]
     pub device_memory: Vec<DeviceMemoryEvent>,
     #[serde(default)]
+    pub device_intervals: Vec<DeviceIntervalEvent>,
+    #[serde(default)]
     pub gradients: Vec<GradientEvent>,
     #[serde(default)]
     pub edges: Vec<EdgeEvent>,
+    pub terminal: TerminalEvent,
 }
 
 impl TraceDocument {
@@ -48,10 +51,15 @@ impl TraceDocument {
         let mut tensors = Vec::new();
         let mut memory = Vec::new();
         let mut device_memory = Vec::new();
+        let mut device_intervals = Vec::new();
         let mut gradients = Vec::new();
         let mut edges = Vec::new();
+        let mut terminal: Option<TerminalEvent> = None;
 
         for (index, event) in events.into_iter().enumerate() {
+            if terminal.is_some() {
+                bail!("terminal event must be the final trace record; found another event at index {index}");
+            }
             match event {
                 TraceEvent::Meta {
                     schema: s,
@@ -66,7 +74,7 @@ impl TraceDocument {
                         );
                     }
                     schema = Some(s);
-                    run = Some(meta);
+                    run = Some(*meta);
                 }
                 TraceEvent::SpanStart(start) => {
                     if span_starts.contains_key(&start.id) {
@@ -85,30 +93,34 @@ impl TraceDocument {
                     span_durations.insert(id, duration_ns);
                 }
                 TraceEvent::Op(mut op) => {
-                    op.storage_bytes = Some(resolve_storage_bytes(
-                        op.storage_bytes,
-                        &op.shape,
-                        &op.dtype,
-                    ));
+                    op.output_dense_bytes =
+                        resolve_dense_tensor_bytes(op.output_dense_bytes, &op.shape, &op.dtype);
                     ops.push(op);
                 }
                 TraceEvent::Tensor(mut tensor) => {
-                    tensor.storage_bytes = Some(resolve_storage_bytes(
-                        tensor.storage_bytes,
+                    tensor.dense_bytes = resolve_dense_tensor_bytes(
+                        tensor.dense_bytes,
                         &tensor.shape,
                         &tensor.dtype,
-                    ));
+                    );
                     tensors.push(tensor);
                 }
                 TraceEvent::Memory(mem) => memory.push(mem),
                 TraceEvent::DeviceMemory(snapshot) => device_memory.push(snapshot),
+                TraceEvent::DeviceInterval(interval) => device_intervals.push(interval),
                 TraceEvent::Gradient(gradient) => gradients.push(gradient),
                 TraceEvent::Edge(edge) => edges.push(edge),
+                TraceEvent::Terminal(event) => {
+                    if terminal.replace(event).is_some() {
+                        bail!("duplicate terminal event at index {index}");
+                    }
+                }
             }
         }
 
         let schema = schema.unwrap_or_else(|| SCHEMA.to_string());
         let run = run.context("trace stream is missing a meta event with run metadata")?;
+        let terminal = terminal.context("trace stream is missing its terminal event")?;
 
         if schema != SCHEMA {
             bail!("unsupported trace schema {schema:?}; expected {SCHEMA:?}");
@@ -130,6 +142,41 @@ impl TraceDocument {
             .collect();
         spans.sort_by(|a, b| a.id.cmp(&b.id));
 
+        match terminal.outcome {
+            RunOutcome::Complete if terminal.reason.is_some() => {
+                bail!("complete terminal event cannot contain a failure reason")
+            }
+            RunOutcome::Failed
+                if terminal
+                    .reason
+                    .as_deref()
+                    .is_none_or(|reason| reason.trim().is_empty()) =>
+            {
+                bail!("failed terminal event requires a non-empty reason")
+            }
+            _ => {}
+        }
+        let latest_host_timestamp_ns = spans
+            .iter()
+            .map(|span| {
+                span.start_ns
+                    .saturating_add(if span.closed { span.duration_ns } else { 0 })
+            })
+            .chain(
+                ops.iter()
+                    .map(|op| op.timestamp_ns.saturating_add(op.duration_ns)),
+            )
+            .chain(memory.iter().map(|event| event.timestamp_ns))
+            .chain(device_memory.iter().map(|event| event.timestamp_ns))
+            .max()
+            .unwrap_or(0);
+        if terminal.timestamp_ns < latest_host_timestamp_ns {
+            bail!(
+                "terminal timestamp {} precedes host evidence ending at {latest_host_timestamp_ns}",
+                terminal.timestamp_ns
+            );
+        }
+
         Ok(Self {
             schema,
             run,
@@ -138,8 +185,10 @@ impl TraceDocument {
             tensors,
             memory,
             device_memory,
+            device_intervals,
             gradients,
             edges,
+            terminal,
         })
     }
 
@@ -191,7 +240,9 @@ impl TraceDocument {
             .filter(|event| event.action == MemoryAction::Free)
             .count();
 
-        let peak_bytes = super::memory::analyze_memory(self).summary.peak_bytes;
+        let logical_peak_bytes = super::memory::analyze_memory(self)
+            .logical
+            .and_then(|profile| profile.peak.map(|peak| peak.live_bytes));
 
         TraceSummary {
             op_count,
@@ -201,7 +252,7 @@ impl TraceDocument {
             max_depth,
             alloc_count,
             free_count,
-            peak_bytes,
+            logical_peak_bytes,
         }
     }
 
@@ -209,7 +260,7 @@ impl TraceDocument {
     pub fn to_events(&self) -> Vec<TraceEvent> {
         let mut events = vec![TraceEvent::Meta {
             schema: self.schema.clone(),
-            run: self.run.clone(),
+            run: Box::new(self.run.clone()),
         }];
 
         let mut span_ids: Vec<_> = self.spans.iter().map(|span| span.id.as_str()).collect();
@@ -246,8 +297,15 @@ impl TraceDocument {
                 .cloned()
                 .map(TraceEvent::DeviceMemory),
         );
+        events.extend(
+            self.device_intervals
+                .iter()
+                .cloned()
+                .map(TraceEvent::DeviceInterval),
+        );
         events.extend(self.gradients.iter().cloned().map(TraceEvent::Gradient));
         events.extend(self.edges.iter().cloned().map(TraceEvent::Edge));
+        events.push(TraceEvent::Terminal(self.terminal.clone()));
         events
     }
 }
@@ -307,9 +365,10 @@ pub fn write_jsonl(path: impl AsRef<Path>, events: &[TraceEvent]) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capability::CaptureContract;
     use crate::trace::events::TraceEvent;
     use crate::trace::memory::MemoryCategory;
-    use crate::trace::schema::{GradientState, SpanKind};
+    use crate::trace::schema::{GradientState, RunOutcome, SpanKind};
 
     fn sample_meta() -> TraceRunMeta {
         TraceRunMeta {
@@ -323,6 +382,8 @@ mod tests {
             device: "cpu".into(),
             measured_region_device_synchronized: false,
             timing_mode: crate::trace::TimingMode::Host,
+            capture_contract: CaptureContract::default(),
+            comparison_identity: None,
             tags: Default::default(),
             candle_version: Some("0.8.0".into()),
         }
@@ -358,12 +419,13 @@ mod tests {
                 dtype: "f32".into(),
                 device: "cpu".into(),
                 duration_ns: 1200,
-                timestamp_ns: 1200,
-                storage_bytes: None,
-                input_storage_bytes: 0,
+                timestamp_ns: 10,
+                output_dense_bytes: None,
+                input_dense_bytes: 0,
             }),
             TraceEvent::Memory(super::super::events::MemoryEvent {
                 timestamp_ns: 1200,
+                storage_id: "storage-t2".into(),
                 tensor_id: "t2".into(),
                 span_id: "span-op".into(),
                 op_name: Some("matmul".into()),
@@ -374,10 +436,10 @@ mod tests {
                 dtype: "f32".into(),
                 category: MemoryCategory::Activation,
             }),
-            TraceEvent::Edge(EdgeEvent {
+            TraceEvent::Edge(EdgeEvent::Call {
                 from_span: "span-root".into(),
                 to_span: "span-op".into(),
-                duration_ns: 1200,
+                host_duration_ns: 1200,
             }),
             TraceEvent::Gradient(GradientEvent {
                 event_id: "grad-1".into(),
@@ -392,7 +454,12 @@ mod tests {
             }),
             TraceEvent::SpanEnd(SpanEndEvent {
                 id: "span-root".into(),
-                duration_ns: 2_000,
+                duration_ns: 2_500,
+            }),
+            TraceEvent::Terminal(TerminalEvent {
+                outcome: RunOutcome::Complete,
+                timestamp_ns: 2_500,
+                reason: None,
             }),
         ]
     }
@@ -405,7 +472,7 @@ mod tests {
         assert_eq!(doc.spans.len(), 2);
         assert!(doc.spans.iter().all(|span| span.closed));
         assert_eq!(doc.ops.len(), 1);
-        assert_eq!(doc.ops[0].storage_bytes, Some(32 * 32 * 4));
+        assert_eq!(doc.ops[0].output_dense_bytes, Some(32 * 32 * 4));
         assert_eq!(doc.memory.len(), 1);
         assert_eq!(doc.edges.len(), 1);
         assert_eq!(doc.gradients.len(), 1);
@@ -413,18 +480,18 @@ mod tests {
 
         let summary = doc.build_summary();
         assert_eq!(summary.op_count, 1);
-        assert_eq!(summary.total_ns, 2_000);
+        assert_eq!(summary.total_ns, 2_500);
         assert_eq!(summary.span_count, 2);
         assert_eq!(summary.root_span_count, 1);
         assert_eq!(summary.max_depth, 1);
         assert_eq!(summary.alloc_count, 1);
-        assert_eq!(summary.peak_bytes, 32 * 32 * 4);
+        assert_eq!(summary.logical_peak_bytes, Some(32 * 32 * 4));
     }
 
     #[test]
     fn jsonl_roundtrip_via_temp_file() {
         let dir = std::env::temp_dir().join(format!(
-            "candle-graph-trace6-{}-{}",
+            "candle-graph-trace7-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -450,10 +517,17 @@ mod tests {
 
     #[test]
     fn rejects_unknown_schema() {
-        let events = vec![TraceEvent::Meta {
-            schema: "not-candle-graph".into(),
-            run: sample_meta(),
-        }];
+        let events = vec![
+            TraceEvent::Meta {
+                schema: "not-candle-graph".into(),
+                run: Box::new(sample_meta()),
+            },
+            TraceEvent::Terminal(TerminalEvent {
+                outcome: RunOutcome::Complete,
+                timestamp_ns: 0,
+                reason: None,
+            }),
+        ];
         let err = TraceDocument::from_events(events).unwrap_err();
         assert!(err.to_string().contains("unsupported trace schema"));
     }
@@ -469,5 +543,41 @@ mod tests {
         ];
         let err = TraceDocument::from_events(events).unwrap_err();
         assert!(err.to_string().contains("unknown span"));
+    }
+
+    #[test]
+    fn rejects_records_after_terminal_and_invalid_outcomes() {
+        let after_terminal = vec![
+            TraceEvent::meta(sample_meta()),
+            TraceEvent::Terminal(TerminalEvent {
+                outcome: RunOutcome::Complete,
+                timestamp_ns: 0,
+                reason: None,
+            }),
+            TraceEvent::Gradient(GradientEvent {
+                event_id: "late".into(),
+                root: "vb".into(),
+                key: "w".into(),
+                state: GradientState::Present,
+                norm: None,
+            }),
+        ];
+        assert!(TraceDocument::from_events(after_terminal)
+            .unwrap_err()
+            .to_string()
+            .contains("must be the final"));
+
+        let failed_without_reason = vec![
+            TraceEvent::meta(sample_meta()),
+            TraceEvent::Terminal(TerminalEvent {
+                outcome: RunOutcome::Failed,
+                timestamp_ns: 0,
+                reason: Some("  ".into()),
+            }),
+        ];
+        assert!(TraceDocument::from_events(failed_without_reason)
+            .unwrap_err()
+            .to_string()
+            .contains("non-empty reason"));
     }
 }

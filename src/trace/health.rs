@@ -1,4 +1,4 @@
-//! Structural trust and evidence-coverage checks for a parsed trace.
+//! Structural validation and observed evidence coverage for a parsed trace.
 
 use std::collections::{HashMap, HashSet};
 
@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::phase::{ExecutionPhase, ExecutionStep};
 
-use super::TraceDocument;
+use super::{EdgeEvent, MemoryAction, RunOutcome, TraceDocument};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,8 +32,10 @@ pub struct EvidenceCoverage {
     pub tensors: usize,
     pub memory_events: usize,
     pub device_memory_samples: usize,
+    pub device_intervals: usize,
     pub gradients: usize,
-    pub edges: usize,
+    pub call_edges: usize,
+    pub data_edges: usize,
     pub forward_spans: usize,
     pub backward_spans: usize,
     pub optimizer_spans: usize,
@@ -41,7 +43,10 @@ pub struct EvidenceCoverage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceHealth {
-    pub trusted: bool,
+    /// The event stream is internally consistent enough for derived analysis.
+    pub structurally_valid: bool,
+    /// The producer emitted a successful terminal event.
+    pub capture_complete: bool,
     pub issues: Vec<HealthIssue>,
     pub coverage: EvidenceCoverage,
 }
@@ -55,6 +60,7 @@ impl TraceHealth {
 }
 
 pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
+    let failed = doc.terminal.outcome == RunOutcome::Failed;
     let ids: HashSet<&str> = doc.spans.iter().map(|span| span.id.as_str()).collect();
     let by_id: HashMap<&str, _> = doc
         .spans
@@ -62,16 +68,67 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
         .map(|span| (span.id.as_str(), span))
         .collect();
     let mut issues = Vec::new();
-    if ids.len() != doc.spans.len() {
+
+    match doc.terminal.outcome {
+        RunOutcome::Complete if doc.terminal.reason.is_some() => error(
+            &mut issues,
+            "complete_with_failure_reason",
+            "complete terminal outcome cannot contain a failure reason",
+        ),
+        RunOutcome::Failed
+            if doc
+                .terminal
+                .reason
+                .as_deref()
+                .is_none_or(|reason| reason.trim().is_empty()) =>
+        {
+            error(
+                &mut issues,
+                "failed_without_reason",
+                "failed terminal outcome requires a non-empty reason",
+            )
+        }
+        _ => {}
+    }
+    let latest_host_timestamp_ns = doc
+        .spans
+        .iter()
+        .map(|span| {
+            span.start_ns
+                .saturating_add(if span.closed { span.duration_ns } else { 0 })
+        })
+        .chain(
+            doc.ops
+                .iter()
+                .map(|op| op.timestamp_ns.saturating_add(op.duration_ns)),
+        )
+        .chain(doc.memory.iter().map(|event| event.timestamp_ns))
+        .chain(doc.device_memory.iter().map(|event| event.timestamp_ns))
+        .max()
+        .unwrap_or(0);
+    if doc.terminal.timestamp_ns < latest_host_timestamp_ns {
         error(
             &mut issues,
-            "duplicate_span_id",
+            "terminal_precedes_evidence",
             format!(
-                "span IDs must be unique; found {} records but {} unique IDs",
-                doc.spans.len(),
-                ids.len()
+                "terminal timestamp {} precedes host evidence ending at {latest_host_timestamp_ns}",
+                doc.terminal.timestamp_ns
             ),
         );
+    }
+
+    if failed {
+        warning(
+            &mut issues,
+            "capture_failed",
+            doc.terminal
+                .reason
+                .as_deref()
+                .unwrap_or("capture ended with a failed outcome"),
+        );
+    }
+    if ids.len() != doc.spans.len() {
+        error(&mut issues, "duplicate_span_id", "span IDs must be unique");
     }
     let root_spans = doc
         .spans
@@ -86,20 +143,29 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
         );
     }
     let measured_spans = doc.spans.iter().filter(|span| span.measured).count();
-    if measured_spans != 1 {
+    if measured_spans != 1 && !failed {
         error(
             &mut issues,
             "measurement_count",
             format!("expected exactly one measured region, found {measured_spans}"),
         );
     }
+
     for span in &doc.spans {
         if !span.closed {
-            error(
-                &mut issues,
-                "open_span",
-                format!("span `{}` was not closed", span.id),
-            );
+            if failed {
+                warning(
+                    &mut issues,
+                    "open_span",
+                    format!("span `{}` was interrupted", span.id),
+                );
+            } else {
+                error(
+                    &mut issues,
+                    "open_span",
+                    format!("span `{}` was not closed", span.id),
+                );
+            }
         }
         if let Some(parent) = span.parent_id.as_deref() {
             match by_id.get(parent) {
@@ -108,24 +174,18 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
                     "unknown_parent",
                     format!("span `{}` refers to missing parent `{parent}`", span.id),
                 ),
-                Some(parent_span) => {
+                Some(parent_span) if span.closed && parent_span.closed => {
                     let child_end = span.start_ns.saturating_add(span.duration_ns);
                     let parent_end = parent_span.start_ns.saturating_add(parent_span.duration_ns);
                     if span.start_ns < parent_span.start_ns || child_end > parent_end {
                         error(
                             &mut issues,
                             "child_outside_parent",
-                            format!(
-                                "span `{}` interval {}..{} is outside parent `{parent}` interval {}..{}",
-                                span.id,
-                                span.start_ns,
-                                child_end,
-                                parent_span.start_ns,
-                                parent_end
-                            ),
+                            format!("span `{}` lies outside parent `{parent}`", span.id),
                         );
                     }
                 }
+                Some(_) => {}
             }
         }
         let mut current = Some(span.id.as_str());
@@ -142,30 +202,18 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
             current = by_id.get(id).and_then(|item| item.parent_id.as_deref());
         }
     }
-    for parent in &doc.spans {
-        let child_total: u64 = doc
-            .spans
-            .iter()
-            .filter(|span| span.parent_id.as_deref() == Some(parent.id.as_str()))
-            .map(|span| span.duration_ns)
-            .sum();
-        if child_total > parent.duration_ns {
-            error(
-                &mut issues,
-                "children_exceed_parent",
-                format!(
-                    "children of span `{}` total {} ns, exceeding its {} ns duration",
-                    parent.id, child_total, parent.duration_ns
-                ),
-            );
-        }
-    }
+
     for (kind, span_id) in doc
         .ops
         .iter()
         .map(|x| ("operation", x.span_id.as_str()))
         .chain(doc.tensors.iter().map(|x| ("tensor", x.span_id.as_str())))
         .chain(doc.memory.iter().map(|x| ("memory", x.span_id.as_str())))
+        .chain(
+            doc.device_intervals
+                .iter()
+                .map(|x| ("device interval", x.span_id.as_str())),
+        )
     {
         if !ids.contains(span_id) {
             error(
@@ -175,41 +223,177 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
             );
         }
     }
-    for edge in &doc.edges {
-        if !ids.contains(edge.from_span.as_str()) || !ids.contains(edge.to_span.as_str()) {
+    for interval in &doc.device_intervals {
+        if interval.duration_ns == 0 {
             error(
                 &mut issues,
-                "unknown_edge_span",
+                "empty_device_interval",
                 format!(
-                    "edge `{}` -> `{}` refers to a missing span",
-                    edge.from_span, edge.to_span
+                    "device interval for `{}` has zero duration",
+                    interval.span_id
                 ),
             );
         }
     }
-    let mut live_memory = HashSet::new();
+    for op in &doc.ops {
+        if let Some(span) = by_id.get(op.span_id.as_str()).filter(|span| span.closed) {
+            let span_end = span.start_ns.saturating_add(span.duration_ns);
+            let op_end = op.timestamp_ns.saturating_add(op.duration_ns);
+            if op.timestamp_ns < span.start_ns || op_end > span_end {
+                error(
+                    &mut issues,
+                    "operation_outside_span",
+                    format!(
+                        "operation `{}` lies outside span `{}`",
+                        op.op_name, op.span_id
+                    ),
+                );
+            }
+        }
+    }
+    for sample in &doc.device_memory {
+        if sample.used_bytes.is_none()
+            && sample.free_bytes.is_none()
+            && sample.reserved_bytes.is_none()
+            && sample.capacity_bytes.is_none()
+        {
+            error(
+                &mut issues,
+                "empty_device_memory_sample",
+                format!(
+                    "device-memory sample for `{}` contains no measurements",
+                    sample.device
+                ),
+            );
+        }
+    }
+    let known_tensors = doc
+        .tensors
+        .iter()
+        .map(|tensor| tensor.tensor_id.as_str())
+        .chain(
+            doc.ops
+                .iter()
+                .flat_map(|op| op.inputs.iter().map(String::as_str)),
+        )
+        .chain(doc.ops.iter().filter_map(|op| op.output.as_deref()))
+        .collect::<HashSet<_>>();
+    for edge in &doc.edges {
+        match edge {
+            EdgeEvent::Call {
+                from_span,
+                to_span,
+                ..
+            } if !ids.contains(from_span.as_str()) || !ids.contains(to_span.as_str()) => error(
+                &mut issues,
+                "unknown_call_edge_span",
+                format!("call edge `{from_span}` -> `{to_span}` refers to a missing span"),
+            ),
+            EdgeEvent::Call {
+                from_span,
+                to_span,
+                host_duration_ns,
+            } => {
+                let target = by_id[to_span.as_str()];
+                if target.parent_id.as_deref() != Some(from_span.as_str()) {
+                    error(
+                        &mut issues,
+                        "call_edge_hierarchy_mismatch",
+                        format!(
+                            "call edge `{from_span}` -> `{to_span}` does not match the span hierarchy"
+                        ),
+                    );
+                }
+                if target.closed && *host_duration_ns != target.duration_ns {
+                    error(
+                        &mut issues,
+                        "call_edge_duration_mismatch",
+                        format!(
+                            "call edge `{from_span}` -> `{to_span}` reports {host_duration_ns} ns but the span reports {} ns",
+                            target.duration_ns
+                        ),
+                    );
+                }
+            }
+            EdgeEvent::Data {
+                from_tensor,
+                to_tensor,
+            } if from_tensor.is_empty() || to_tensor.is_empty() => error(
+                &mut issues,
+                "empty_data_edge_endpoint",
+                "data-edge tensor IDs cannot be empty",
+            ),
+            EdgeEvent::Data {
+                from_tensor,
+                to_tensor,
+            } if !known_tensors.contains(from_tensor.as_str())
+                || !known_tensors.contains(to_tensor.as_str()) =>
+            {
+                error(
+                    &mut issues,
+                    "unknown_data_edge_tensor",
+                    format!(
+                        "data edge `{from_tensor}` -> `{to_tensor}` refers to unknown tensor evidence"
+                    ),
+                )
+            }
+            _ => {}
+        }
+    }
+
+    let mut live_memory: HashMap<(&str, &str), (u64, HashSet<&str>)> = HashMap::new();
     let mut memory = doc.memory.iter().collect::<Vec<_>>();
     memory.sort_by_key(|event| event.timestamp_ns);
     for event in memory {
-        let key = (event.device.as_str(), event.tensor_id.as_str());
+        let key = (event.device.as_str(), event.storage_id.as_str());
         match event.action {
-            super::MemoryAction::Alloc if !live_memory.insert(key) => error(
-                &mut issues,
-                "duplicate_allocation",
-                format!(
-                    "tensor `{}` was allocated twice without a free",
-                    event.tensor_id
+            MemoryAction::Alloc => match live_memory.get_mut(&key) {
+                Some((bytes, _)) if *bytes != event.bytes => error(
+                    &mut issues,
+                    "allocation_size_mismatch",
+                    format!(
+                        "storage `{}` on `{}` has conflicting allocation sizes",
+                        event.storage_id, event.device
+                    ),
                 ),
-            ),
-            super::MemoryAction::Free if !live_memory.remove(&key) => error(
-                &mut issues,
-                "unpaired_free",
-                format!(
-                    "tensor `{}` was freed without a live allocation",
-                    event.tensor_id
+                Some((_, tensor_ids)) => {
+                    if !tensor_ids.insert(event.tensor_id.as_str()) {
+                        error(
+                            &mut issues,
+                            "duplicate_allocation",
+                            format!(
+                                "tensor `{}` repeated an allocation for storage `{}` on `{}`",
+                                event.tensor_id, event.storage_id, event.device
+                            ),
+                        );
+                    }
+                }
+                None => {
+                    live_memory.insert(
+                        key,
+                        (event.bytes, HashSet::from([event.tensor_id.as_str()])),
+                    );
+                }
+            },
+            MemoryAction::Free => match live_memory.remove(&key) {
+                None => error(
+                    &mut issues,
+                    "unpaired_free",
+                    format!(
+                        "storage `{}` on `{}` was freed while not live",
+                        event.storage_id, event.device
+                    ),
                 ),
-            ),
-            _ => {}
+                Some((bytes, _)) if bytes != event.bytes => error(
+                    &mut issues,
+                    "allocation_size_mismatch",
+                    format!(
+                        "storage `{}` allocated {bytes} bytes but freed {}",
+                        event.storage_id, event.bytes
+                    ),
+                ),
+                Some(_) => {}
+            },
         }
     }
     if !live_memory.is_empty() {
@@ -217,7 +401,7 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
             &mut issues,
             "retained_allocations",
             format!(
-                "{} explicit allocations remained live at measurement end",
+                "{} storages remained live at capture end",
                 live_memory.len()
             ),
         );
@@ -232,8 +416,18 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
         tensors: doc.tensors.len(),
         memory_events: doc.memory.len(),
         device_memory_samples: doc.device_memory.len(),
+        device_intervals: doc.device_intervals.len(),
         gradients: doc.gradients.len(),
-        edges: doc.edges.len(),
+        call_edges: doc
+            .edges
+            .iter()
+            .filter(|edge| matches!(edge, EdgeEvent::Call { .. }))
+            .count(),
+        data_edges: doc
+            .edges
+            .iter()
+            .filter(|edge| matches!(edge, EdgeEvent::Data { .. }))
+            .count(),
         forward_spans: step_count(doc, ExecutionStep::Forward),
         backward_spans: step_count(doc, ExecutionStep::Backward),
         optimizer_spans: step_count(doc, ExecutionStep::Optimizer),
@@ -243,7 +437,7 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
         (
             coverage.operations == 0,
             "operations_absent",
-            "no timed operation evidence was captured",
+            "no operation evidence was captured",
         ),
         (
             coverage.tensors == 0,
@@ -252,13 +446,18 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
         ),
         (
             coverage.memory_events == 0,
-            "memory_absent",
-            "no tensor memory events were captured",
+            "logical_memory_absent",
+            "no logical storage events were captured",
         ),
         (
             coverage.device_memory_samples == 0,
-            "device_memory_absent",
-            "no device-memory checkpoints were captured",
+            "physical_memory_absent",
+            "no physical device-memory samples were captured",
+        ),
+        (
+            coverage.device_intervals == 0,
+            "device_timing_absent",
+            "no device timing intervals were captured",
         ),
         (
             coverage.gradients == 0 && doc.run.phase == ExecutionPhase::Train,
@@ -285,12 +484,36 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
             warning(&mut issues, code, message);
         }
     }
+    let mut required_labels = HashSet::new();
+    for required in &doc.run.capture_contract.required_semantic_labels {
+        if !required_labels.insert(required.as_str()) {
+            warning(
+                &mut issues,
+                "duplicate_required_semantic_label",
+                format!("required semantic label `{required}` is declared more than once"),
+            );
+        }
+        let count = doc
+            .spans
+            .iter()
+            .filter(|span| span.name == *required)
+            .count();
+        if count != 1 {
+            warning(
+                &mut issues,
+                "required_semantic_label_cardinality",
+                format!(
+                    "required semantic label `{required}` must occur exactly once; observed {count}"
+                ),
+            );
+        }
+    }
 
-    let trusted = !issues
-        .iter()
-        .any(|issue| issue.severity == HealthSeverity::Error);
     TraceHealth {
-        trusted,
+        structurally_valid: !issues
+            .iter()
+            .any(|issue| issue.severity == HealthSeverity::Error),
+        capture_complete: !failed,
         issues,
         coverage,
     }
@@ -322,102 +545,98 @@ fn warning(issues: &mut Vec<HealthIssue>, code: &str, message: impl Into<String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace::{SpanKind, SpanRecord, TimingMode, TraceRunMeta, SCHEMA};
+    use crate::capability::CaptureContract;
+    use crate::trace::{
+        MemoryCategory, MemoryEvent, RunOutcome, SpanKind, SpanRecord, TerminalEvent, TimingMode,
+        TraceRunMeta, SCHEMA,
+    };
 
-    fn document(spans: Vec<SpanRecord>) -> TraceDocument {
+    fn failed_document() -> TraceDocument {
         TraceDocument {
             schema: SCHEMA.into(),
             run: TraceRunMeta {
-                run_id: "health".into(),
-                correlation_id: "health/update-1".into(),
-                entrypoint: "health".into(),
+                run_id: "failed".into(),
+                correlation_id: "failed/run".into(),
+                entrypoint: "demo".into(),
                 phase: ExecutionPhase::Infer,
-                timestamp: "2026-08-08T00:00:00Z".into(),
+                timestamp: "2026-08-19T00:00:00Z".into(),
                 capture_step: 1,
                 warmup_steps: 0,
                 device: "cpu".into(),
                 measured_region_device_synchronized: false,
                 timing_mode: TimingMode::Host,
+                capture_contract: CaptureContract::default(),
+                comparison_identity: None,
                 tags: Default::default(),
                 candle_version: None,
             },
-            spans,
+            spans: vec![SpanRecord {
+                id: "root".into(),
+                parent_id: None,
+                name: "demo".into(),
+                kind: SpanKind::Function,
+                measured: false,
+                start_ns: 0,
+                closed: false,
+                duration_ns: 0,
+                step: None,
+            }],
             ops: vec![],
             tensors: vec![],
             memory: vec![],
             device_memory: vec![],
+            device_intervals: vec![],
             gradients: vec![],
             edges: vec![],
-        }
-    }
-
-    fn span(id: &str, parent: Option<&str>, measured: bool, duration_ns: u64) -> SpanRecord {
-        SpanRecord {
-            id: id.into(),
-            parent_id: parent.map(str::to_string),
-            name: id.into(),
-            kind: SpanKind::Function,
-            measured,
-            start_ns: 0,
-            closed: true,
-            duration_ns,
-            step: None,
+            terminal: TerminalEvent {
+                outcome: RunOutcome::Failed,
+                timestamp_ns: 10,
+                reason: Some("boom".into()),
+            },
         }
     }
 
     #[test]
-    fn rejects_multiple_roots_before_graph_building() {
-        let health = analyze_health(&document(vec![
-            span("a", None, true, 10),
-            span("b", None, false, 10),
-        ]));
-        assert!(!health.trusted);
-        assert!(health.issues.iter().any(|issue| issue.code == "root_count"));
-    }
-
-    #[test]
-    fn rejects_disconnected_parent_cycle() {
-        let health = analyze_health(&document(vec![
-            span("root", None, true, 100),
-            span("a", Some("b"), false, 0),
-            span("b", Some("a"), false, 0),
-        ]));
-        assert!(!health.trusted);
-        assert!(health.issues.iter().any(|issue| issue.code == "span_cycle"));
-    }
-
-    #[test]
-    fn rejects_aggregate_child_time_larger_than_parent() {
-        let health = analyze_health(&document(vec![
-            span("root", None, true, 100),
-            span("a", Some("root"), false, 70),
-            span("b", Some("root"), false, 70),
-        ]));
-        assert!(!health.trusted);
+    fn failed_capture_is_diagnosable_without_becoming_complete() {
+        let health = analyze_health(&failed_document());
+        assert!(health.structurally_valid);
+        assert!(!health.capture_complete);
         assert!(health
             .issues
             .iter()
-            .any(|issue| issue.code == "children_exceed_parent"));
+            .any(|issue| issue.code == "capture_failed"));
+        assert!(health
+            .issues
+            .iter()
+            .any(|issue| issue.code == "open_span" && issue.severity == HealthSeverity::Warning));
     }
 
     #[test]
-    fn rejects_duplicate_ids_and_child_outside_parent_interval() {
-        let mut spans = vec![
-            span("root", None, true, 100),
-            span("child", Some("root"), false, 10),
-            span("child", Some("root"), false, 10),
+    fn distinct_tensor_aliases_share_one_live_storage() {
+        let mut document = failed_document();
+        let memory = |timestamp_ns, tensor_id: &str, action| MemoryEvent {
+            timestamp_ns,
+            storage_id: "shared".into(),
+            tensor_id: tensor_id.into(),
+            span_id: "root".into(),
+            op_name: None,
+            device: "cpu".into(),
+            bytes: 64,
+            action,
+            shape: vec![16],
+            dtype: "f32".into(),
+            category: MemoryCategory::Activation,
+        };
+        document.memory = vec![
+            memory(1, "base", MemoryAction::Alloc),
+            memory(2, "view", MemoryAction::Alloc),
+            memory(3, "view", MemoryAction::Free),
         ];
-        spans[1].start_ns = 101;
-        spans[2].start_ns = 101;
-        let health = analyze_health(&document(spans));
-        assert!(!health.trusted);
-        assert!(health
+        let health = analyze_health(&document);
+        assert!(health.structurally_valid);
+        assert!(!health
             .issues
             .iter()
-            .any(|issue| issue.code == "duplicate_span_id"));
-        assert!(health
-            .issues
-            .iter()
-            .any(|issue| issue.code == "child_outside_parent"));
+            .any(|issue| issue.code == "duplicate_allocation"));
     }
 }

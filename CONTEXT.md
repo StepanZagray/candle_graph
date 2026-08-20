@@ -16,9 +16,34 @@ session setup and evidence publication are outside it.
 **GPU evidence**: optional normalized Nsight kernel, runtime, transfer, timeline, and projected NVTX
 facts. Its absence never invalidates application evidence.
 
-**Evidence packet**: the single deep interface for agents, reports, comparisons, and the HTML
-viewer: provenance, structural health, coverage, structured facts, explicit gaps, graph, optional
-baseline, and optional GPU evidence.
+**Evidence packet**: the single deep interface for agents, reports, and the HTML viewer:
+provenance, structural health, capability states, typed facts, explicit gaps, optional validated
+graph, separate timing and memory planes, and optional GPU evidence.
+
+**Capture contract**: the producer's typed declaration of which evidence classes cover the whole
+measured region. Observed event counts can prove presence, but never upgrade coverage to complete.
+
+**Evidence capability**: a machine-checkable statement that one class of conclusion is supported,
+partial, unavailable, or invalid for an evidence packet.
+
+**Timing plane**: one clock and interval semantics for timing evidence. Host, device-event, and
+Nsight-projected intervals are separate timing planes even when they describe the same phase.
+
+**Logical memory evidence**: storage lifetimes identified by device and storage identity, including
+simultaneous live bytes and residual storage.
+
+**Physical memory evidence**: observed device or allocator used, reserved, free, and capacity bytes.
+Each measurement is independently optional. Capacity is never derived from used plus free, tensor
+metadata, or logical storage lifetimes.
+
+**Replicated comparison**: a metric-scoped comparison of at least five compatible independent
+baseline runs and five compatible independent candidate runs, retaining every raw sample.
+
+**Evidence bundle**: one atomically published directory whose manifest binds every input and
+derived artifact to the profile run.
+
+**Failed capture**: a terminated profile run with an explicit failure reason and partial structural
+evidence. It is diagnosable but cannot support normal findings or comparisons.
 
 ## Evidence flow
 
@@ -29,13 +54,14 @@ representative update
   └─ matching NVTX labels (optional)
             │
             ▼
- application.jsonl (trace/6) ── validate ── graph/3
+ application.jsonl (trace/7) ── validate ── graph/4
             │                                │
  official nsys stats CSV ── normalize ───────┤
             │                                ▼
-            └──────────────────── evidence/1 packet
+            └──────────────────── evidence/2 packet
                                       ├─ bounded JSON / Markdown for agents
-                                      └─ viewer/4 HTML for humans
+                                      ├─ comparison/2 across repeated runs
+                                      └─ viewer/5 HTML for humans
 ```
 
 Analysis never proceeds through an invalid hierarchy. Optional evidence is represented by coverage
@@ -48,7 +74,7 @@ and reasons, never silent empty arrays. Tensor footprint and observed memory lif
 3. Required provenance and typed timing mode before comparisons.
 4. Structural trust before graph construction or findings.
 5. Bounded agent queries and durable JSON/Markdown evidence.
-6. Baseline deltas by semantic path, memory, and gradient facts.
+6. Fail-closed repeated-run timing comparisons with raw samples and confidence intervals.
 7. One accessible offline UI for application and optional GPU evidence.
 8. Stable normalization from official Nsight CSV, retaining raw `.nsys-rep`.
 
@@ -56,14 +82,11 @@ and reasons, never silent empty arrays. Tensor footprint and observed memory lif
 
 | Schema | Role |
 | --- | --- |
-| `candle-graph/trace/6` | Execution evidence stream |
-| `candle-graph/graph/3` | Validated semantic graph |
-| `candle-graph/evidence/1` | Unified agent/human packet |
-| `candle-graph/comparison/1` | Explicit baseline comparison |
-| `candle-graph/viewer/4` | Embedded offline UI payload |
-
-## Related project
-
-Tofy is the primary consumer. It captures update 1 by default, publishes an atomic per-update
-bundle, emits the same semantic labels to candle-graph and NVTX, and exposes the packet to repair
-agents and humans.
+| `candle-graph/trace/7` | Execution evidence stream and terminal outcome |
+| `candle-graph/graph/4` | Validated call/data graph with separate timing planes |
+| `candle-graph/evidence/2` | Capability-qualified agent/human packet |
+| `candle-graph/comparison/2` | Replicated outer-wall comparison |
+| `candle-graph/viewer/5` | Embedded offline UI payload |
+| `candle-graph/nsight-capture/1` | Nsight raw/normalized artifact provenance |
+| `candle-graph/bundle/1` | Content-addressed atomic evidence bundle |
+| `candle-graph/bundle-verification/1` | Deep verification receipt bound to one manifest digest |

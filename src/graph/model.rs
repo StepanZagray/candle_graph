@@ -1,11 +1,11 @@
-//! Execution graph model (`candle-graph/graph/3`).
+//! Execution graph model (`candle-graph/graph/4`).
 
 use serde::{Deserialize, Serialize};
 
-use crate::trace::memory::{MemoryCategory, MemoryProfile, MemorySummary};
+use crate::trace::memory::MemoryCategory;
 
 /// Schema identifier for [`ExecutionGraph`] documents.
-pub const SCHEMA: &str = "candle-graph/graph/3";
+pub const SCHEMA: &str = "candle-graph/graph/4";
 
 /// Hierarchical execution graph built from a trace document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -19,18 +19,20 @@ pub struct ExecutionGraph {
     pub tensors: Vec<TensorRecord>,
     pub gradients: Vec<GradientRecord>,
     pub summary: GraphSummary,
-    pub memory: MemoryProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorRecord {
     pub span_id: String,
     pub tensor_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub shape: Vec<usize>,
     pub dtype: String,
     pub device: String,
     pub requires_grad: bool,
-    pub storage_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dense_bytes: Option<u64>,
     pub category: MemoryCategory,
 }
 
@@ -42,28 +44,31 @@ pub struct GraphNode {
     pub name: String,
     pub kind: GraphNodeKind,
     pub start_ns: u64,
-    /// Wall time excluding nested spans/ops (TensorFlow profiler style).
-    pub self_time_ns: u64,
-    /// Inclusive wall time for this node.
-    pub total_time_ns: u64,
+    /// Host wall time excluding nested spans/ops.
+    pub host_self_time_ns: u64,
+    /// Inclusive host wall time for this node.
+    pub host_total_time_ns: u64,
+    /// Overlap-safe timings kept separate for every incomparable device clock.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device_timings: Vec<DeviceNodeTiming>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shape: Option<Vec<usize>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dtype: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
-    /// Total bytes requested by this node's ops (TF `bytes`).
-    #[serde(default)]
-    pub bytes: u64,
-    /// Peak live bytes in subtree (TF `peak_bytes`).
-    #[serde(default)]
-    pub peak_bytes: u64,
-    /// Bytes still live when node finishes (TF `residual_bytes`).
-    #[serde(default)]
-    pub residual_bytes: u64,
-    /// Op output storage (derived from shape×dtype).
+    /// Logical storage bytes directly allocated by this node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage_bytes: Option<u64>,
+    pub allocated_bytes: Option<u64>,
+    /// Peak logical live bytes in this node's subtree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_live_bytes: Option<u64>,
+    /// Logical bytes still live when this node finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residual_bytes: Option<u64>,
+    /// Dense tensor footprint (derived from shape×dtype), not backing allocation size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dense_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -73,25 +78,34 @@ pub enum GraphNodeKind {
     Function,
     Module,
     Op,
+    Tensor,
     #[serde(other)]
     Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GraphEdge {
-    pub from: String,
-    pub to: String,
-    pub kind: GraphEdgeKind,
-    pub duration_ns: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
+pub struct DeviceNodeTiming {
+    pub device: String,
+    pub clock_id: String,
+    pub busy_ns: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GraphEdgeKind {
-    Call,
-    Data,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GraphEdge {
+    Call {
+        from_span: String,
+        to_span: String,
+        host_duration_ns: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    Data {
+        from_tensor: String,
+        to_tensor: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -115,28 +129,35 @@ pub enum GradientRecordState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphSummary {
     pub entrypoint: String,
-    /// Root span inclusive wall time in milliseconds.
-    pub total_ms: f64,
-    /// Top spans by self time (excluding op leaf nodes).
-    pub slowest_spans: Vec<SlowSpan>,
-    /// Top spans by requested bytes (TF scope -order_by bytes).
+    pub outer_wall_time_ns: u64,
+    pub slowest_host_spans: Vec<HostSpanCost>,
+    pub slowest_device_spans: Vec<DeviceSpanCost>,
+    /// Top spans by known logical allocation bytes.
     pub heaviest_spans: Vec<HeavySpan>,
-    pub memory: MemorySummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SlowSpan {
+pub struct HostSpanCost {
     pub id: String,
     pub name: String,
-    pub self_time_ns: u64,
+    pub host_self_time_ns: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceSpanCost {
+    pub id: String,
+    pub name: String,
+    pub device: String,
+    pub clock_id: String,
+    pub device_busy_ns: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeavySpan {
     pub id: String,
     pub name: String,
-    pub bytes: u64,
-    pub peak_bytes: u64,
+    pub allocated_bytes: u64,
+    pub peak_live_bytes: Option<u64>,
 }
 
 impl ExecutionGraph {

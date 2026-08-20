@@ -19,14 +19,14 @@ pub struct OpRecord<'a> {
     pub device: &'a str,
     pub duration_ns: u64,
     pub timestamp_ns: u64,
-    pub storage_bytes: Option<u64>,
-    pub input_storage_bytes: u64,
-    pub category: Option<crate::trace::MemoryCategory>,
+    pub output_dense_bytes: Option<u64>,
+    pub input_dense_bytes: u64,
 }
 
 /// Fields for an explicit memory alloc/free event.
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryRecord<'a> {
+    pub storage_id: &'a str,
     pub tensor_id: &'a str,
     pub device: &'a str,
     pub bytes: u64,
@@ -37,15 +37,38 @@ pub struct MemoryRecord<'a> {
     pub shape: &'a [usize],
 }
 
+/// One already-resolved interval from a device timing adapter.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceIntervalRecord<'a> {
+    pub device: &'a str,
+    pub stream_id: &'a str,
+    pub clock_id: &'a str,
+    pub backend: &'a str,
+    pub start_ns: u64,
+    pub duration_ns: u64,
+}
+
+/// Independently observed physical-memory checkpoint values.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceMemoryRecord<'a> {
+    pub device: &'a str,
+    pub used_bytes: Option<u64>,
+    pub free_bytes: Option<u64>,
+    pub reserved_bytes: Option<u64>,
+    pub capacity_bytes: Option<u64>,
+    pub timestamp_ns: Option<u64>,
+}
+
 /// Fields for a tensor memory observation inside an open span.
 #[derive(Debug, Clone, Copy)]
 pub struct TensorRecord<'a> {
     pub tensor_id: &'a str,
+    pub label: Option<&'a str>,
     pub shape: &'a [usize],
     pub dtype: &'a str,
     pub device: &'a str,
     pub requires_grad: bool,
-    pub storage_bytes: Option<u64>,
+    pub dense_bytes: Option<u64>,
     pub category: crate::trace::MemoryCategory,
 }
 

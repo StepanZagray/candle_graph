@@ -1,9 +1,9 @@
-//! JSONL event records for `candle-graph/trace/6`.
+//! JSONL event records for `candle-graph/trace/7`.
 
 use serde::{Deserialize, Serialize};
 
 use super::memory::{MemoryAction, MemoryCategory};
-use super::schema::{GradientState, SpanKind, TraceRunMeta, SCHEMA};
+use super::schema::{GradientState, RunOutcome, SpanKind, TraceRunMeta, SCHEMA};
 use crate::phase::ExecutionStep;
 
 /// One JSONL record in a trace stream.
@@ -14,7 +14,7 @@ pub enum TraceEvent {
     Meta {
         schema: String,
         #[serde(flatten)]
-        run: TraceRunMeta,
+        run: Box<TraceRunMeta>,
     },
     SpanStart(SpanStartEvent),
     SpanEnd(SpanEndEvent),
@@ -22,8 +22,10 @@ pub enum TraceEvent {
     Tensor(TensorEvent),
     Memory(MemoryEvent),
     DeviceMemory(DeviceMemoryEvent),
+    DeviceInterval(DeviceIntervalEvent),
     Gradient(GradientEvent),
     Edge(EdgeEvent),
+    Terminal(TerminalEvent),
 }
 
 impl TraceEvent {
@@ -31,7 +33,7 @@ impl TraceEvent {
     pub fn meta(run: TraceRunMeta) -> Self {
         Self::Meta {
             schema: SCHEMA.to_string(),
-            run,
+            run: Box::new(run),
         }
     }
 }
@@ -74,7 +76,6 @@ pub struct OpEvent {
     pub inputs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
-    #[serde(default)]
     pub shape: Vec<usize>,
     pub dtype: String,
     pub device: String,
@@ -82,27 +83,29 @@ pub struct OpEvent {
     /// Monotonic timestamp for memory timeline ordering (nanoseconds since probe start).
     #[serde(default)]
     pub timestamp_ns: u64,
-    /// Dense output storage bytes; derived from shape×dtype when omitted at parse time.
+    /// Dense output tensor footprint; this is not backing-allocation size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage_bytes: Option<u64>,
-    /// Sum of input tensor storage (PyTorch `record_shapes` footprint).
-    #[serde(default)]
-    pub input_storage_bytes: u64,
+    pub output_dense_bytes: Option<u64>,
+    /// Sum of dense input tensor footprints (PyTorch `record_shapes`-style metadata).
+    pub input_dense_bytes: u64,
 }
 
 /// Tensor snapshot associated with a span (create or metadata).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorEvent {
     pub span_id: String,
+    /// Backend tensor identity used for graph joins and deduplication.
     pub tensor_id: String,
-    #[serde(default)]
+    /// Optional caller-owned observation label; it is never used as tensor identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub shape: Vec<usize>,
     pub dtype: String,
     pub device: String,
     #[serde(default)]
     pub requires_grad: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage_bytes: Option<u64>,
+    pub dense_bytes: Option<u64>,
     #[serde(default)]
     pub category: MemoryCategory,
 }
@@ -111,6 +114,8 @@ pub struct TensorEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryEvent {
     pub timestamp_ns: u64,
+    /// Backend storage identity. Aliased tensor IDs share this identity.
+    pub storage_id: String,
     pub tensor_id: String,
     pub span_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,11 +135,28 @@ pub struct MemoryEvent {
 pub struct DeviceMemoryEvent {
     pub timestamp_ns: u64,
     pub device: String,
-    pub used_bytes: u64,
-    pub free_bytes: u64,
-    /// Caching allocator reserved bytes (PyTorch `memory_reserved`); optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+    /// Caching allocator reserved bytes (PyTorch `memory_reserved`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserved_bytes: Option<u64>,
+    /// Independently observed device capacity; never derived from used + free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_bytes: Option<u64>,
+}
+
+/// Resolved device interval on one device clock and stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceIntervalEvent {
+    pub span_id: String,
+    pub device: String,
+    pub stream_id: String,
+    pub clock_id: String,
+    pub backend: String,
+    pub start_ns: u64,
+    pub duration_ns: u64,
 }
 
 /// Parameter gradient fact recorded during a probe run.
@@ -155,10 +177,43 @@ impl GradientEvent {
     }
 }
 
-/// Data-flow edge timing between two spans.
+/// A typed call-hierarchy or tensor data-flow edge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EdgeEvent {
-    pub from_span: String,
-    pub to_span: String,
-    pub duration_ns: u64,
+#[serde(tag = "edge_kind", rename_all = "snake_case")]
+pub enum EdgeEvent {
+    Call {
+        from_span: String,
+        to_span: String,
+        host_duration_ns: u64,
+    },
+    Data {
+        from_tensor: String,
+        to_tensor: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalEvent {
+    pub outcome: RunOutcome,
+    pub timestamp_ns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tensor_event_without_label_remains_readable() {
+        let event: TraceEvent = serde_json::from_str(
+            r#"{"kind":"tensor","span_id":"root","tensor_id":"backend:1","shape":[1],"dtype":"f32","device":"cpu"}"#,
+        )
+        .unwrap();
+        let TraceEvent::Tensor(tensor) = event else {
+            panic!("expected tensor event");
+        };
+        assert_eq!(tensor.tensor_id, "backend:1");
+        assert_eq!(tensor.label, None);
+    }
 }

@@ -1,55 +1,60 @@
-//! Project [`EvidencePacket`] into `candle-graph/viewer/4` for the unified visualizer.
+//! Project evidence/2 into the standalone viewer/5 payload.
 
 use serde_json::{json, Value};
 
 use crate::evidence::EvidencePacket;
-use crate::graph::{
-    ExecutionGraph, GraphEdge, GraphEdgeKind, GraphNode, GraphNodeKind, GraphSummary,
-};
+use crate::graph::{ExecutionGraph, GraphEdge, GraphNode, GraphNodeKind};
 
-pub const TRACE_VIEWER_SCHEMA: &str = "candle-graph/viewer/4";
+pub const SCHEMA: &str = "candle-graph/viewer/5";
 
-/// Build the unified evidence payload consumed by [`crate::viewer::render_evidence_html`].
 pub fn project(evidence: &EvidencePacket) -> Value {
-    let graph = &evidence.graph;
+    let graph = evidence.graph.as_ref();
+    let tensors = graph
+        .map(|graph| graph.tensors.as_slice())
+        .unwrap_or_default();
+    let gradients = graph.map(gradients_view).unwrap_or_else(|| json!([]));
+    let mut gpu = serde_json::to_value(&evidence.gpu).expect("Nsight evidence is serializable");
+    if let Some(gpu) = gpu.as_object_mut() {
+        gpu.insert(
+            "correlation_capability".into(),
+            serde_json::to_value(&evidence.capabilities.gpu_correlation)
+                .expect("capability is serializable"),
+        );
+        gpu.insert(
+            "provenance_capability".into(),
+            serde_json::to_value(&evidence.capabilities.provenance_binding)
+                .expect("capability is serializable"),
+        );
+    }
     json!({
-        "schema": TRACE_VIEWER_SCHEMA,
+        "schema": SCHEMA,
         "default_view": "evidence",
-        "summary": summary_view(&graph.summary, graph, evidence),
+        "summary": {
+            "entrypoint": evidence.provenance.entrypoint,
+            "phase": evidence.provenance.phase,
+            "outer_wall_time_ns": graph.map(|graph| graph.summary.outer_wall_time_ns),
+            "logical_peak_live_bytes": evidence.memory.logical.as_ref().and_then(|logical| logical.peak.as_ref().map(|peak| peak.live_bytes)),
+            "capture_complete": evidence.health.capture_complete,
+            "structurally_valid": evidence.health.structurally_valid,
+        },
         "views": {
-            "trace": trace_view(graph),
-            "span_costs": span_costs_view(graph),
-            "memory": memory_view(graph),
+            "trace": graph.map(trace_view).unwrap_or_else(|| json!({"nodes": [], "edges": []})),
+            "span_costs": graph.map(span_costs_view).unwrap_or_else(|| json!({"items": []})),
+            "memory": evidence.memory,
             "evidence": {
                 "provenance": evidence.provenance,
                 "health": evidence.health,
+                "capabilities": evidence.capabilities,
                 "findings": evidence.findings,
                 "facts": evidence.facts,
                 "gaps": evidence.gaps,
-                "comparison": evidence.comparison,
-                "tensors": graph.tensors,
-                "gradients": gradients_view(graph),
+                "tensors": tensors,
+                "gradients": gradients,
             },
-            "gpu": evidence.gpu,
+            "gpu": gpu,
         },
-        "span_tree": span_tree_view(graph),
-        "gradients": gradients_view(graph),
-    })
-}
-
-fn summary_view(
-    summary: &GraphSummary,
-    graph: &ExecutionGraph,
-    evidence: &EvidencePacket,
-) -> Value {
-    json!({
-        "entrypoint": summary.entrypoint,
-        "total_ms": summary.total_ms,
-        "phase": evidence.provenance.phase,
-        "slowest_spans": summary.slowest_spans,
-        "heaviest_spans": summary.heaviest_spans,
-        "memory": summary.memory,
-        "peak_breakdown": graph.memory.peak_breakdown,
+        "span_tree": graph.map(span_tree_view).unwrap_or_else(|| json!([])),
+        "gradients": gradients,
     })
 }
 
@@ -61,7 +66,7 @@ fn trace_view(graph: &ExecutionGraph) -> Value {
 }
 
 fn span_costs_view(graph: &ExecutionGraph) -> Value {
-    let mut items: Vec<Value> = graph
+    let mut items = graph
         .spans
         .iter()
         .map(|node| {
@@ -71,32 +76,17 @@ fn span_costs_view(graph: &ExecutionGraph) -> Value {
                 "kind": node_kind_str(&node.kind),
                 "parent_id": node.parent_id,
                 "start_ns": node.start_ns,
-                "self_ms": ns_to_ms(node.self_time_ns),
-                "total_ms": ns_to_ms(node.total_time_ns),
-                "self_time_ns": node.self_time_ns,
-                "total_time_ns": node.total_time_ns,
-                "bytes": node.bytes,
-                "peak_bytes": node.peak_bytes,
-                "storage_bytes": node.storage_bytes,
+                "host_self_time_ns": node.host_self_time_ns,
+                "host_total_time_ns": node.host_total_time_ns,
+                "device_timings": node.device_timings,
+                "allocated_bytes": node.allocated_bytes,
+                "peak_live_bytes": node.peak_live_bytes,
+                "dense_bytes": node.dense_bytes,
             })
         })
-        .collect();
-    items.sort_by(|a, b| {
-        b["total_time_ns"]
-            .as_u64()
-            .unwrap_or(0)
-            .cmp(&a["total_time_ns"].as_u64().unwrap_or(0))
-    });
+        .collect::<Vec<_>>();
+    items.sort_by_key(|item| std::cmp::Reverse(item["host_total_time_ns"].as_u64().unwrap_or(0)));
     json!({ "items": items })
-}
-
-fn memory_view(graph: &ExecutionGraph) -> Value {
-    json!({
-        "summary": graph.memory.summary,
-        "timeline": graph.memory.timeline,
-        "peak_breakdown": graph.memory.peak_breakdown,
-        "by_device": graph.memory.by_device,
-    })
 }
 
 fn span_tree_view(graph: &ExecutionGraph) -> Value {
@@ -104,18 +94,18 @@ fn span_tree_view(graph: &ExecutionGraph) -> Value {
         graph
             .spans
             .iter()
-            .filter(|node| node.kind != GraphNodeKind::Op)
+            .filter(|node| !matches!(node.kind, GraphNodeKind::Op | GraphNodeKind::Tensor))
             .map(|node| {
                 json!({
                     "id": node.id,
                     "parent_id": node.parent_id,
                     "name": node.name,
                     "kind": node_kind_str(&node.kind),
-                    "self_ms": ns_to_ms(node.self_time_ns),
-                    "total_ms": ns_to_ms(node.total_time_ns),
-                    "self_ratio": self_ratio(node),
-                    "bytes": node.bytes,
-                    "peak_bytes": node.peak_bytes,
+                    "host_self_time_ns": node.host_self_time_ns,
+                    "host_total_time_ns": node.host_total_time_ns,
+                    "host_self_ratio": host_self_ratio(node),
+                    "allocated_bytes": node.allocated_bytes,
+                    "peak_live_bytes": node.peak_live_bytes,
                 })
             })
             .collect(),
@@ -127,12 +117,12 @@ fn gradients_view(graph: &ExecutionGraph) -> Value {
         graph
             .gradients
             .iter()
-            .map(|g| {
+            .map(|gradient| {
                 json!({
-                    "root": g.root,
-                    "key": g.key,
-                    "state": format!("{:?}", g.state).to_lowercase(),
-                    "norm": g.norm,
+                    "root": gradient.root,
+                    "key": gradient.key,
+                    "state": format!("{:?}", gradient.state).to_lowercase(),
+                    "norm": gradient.norm,
                 })
             })
             .collect(),
@@ -147,42 +137,47 @@ fn trace_node(node: &GraphNode) -> Value {
         "kind": node_kind_str(&node.kind),
         "parent_id": node.parent_id,
         "start_ns": node.start_ns,
-        "self_time_ns": node.self_time_ns,
-        "total_time_ns": node.total_time_ns,
-        "self_time_ms": ns_to_ms(node.self_time_ns),
-        "total_time_ms": ns_to_ms(node.total_time_ns),
-        "self_ratio": self_ratio(node),
+        "host_self_time_ns": node.host_self_time_ns,
+        "host_total_time_ns": node.host_total_time_ns,
+        "host_self_ratio": host_self_ratio(node),
+        "device_timings": node.device_timings,
         "shape": node.shape,
         "dtype": node.dtype,
         "device": node.device,
-        "bytes": node.bytes,
-        "peak_bytes": node.peak_bytes,
+        "allocated_bytes": node.allocated_bytes,
+        "peak_live_bytes": node.peak_live_bytes,
         "residual_bytes": node.residual_bytes,
-        "storage_bytes": node.storage_bytes,
-        "memory_ratio": memory_ratio(node, node.peak_bytes),
+        "dense_bytes": node.dense_bytes,
     })
 }
 
 fn trace_edge(edge: &GraphEdge) -> Value {
-    let duration_ms = ns_to_ms(edge.duration_ns);
-    let label = edge
-        .label
-        .as_ref()
-        .filter(|s| s.contains("ms"))
-        .cloned()
-        .unwrap_or_else(|| format!("{duration_ms:.2} ms"));
-    json!({
-        "id": format!("{}->{}", edge.from, edge.to),
-        "from": edge.from,
-        "to": edge.to,
-        "kind": match edge.kind {
-            GraphEdgeKind::Call => "call",
-            GraphEdgeKind::Data => "data",
-        },
-        "duration_ns": edge.duration_ns,
-        "duration_ms": duration_ms,
-        "label": label,
-    })
+    match edge {
+        GraphEdge::Call {
+            from_span,
+            to_span,
+            host_duration_ns,
+            label,
+        } => json!({
+            "id": format!("{from_span}->{to_span}"),
+            "from": from_span,
+            "to": to_span,
+            "kind": "call",
+            "host_duration_ns": host_duration_ns,
+            "label": label,
+        }),
+        GraphEdge::Data {
+            from_tensor,
+            to_tensor,
+            label,
+        } => json!({
+            "id": format!("{from_tensor}->{to_tensor}"),
+            "from": from_tensor,
+            "to": to_tensor,
+            "kind": "data",
+            "label": label,
+        }),
+    }
 }
 
 fn node_kind_str(kind: &GraphNodeKind) -> &'static str {
@@ -191,6 +186,7 @@ fn node_kind_str(kind: &GraphNodeKind) -> &'static str {
         GraphNodeKind::Function => "function",
         GraphNodeKind::Module => "module",
         GraphNodeKind::Op => "op",
+        GraphNodeKind::Tensor => "tensor",
         GraphNodeKind::Other => "other",
     }
 }
@@ -199,167 +195,10 @@ fn short_label(name: &str) -> String {
     name.rsplit("::").next().unwrap_or(name).to_string()
 }
 
-fn ns_to_ms(ns: u64) -> f64 {
-    (ns as f64) / 1_000_000.0
-}
-
-fn self_ratio(node: &GraphNode) -> f64 {
-    if node.total_time_ns == 0 {
+fn host_self_ratio(node: &GraphNode) -> f64 {
+    if node.host_total_time_ns == 0 {
         0.0
     } else {
-        node.self_time_ns as f64 / node.total_time_ns as f64
-    }
-}
-
-fn memory_ratio(node: &GraphNode, peak: u64) -> f64 {
-    if peak == 0 {
-        0.0
-    } else {
-        node.peak_bytes as f64 / peak as f64
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::evidence::{EvidencePacket, EVIDENCE_SCHEMA};
-    use crate::graph::{
-        GradientRecord, GradientRecordState, GraphEdge, GraphNode, GraphSummary, HeavySpan,
-        SlowSpan, SCHEMA,
-    };
-    use crate::nsight::NsightEvidence;
-    use crate::trace::memory::MemorySummary;
-    use crate::trace::{EvidenceCoverage, TraceHealth, TraceRunMeta};
-    use std::collections::BTreeMap;
-
-    fn sample_graph() -> ExecutionGraph {
-        ExecutionGraph {
-            schema: SCHEMA.into(),
-            spans: vec![
-                GraphNode {
-                    id: "root".into(),
-                    parent_id: None,
-                    name: "demo::loss".into(),
-                    kind: GraphNodeKind::Root,
-                    start_ns: 0,
-                    self_time_ns: 1_000_000,
-                    total_time_ns: 5_000_000,
-                    shape: None,
-                    dtype: None,
-                    device: None,
-                    bytes: 4096,
-                    peak_bytes: 4096,
-                    residual_bytes: 0,
-                    storage_bytes: None,
-                },
-                GraphNode {
-                    id: "child".into(),
-                    parent_id: Some("root".into()),
-                    name: "forward".into(),
-                    kind: GraphNodeKind::Function,
-                    start_ns: 1_000_000,
-                    self_time_ns: 2_000_000,
-                    total_time_ns: 4_000_000,
-                    shape: None,
-                    dtype: None,
-                    device: None,
-                    bytes: 4096,
-                    peak_bytes: 4096,
-                    residual_bytes: 0,
-                    storage_bytes: None,
-                },
-            ],
-            edges: vec![GraphEdge {
-                from: "root".into(),
-                to: "child".into(),
-                kind: GraphEdgeKind::Call,
-                duration_ns: 4_000_000,
-                label: None,
-            }],
-            tensors: vec![],
-            gradients: vec![GradientRecord {
-                root: "vb".into(),
-                key: "w".into(),
-                state: GradientRecordState::Present,
-                norm: Some(1.0),
-            }],
-            summary: GraphSummary {
-                entrypoint: "demo::loss".into(),
-                total_ms: 5.0,
-                slowest_spans: vec![SlowSpan {
-                    id: "root".into(),
-                    name: "demo::loss".into(),
-                    self_time_ns: 1_000_000,
-                }],
-                heaviest_spans: vec![HeavySpan {
-                    id: "root".into(),
-                    name: "demo::loss".into(),
-                    bytes: 4096,
-                    peak_bytes: 4096,
-                }],
-                memory: MemorySummary {
-                    peak_bytes: 4096,
-                    ..MemorySummary::default()
-                },
-            },
-            memory: crate::trace::memory::MemoryProfile {
-                summary: MemorySummary {
-                    peak_bytes: 4096,
-                    ..MemorySummary::default()
-                },
-                timeline: vec![],
-                peak_breakdown: vec![],
-                by_device: vec![],
-            },
-        }
-    }
-
-    fn sample_evidence() -> EvidencePacket {
-        EvidencePacket {
-            schema: EVIDENCE_SCHEMA.into(),
-            provenance: TraceRunMeta {
-                run_id: "run-1".into(),
-                correlation_id: "demo/update-1".into(),
-                entrypoint: "demo::loss".into(),
-                phase: crate::phase::ExecutionPhase::Train,
-                timestamp: "2026-08-08T00:00:00Z".into(),
-                capture_step: 1,
-                warmup_steps: 0,
-                device: "cpu".into(),
-                measured_region_device_synchronized: false,
-                timing_mode: crate::trace::TimingMode::Host,
-                tags: BTreeMap::new(),
-                candle_version: None,
-            },
-            health: TraceHealth {
-                trusted: true,
-                issues: vec![],
-                coverage: EvidenceCoverage::default(),
-            },
-            findings: vec![],
-            facts: vec![],
-            gaps: vec![],
-            graph: sample_graph(),
-            gpu: NsightEvidence::unavailable("not captured"),
-            comparison: None,
-        }
-    }
-
-    #[test]
-    fn project_emits_viewer4_schema() {
-        let payload = project(&sample_evidence());
-        assert_eq!(payload["schema"], TRACE_VIEWER_SCHEMA);
-        assert_eq!(payload["default_view"], "evidence");
-        assert!(payload["views"]["memory"]["summary"]["peak_bytes"].as_u64() == Some(4096));
-    }
-
-    #[test]
-    fn every_edge_has_duration_ms_label() {
-        let payload = project(&sample_evidence());
-        for edge in payload["views"]["trace"]["edges"].as_array().unwrap() {
-            assert!(edge["duration_ms"].is_number());
-            let label = edge["label"].as_str().unwrap();
-            assert!(label.contains("ms"), "edge label must include ms: {label}");
-        }
+        node.host_self_time_ns as f64 / node.host_total_time_ns as f64
     }
 }

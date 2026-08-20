@@ -18,7 +18,8 @@
 
 ## Agent skills
 
-Matt Pocock engineering skills are installed under `.agents/skills/`. Invoke them with `/skill-name` in Cursor chat.
+Agent skills are installed globally under `~/.agents/skills/`. Invoke them with `/skill-name` in Cursor chat.
+Use the global `/research` skill for the local-memory research workflow.
 
 ### Issue tracker
 
@@ -47,14 +48,10 @@ Standalone HTML visualizer (`src/viewer/`, normally emitted as `viewer.html`). S
 |-------|-------------|
 | `/ui-ux-pro-max` | Color, typography, spacing, accessibility, chart styling, interaction patterns. Use stack `html-tailwind` or general UX domains when querying. |
 | `/web-design-guidelines` | Audit existing viewer HTML/CSS/JS against Vercel Web Interface Guidelines. |
-| `/design-an-interface` | Explore radically different UI layouts or control surfaces (parallel design options). |
+| `/interface-design` | Refine the visualizer's layout hierarchy, controls, states, and design-system consistency. |
 | `/prototype` | Quick throwaway UI variants before committing to the embedded viewer. |
 
 Prefer improving the existing visualizer over introducing a frontend framework.
-
-## Related projects
-
-- Sibling crate used by [Tofy](../Tofy): path dependency for post-run profiling and HTML inspection.
 
 ## Module map
 
@@ -64,6 +61,7 @@ Prefer improving the existing visualizer over introducing a frontend framework.
 | `instrument/` | `TraceSession`, `SpanGuard`, probe API |
 | `graph/` | `ExecutionGraph` from trace events |
 | `evidence.rs` | Unified evidence and baseline comparison packets |
+| `artifact.rs` | Atomic bundle publication and deep verification receipts |
 | `nsight.rs` | Normalize supported official Nsight CSV reports |
 | `cli/trace_cli.rs` | `import`, `view`, `summary`, `query`, `compare`, `report` |
 | `viewer/` | `render_evidence_html` (`candle-graph/viewer/4`) |

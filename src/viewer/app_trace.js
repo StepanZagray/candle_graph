@@ -40,7 +40,7 @@
     return Array.isArray(s) ? s.join(" × ") : String(s);
   }
   function fmtBytes(n) {
-    if (n == null || !Number.isFinite(n) || n <= 0) return "—";
+    if (n == null || !Number.isFinite(n) || n < 0) return "—";
     var b = Number(n);
     if (b >= 1073741824) return (b / 1073741824).toFixed(2) + " GiB";
     if (b >= 1048576) return (b / 1048576).toFixed(2) + " MiB";
@@ -50,6 +50,13 @@
   function fmtNsMs(ns) {
     if (ns == null || !Number.isFinite(ns)) return "—";
     return (Number(ns) / 1e6).toFixed(2) + " ms";
+  }
+  function formatDeviceTimings(timings) {
+    if (!Array.isArray(timings) || !timings.length) return "—";
+    return timings.map(function (timing) {
+      return (timing.device || "device") + " / " + (timing.clock_id || "clock") + ": " +
+        fmtNsMs(timing.busy_ns);
+    }).join(" · ");
   }
   function isScalar(value) {
     return value == null || ["string", "number", "boolean"].includes(typeof value);
@@ -78,8 +85,8 @@
   function statusLabel(value) {
     var status = safeStatus(value);
     var marks = {
-      valid: "✓", trusted: "✓", available: "✓", captured: "✓", complete: "✓",
-      warning: "!", partial: "!", untrusted: "!", invalid: "×", unavailable: "—",
+      valid: "✓", available: "✓", captured: "✓", complete: "✓",
+      warning: "!", partial: "!", failed: "×", invalid: "×", unavailable: "—",
       absent: "—", missing: "—", unknown: "?",
     };
     return '<span class="status-badge status-' + esc(status) + '"><span aria-hidden="true">' +
@@ -88,8 +95,8 @@
 
   function heatColor(n) {
     if (heatMode === "memory") {
-      var peak = (SUM.memory && SUM.memory.peak_bytes) || 1;
-      var ratio = Math.max(0, Math.min(1, (n.peak_bytes || n.bytes || 0) / peak));
+      var peak = SUM.logical_peak_live_bytes || 1;
+      var ratio = Math.max(0, Math.min(1, (n.peak_live_bytes || n.allocated_bytes || 0) / peak));
       var hue = (1 - ratio) * 220;
       return "hsl(" + hue.toFixed(0) + ", 68%, 42%)";
     }
@@ -97,9 +104,9 @@
   }
 
   function heatStroke(n) {
-    var ratio = n.self_ratio;
-    if (ratio == null && n.total_time_ns > 0) {
-      ratio = (n.self_time_ns || 0) / n.total_time_ns;
+    var ratio = n.host_self_ratio;
+    if (ratio == null && n.host_total_time_ns > 0) {
+      ratio = (n.host_self_time_ns || 0) / n.host_total_time_ns;
     }
     ratio = Math.max(0, Math.min(1, ratio || 0));
     var hue = (1 - ratio) * 220;
@@ -142,8 +149,8 @@
     if (!el) return;
     el.textContent = [
       SUM.entrypoint,
-      SUM.total_ms != null ? fmtMs(SUM.total_ms) + " total" : null,
-      SUM.memory && SUM.memory.peak_bytes ? fmtBytes(SUM.memory.peak_bytes) + " peak" : null,
+      SUM.outer_wall_time_ns != null ? fmtNsMs(SUM.outer_wall_time_ns) + " outer wall" : null,
+      SUM.logical_peak_live_bytes != null ? fmtBytes(SUM.logical_peak_live_bytes) + " logical peak" : null,
       SUM.phase || null,
     ].filter(Boolean).join(" · ") || "Trace";
   }
@@ -151,7 +158,8 @@
   function renderPeakBreakdown() {
     var panel = document.getElementById("peak-breakdown");
     if (!panel) return;
-    var rows = (SUM.peak_breakdown || P.views.memory && P.views.memory.peak_breakdown) || [];
+    var logical = P.views.memory && P.views.memory.logical;
+    var rows = logical && logical.peak && logical.peak.live_allocations || [];
     if (!rows.length) {
       panel.innerHTML = "<p class=\"section-empty\">No peak allocations recorded.</p>";
       return;
@@ -159,7 +167,7 @@
     panel.innerHTML =
       '<table><thead><tr><th>Tensor</th><th>Op</th><th>Size</th><th>Shape</th></tr></thead><tbody>' +
       rows.map(function (r) {
-        return "<tr><td>" + esc(r.tensor_id || "") + "</td><td>" + esc(r.op_name || "—") +
+        return "<tr><td>" + esc((r.tensor_ids || []).join(", ")) + "</td><td>" + esc(r.op_name || "—") +
           "</td><td>" + esc(fmtBytes(r.bytes)) + "</td><td>" + esc(fmtShape(r.shape)) + "</td></tr>";
       }).join("") +
       "</tbody></table>";
@@ -173,13 +181,13 @@
     var fields = {
       label: empty ? "Nothing selected" : (o.label || o.name || "—"),
       kind: o.kind || "—",
-      self_time: fmtMs(o.self_time_ms != null ? o.self_time_ms : (o.self_ms != null ? o.self_ms : null)),
-      total_time: fmtMs(o.total_time_ms != null ? o.total_time_ms : (o.total_ms != null ? o.total_ms : null)),
+      self_time: fmtNsMs(o.host_self_time_ns),
+      total_time: fmtNsMs(o.host_total_time_ns),
       shape: fmtShape(o.shape),
       dtype: o.dtype || "—",
-      storage: fmtBytes(o.storage_bytes),
-      peak_bytes: fmtBytes(o.peak_bytes),
-      bytes: fmtBytes(o.bytes),
+      dense: fmtBytes(o.dense_bytes),
+      peak_bytes: fmtBytes(o.peak_live_bytes),
+      bytes: fmtBytes(o.allocated_bytes),
     };
     Object.keys(fields).forEach(function (k) {
       var el = document.querySelector('[data-field="' + k + '"]');
@@ -293,9 +301,12 @@
     if (!items.length) return '<p class="section-empty">' + esc(emptyText) + "</p>";
     return '<ul class="notice-list" role="list">' + items.map(function (item) {
       var record = isScalar(item) ? { message: item } : (item || {});
-      var severity = record.severity || record.status || kind;
+      var severity = record.qualification || record.severity || record.status || kind;
       var title = record.title || record.code || record.name || humanize(severity);
-      var message = record.message || record.detail || record.description || "";
+      var message = record.summary || record.message || record.detail || record.description || "";
+      if (Array.isArray(record.requires) && record.requires.length) {
+        message += (message ? " " : "") + "Requires: " + record.requires.map(humanize).join(", ") + ".";
+      }
       return '<li class="notice notice-' + esc(safeStatus(severity)) + '">' +
         '<div class="notice-title">' + statusLabel(severity) + '<strong>' + esc(title) + '</strong></div>' +
         (message ? '<p>' + esc(message) + "</p>" : "") + "</li>";
@@ -329,26 +340,13 @@
     return html;
   }
 
-  function renderComparison(comparison) {
-    if (!comparison || (typeof comparison === "object" && !Object.keys(comparison).length)) {
-      return '<p class="section-empty">No baseline comparison was requested for this run.</p>';
-    }
-    var rows = comparison.items || comparison.spans || comparison.span_deltas || comparison.deltas || [];
-    var omitted = ["items", "spans", "span_deltas", "deltas", "warnings"];
-    var html = renderKeyValues(comparison, omitted);
-    if (comparison.warnings) html += renderNoticeList(comparison.warnings, "warning", "No comparison warnings.");
-    if (rows.length) html += renderDataTable(rows, "Baseline comparison", 100);
-    return html;
-  }
-
   function renderEvidenceView(data) {
     var panel = panelFor("evidence");
     if (!panel) return;
     var provenance = data.provenance || {};
     var health = data.health || {};
-    var healthStatus = health.status || health.state ||
-      (health.valid === false ? "invalid" : health.trusted === false ? "untrusted" :
-        (health.valid || health.trusted) ? "trusted" : "unknown");
+    var healthStatus = !health.structurally_valid ? "invalid" :
+      (!health.capture_complete ? "failed" : "complete");
     var issues = health.issues || health.problems || [];
     var findings = data.findings || [];
     var gaps = data.gaps || [];
@@ -362,8 +360,12 @@
       renderKeyValues(provenance) + '</section><section class="evidence-card"><h2>Trace health</h2>' +
       renderKeyValues(health, ["status", "state", "summary", "message", "issues", "problems"]) +
       renderNoticeList(issues, "warning", "No health issues were recorded.") + "</section>" +
-      '<section class="evidence-card"><h2>Trusted findings</h2>' +
-      renderNoticeList(findings, "information", "No trusted findings were derived from this profile.") + "</section>" +
+      '<section class="evidence-card evidence-card-wide"><h2>Capability matrix</h2>' +
+      renderDataTable(Object.keys(data.capabilities || {}).map(function (name) {
+        return Object.assign({ capability: name }, data.capabilities[name]);
+      }), "Capabilities", 20) + "</section>" +
+      '<section class="evidence-card"><h2>Qualified findings</h2>' +
+      renderNoticeList(findings, "information", "No findings met their evidence prerequisites.") + "</section>" +
       '<section class="evidence-card"><h2>Evidence gaps</h2>' +
       renderNoticeList(gaps, "missing", "No evidence gaps were reported.") + "</section>" +
       '<section class="evidence-card evidence-card-wide"><h2>Structured facts</h2>' +
@@ -371,28 +373,25 @@
       '<section class="evidence-card evidence-card-wide"><h2>Tensor checkpoints</h2>' +
       renderDataTable(data.tensors, "Tensor checkpoints", 100) + "</section>" +
       '<section class="evidence-card evidence-card-wide"><h2>Gradient evidence</h2>' +
-      renderDataTable(data.gradients, "Gradient evidence", 250) + "</section>" +
-      '<section class="evidence-card evidence-card-wide"><h2>Baseline comparison</h2>' +
-      renderComparison(data.comparison) + "</section></div>";
+      renderDataTable(data.gradients, "Gradient evidence", 250) + "</section></div>";
   }
 
   function renderMemoryView(data) {
     var panel = panelFor("memory");
     if (!panel) return;
-    var timeline = data.timeline || [];
-    var summary = data.summary || {};
+    var logical = data.logical || null;
+    var physical = data.physical || null;
+    var timeline = logical && logical.timeline || [];
+    var peak = logical && logical.peak || null;
     var html = "";
     html += '<div class="view-heading"><div><p class="eyebrow">Allocation evidence</p><h1>Memory</h1></div></div>';
     html += '<p class="view-summary">';
-    html += "Peak: <strong>" + esc(fmtBytes(summary.peak_bytes)) + "</strong>";
-    if (summary.peak_timestamp_ns) html += " @ " + esc(fmtNsMs(summary.peak_timestamp_ns));
-    html += " · allocs " + esc(String(summary.alloc_count || 0));
-    html += " · frees " + esc(String(summary.free_count || 0));
-    if (summary.autograd_retained_bytes) {
-      html += " · autograd retained " + esc(fmtBytes(summary.autograd_retained_bytes));
-    }
+    html += "Logical peak: <strong>" + esc(peak ? fmtBytes(peak.live_bytes) : "unknown") + "</strong>";
+    if (peak) html += " @ " + esc(fmtNsMs(peak.timestamp_ns));
+    html += " · storage allocs " + esc(logical ? String(logical.storage_allocation_count) : "unknown");
+    html += " · matched frees " + esc(logical ? String(logical.matched_storage_free_count) : "unknown");
     html += "</p>";
-    var cats = summary.peak_by_category || {};
+    var cats = peak && peak.live_bytes_by_category || {};
     var catKeys = Object.keys(cats);
     if (catKeys.length) {
       html += "<p style=\"font-size:11px;margin:0 0 8px;color:var(--muted)\">Peak by category: ";
@@ -400,7 +399,8 @@
       html += "</p>";
     }
     if (!timeline.length) {
-      html += '<div class="content-empty" role="status"><strong>No memory timeline</strong><p>No allocation events were captured for this run.</p></div>';
+      html += '<div class="content-empty" role="status"><strong>Logical memory unknown</strong><p>No storage-lifetime events were captured; zero is not inferred.</p></div>';
+      if (physical) html += '<h2>Physical device samples</h2>' + renderDataTable(physical.by_device, "Physical device memory", 100);
       panel.innerHTML = html;
       return;
     }
@@ -421,12 +421,13 @@
     html += '<text x="' + (w - pad) + '" y="' + (h - 8) + '" fill="var(--muted)" font-size="10" text-anchor="end">' + esc(fmtNsMs(maxTs)) + "</text>";
     html += '<text x="8" y="' + pad + '" fill="var(--muted)" font-size="10">' + esc(fmtBytes(maxLive)) + "</text>";
     html += "</svg>";
-    html += '<div class="table-wrap"><table class="timeline-table"><caption class="sr">Memory timeline events</caption><thead><tr><th scope="col">Time</th><th scope="col">Device</th><th scope="col">Live</th><th scope="col">Heap</th></tr></thead><tbody>';
+    html += '<div class="table-wrap"><table class="timeline-table"><caption class="sr">Logical memory timeline</caption><thead><tr><th scope="col">Time</th><th scope="col">Live</th><th scope="col">By device</th><th scope="col">By category</th></tr></thead><tbody>';
     html += timeline.slice(-100).map(function (p) {
-      return "<tr><td>" + esc(fmtNsMs(p.timestamp_ns)) + "</td><td>" + esc(p.device || "") +
-        "</td><td>" + esc(fmtBytes(p.live_bytes)) + "</td><td>" + esc(fmtBytes(p.heap_bytes)) + "</td></tr>";
+      return "<tr><td>" + esc(fmtNsMs(p.timestamp_ns)) + "</td><td>" + esc(fmtBytes(p.live_bytes)) +
+        "</td><td>" + esc(fmtValue(p.live_bytes_by_device)) + "</td><td>" + esc(fmtValue(p.live_bytes_by_category)) + "</td></tr>";
     }).join("");
     html += "</tbody></table></div>";
+    html += '<h2>Physical device samples</h2>' + (physical ? renderDataTable(physical.by_device, "Physical device memory", 100) : '<p class="section-empty">No physical device-memory samples were captured.</p>');
     panel.innerHTML = html;
   }
 
@@ -442,12 +443,13 @@
     panel.innerHTML =
       '<div class="view-heading"><div><p class="eyebrow">Aggregated semantic work</p><h1>Span costs</h1></div><p>' +
       items.length + ' measured spans</p></div><div class="table-wrap"><table class="timeline-table span-cost-table"><caption class="sr">Span cost ranking</caption>' +
-      '<thead><tr><th scope="col">Span</th><th scope="col">Kind</th><th scope="col">Self</th><th scope="col">Total</th><th scope="col">Memory</th></tr></thead><tbody>' +
+      '<thead><tr><th scope="col">Span</th><th scope="col">Kind</th><th scope="col">Host self</th><th scope="col">Host total</th><th scope="col">Device busy</th><th scope="col">Memory</th></tr></thead><tbody>' +
       items.map(function (it) {
         return '<tr data-id="' + esc(idStr(it.id)) + '"><td><button type="button" class="table-row-action" data-span-cost-id="' +
           esc(idStr(it.id)) + '">' + esc(it.name) + '</button></td><td>' + esc(it.kind || "") +
-          "</td><td>" + esc(fmtMs(it.self_ms)) + "</td><td>" + esc(fmtMs(it.total_ms)) +
-          "</td><td>" + esc(fmtBytes(it.peak_bytes || it.bytes)) + "</td></tr>";
+          "</td><td>" + esc(fmtNsMs(it.host_self_time_ns)) + "</td><td>" + esc(fmtNsMs(it.host_total_time_ns)) +
+          "</td><td>" + esc(formatDeviceTimings(it.device_timings)) + "</td><td>" +
+          esc(fmtBytes(it.peak_live_bytes != null ? it.peak_live_bytes : it.allocated_bytes)) + "</td></tr>";
       }).join("") +
       "</tbody></table></div>";
     panel.querySelectorAll("[data-span-cost-id]").forEach(function (button) {
@@ -470,16 +472,22 @@
   function renderGpuView(data) {
     var panel = panelFor("gpu");
     if (!panel) return;
-    var status = data.status || (data.available ? "available" : "unavailable");
-    var available = data.available === true || ["available", "captured", "complete"].includes(safeStatus(status));
-    var sources = Array.isArray(data.source_csv) ? data.source_csv : (data.source_csv ? [data.source_csv] : []);
-    var sourceHtml = '<dl class="key-values source-list"><div><dt>Raw report</dt><dd>' + esc(data.raw_report || "Not retained") +
-      '</dd></div><div><dt>Normalized CSV</dt><dd>' + esc(sources.length ? sources.join(", ") : "Not available") + "</dd></div></dl>";
+    var correlationLevel = safeStatus((data.correlation_capability || {}).level);
+    var provenanceLevel = safeStatus((data.provenance_capability || {}).level);
+    var capabilityLevels = [correlationLevel, provenanceLevel];
+    var status = capabilityLevels.includes("invalid") ? "invalid" :
+      capabilityLevels.includes("unavailable") ? "unavailable" :
+      capabilityLevels.includes("partial") ? "partial" :
+      (data.status || (data.available ? "available" : "unavailable"));
+    var available = safeStatus(data.status) === "available";
+    var sources = Array.isArray(data.source_csv) ? data.source_csv : [];
+    var artifacts = (data.raw_report ? [data.raw_report] : []).concat(sources);
+    var sourceHtml = renderDataTable(artifacts, "Hashed Nsight artifacts", 250);
     var html = '<div class="view-heading"><div><p class="eyebrow">Nsight Systems correlation</p><h1>GPU evidence</h1></div>' +
       statusLabel(status) + "</div>";
-    var trustHtml = '<section class="evidence-card gpu-sources"><h2>Coverage and correlation trust</h2>' +
-      renderKeyValues({ coverage: data.coverage, correlation: data.correlation, limits: data.limits }) +
-      renderNoticeList(data.diagnostics, "warning", "No normalization diagnostics.") + "</section>";
+    var trustHtml = '<section class="evidence-card gpu-sources"><h2>Coverage, provenance, and correlation</h2>' +
+      renderKeyValues({ correlation_capability: data.correlation_capability, provenance_capability: data.provenance_capability, provenance: data.provenance, coverage: data.coverage, correlation: data.correlation, limits: data.limits }) +
+      renderNoticeList((data.diagnostics || []).concat(data.provenance && data.provenance.diagnostics || []), "warning", "No normalization diagnostics.") + "</section>";
     if (!available) {
       html += '<div class="gpu-empty" role="status"><div class="gpu-empty-mark" aria-hidden="true">GPU</div>' +
         '<div><h2>GPU evidence is not available</h2><p>' + esc(data.reason || "This profile was captured without Nsight Systems evidence.") +
@@ -489,6 +497,7 @@
     }
     html += '<section class="evidence-card gpu-sources"><h2>Capture sources</h2>' + sourceHtml + "</section>" + trustHtml;
     [
+      ["Phase GPU attribution", data.phase_attribution],
       ["NVTX projected ranges", data.nvtx_ranges],
       ["CUDA kernels", data.kernels],
       ["CUDA runtime calls", data.runtime_calls],
@@ -513,7 +522,7 @@
       (byParent[p] = byParent[p] || []).push(s);
     });
     Object.keys(byParent).forEach(function (k) {
-      byParent[k].sort(function (a, b) { return (b.total_ms || 0) - (a.total_ms || 0); });
+      byParent[k].sort(function (a, b) { return (b.host_total_time_ns || 0) - (a.host_total_time_ns || 0); });
     });
     if (!spanOpen.size && byParent[rootKey]) {
       byParent[rootKey].forEach(function (s) { spanOpen.add(idStr(s.id)); });
@@ -565,8 +574,8 @@
           row.appendChild(name);
           var ms = document.createElement("span");
           ms.className = "span-ms";
-          ms.textContent = fmtMs(s.self_ms) + " / " + fmtMs(s.total_ms) +
-            (s.peak_bytes || s.bytes ? " · " + fmtBytes(s.peak_bytes || s.bytes) : "");
+          ms.textContent = fmtNsMs(s.host_self_time_ns) + " / " + fmtNsMs(s.host_total_time_ns) +
+            (s.peak_live_bytes || s.allocated_bytes ? " · " + fmtBytes(s.peak_live_bytes || s.allocated_bytes) : "");
           row.appendChild(ms);
           function activate() {
             tree.querySelectorAll("[aria-selected=true]").forEach(function (x) {
@@ -694,8 +703,8 @@
     var r = wrap.getBoundingClientRect();
     tooltip.innerHTML =
       '<div class="tt-title">' + esc(n.label || n.name || "") + "</div>" +
-      '<div class="tt-meta">self ' + esc(fmtMs(n.self_time_ms)) + " · total " + esc(fmtMs(n.total_time_ms)) +
-      (n.peak_bytes || n.bytes ? " · " + esc(fmtBytes(n.peak_bytes || n.bytes)) : "") + "</div>";
+      '<div class="tt-meta">host self ' + esc(fmtNsMs(n.host_self_time_ns)) + " · host total " + esc(fmtNsMs(n.host_total_time_ns)) +
+      (n.peak_live_bytes || n.allocated_bytes ? " · " + esc(fmtBytes(n.peak_live_bytes || n.allocated_bytes)) : "") + "</div>";
     tooltip.classList.add("visible");
     var tx = Math.min(clientX - r.left + 12, r.width - tooltip.offsetWidth - 8);
     var ty = Math.min(clientY - r.top + 12, r.height - tooltip.offsetHeight - 8);
@@ -710,8 +719,8 @@
   function buildNodeBody(n) {
     var kind = n.kind || "function";
     var lines = n._titleLines || [CGLayout.labelOf(n)];
-    var sub = n._sub || (fmtMs(n.self_time_ms) + " self · " + fmtMs(n.total_time_ms) + " total" +
-      (n.peak_bytes || n.bytes ? " · " + fmtBytes(n.peak_bytes || n.bytes) : ""));
+    var sub = n._sub || (fmtNsMs(n.host_self_time_ns) + " host self · " + fmtNsMs(n.host_total_time_ns) + " host total" +
+      (n.peak_live_bytes || n.allocated_bytes ? " · " + fmtBytes(n.peak_live_bytes || n.allocated_bytes) : ""));
     var html = '<div class="nb-head"><span class="nb-kind">' + esc(kind) + "</span></div>";
     html += lines.map(function (l) { return '<div class="nb-title">' + esc(l) + "</div>"; }).join("");
     html += '<div class="nb-sub">' + esc(sub) + "</div>";
@@ -743,7 +752,7 @@
         _id: String(e.id != null ? e.id : "e" + i),
         _from: idStr(e.from),
         _to: idStr(e.to),
-        label: e.label || (e.duration_ms != null ? fmtMs(e.duration_ms) : ""),
+        label: e.label || (e.kind === "call" && e.host_duration_ns ? fmtNsMs(e.host_duration_ns) : ""),
       });
     });
 
@@ -839,7 +848,7 @@
         g.appendChild(hit);
         g.appendChild(p);
 
-        var label = e.label || (e.duration_ms != null ? fmtMs(e.duration_ms) : "");
+        var label = e.label || (e.kind === "call" && e.host_duration_ns ? fmtNsMs(e.host_duration_ns) : "");
         if (label) {
           var mid = CGLayout.edgeMidpoint(e);
           if (mid) {
@@ -862,8 +871,8 @@
         gg.dataset.nodeId = n._id;
         gg.setAttribute("tabindex", "0");
         gg.setAttribute("role", "button");
-        gg.setAttribute("aria-label", (n.label || n.name || "Span") + ", self " +
-          fmtMs(n.self_time_ms) + ", total " + fmtMs(n.total_time_ms));
+        gg.setAttribute("aria-label", (n.label || n.name || "Span") + ", host self " +
+          fmtNsMs(n.host_self_time_ns) + ", host total " + fmtNsMs(n.host_total_time_ns));
 
         var card = document.createElementNS(NS, "rect");
         card.setAttribute("class", "node-card");

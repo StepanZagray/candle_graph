@@ -1,4 +1,4 @@
-//! Representative-run profiler session — emits `candle-graph/trace/6` JSONL.
+//! Representative-run profiler session — emits `candle-graph/trace/7` JSONL.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -10,16 +10,21 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+use crate::capability::CaptureContract;
 use crate::phase::ExecutionPhase;
 use crate::trace::events::{
-    DeviceMemoryEvent, GradientEvent, MemoryEvent, OpEvent, SpanEndEvent, SpanStartEvent,
-    TensorEvent, TraceEvent,
+    DeviceIntervalEvent, DeviceMemoryEvent, EdgeEvent, GradientEvent, MemoryEvent, OpEvent,
+    SpanEndEvent, SpanStartEvent, TensorEvent, TerminalEvent, TraceEvent,
 };
-use crate::trace::memory::category_for_step;
-use crate::trace::memory::{resolve_storage_bytes, MemoryAction};
-use crate::trace::schema::{GradientState, TimingMode, TraceRunMeta};
+use crate::trace::memory::{resolve_dense_tensor_bytes, MemoryAction};
+use crate::trace::schema::{
+    ComparisonIdentity, GradientState, RunOutcome, TimingMode, TraceRunMeta,
+};
 
-use super::span::{MemoryRecord, OpRecord, SpanGuard, SpanId, SpanKind, TensorRecord};
+use super::span::{
+    DeviceIntervalRecord, DeviceMemoryRecord, MemoryRecord, OpRecord, SpanGuard, SpanId, SpanKind,
+    TensorRecord,
+};
 
 /// Streaming trace session writing TensorFlow-Profiler-style span JSONL.
 pub struct TraceSession {
@@ -39,6 +44,8 @@ pub struct ProfileRun {
     pub device: String,
     pub measured_region_device_synchronized: bool,
     pub timing_mode: TimingMode,
+    pub capture_contract: CaptureContract,
+    pub comparison_identity: Option<ComparisonIdentity>,
     pub tags: BTreeMap<String, String>,
 }
 
@@ -58,6 +65,8 @@ impl ProfileRun {
             device: device.into(),
             measured_region_device_synchronized: false,
             timing_mode: TimingMode::Host,
+            capture_contract: CaptureContract::default(),
+            comparison_identity: None,
             tags: BTreeMap::new(),
         }
     }
@@ -84,12 +93,42 @@ impl ProfileRun {
         self.measured_region_device_synchronized = true;
         self
     }
+
+    pub fn inference(
+        entrypoint: impl Into<String>,
+        capture_step: u64,
+        device: impl Into<String>,
+    ) -> Self {
+        let entrypoint = entrypoint.into();
+        Self {
+            correlation_id: format!("{entrypoint}/inference-{capture_step}"),
+            entrypoint,
+            phase: ExecutionPhase::Infer,
+            capture_step,
+            warmup_steps: capture_step.saturating_sub(1),
+            device: device.into(),
+            measured_region_device_synchronized: false,
+            timing_mode: TimingMode::Host,
+            capture_contract: CaptureContract::default(),
+            comparison_identity: None,
+            tags: BTreeMap::new(),
+        }
+    }
+
+    pub fn capture_contract(mut self, contract: CaptureContract) -> Self {
+        self.capture_contract = contract;
+        self
+    }
+
+    pub fn comparison_identity(mut self, identity: ComparisonIdentity) -> Self {
+        self.comparison_identity = Some(identity);
+        self
+    }
 }
 
 struct SessionInner {
     writer: io::BufWriter<File>,
     span_stack: Vec<u64>,
-    span_steps: Vec<Option<crate::phase::ExecutionStep>>,
     next_span_id: u64,
     next_event_id: u64,
     id_buf: String,
@@ -128,6 +167,8 @@ impl TraceSession {
             device: run.device,
             measured_region_device_synchronized: run.measured_region_device_synchronized,
             timing_mode: run.timing_mode,
+            capture_contract: run.capture_contract,
+            comparison_identity: run.comparison_identity,
             tags: run.tags,
             candle_version: None,
         };
@@ -149,7 +190,6 @@ impl TraceSession {
             inner: RefCell::new(SessionInner {
                 writer,
                 span_stack: vec![1],
-                span_steps: vec![None],
                 next_span_id: 1,
                 next_event_id: 0,
                 id_buf: String::with_capacity(24),
@@ -212,22 +252,12 @@ impl TraceSession {
         }
 
         inner.span_stack.push(span_id);
-        inner.span_steps.push(step);
 
         SpanGuard {
             session: self,
             id: SpanId(span_id),
             started,
         }
-    }
-
-    fn current_step(&self) -> Option<crate::phase::ExecutionStep> {
-        self.inner
-            .borrow()
-            .span_steps
-            .iter()
-            .rev()
-            .find_map(|step| *step)
     }
 
     pub(crate) fn end_span(&self, id: SpanId, duration_ns: u64) -> Result<()> {
@@ -244,7 +274,6 @@ impl TraceSession {
             expected
         );
         inner.span_stack.pop();
-        inner.span_steps.pop();
 
         format_span_id(&mut inner.id_buf, id.0);
         let span_id = inner.id_buf.clone();
@@ -272,15 +301,13 @@ impl TraceSession {
 
     /// Record a timed op observation attached to `span_id`.
     pub fn record_op(&self, span_id: SpanId, op: OpRecord<'_>) -> Result<()> {
-        let storage_bytes = resolve_storage_bytes(op.storage_bytes, op.shape, op.dtype);
+        let output_dense_bytes =
+            resolve_dense_tensor_bytes(op.output_dense_bytes, op.shape, op.dtype);
         let timestamp_ns = if op.timestamp_ns > 0 {
             op.timestamp_ns
         } else {
-            self.elapsed_ns()
+            self.elapsed_ns().saturating_sub(op.duration_ns)
         };
-        let category = op
-            .category
-            .unwrap_or_else(|| category_for_step(self.current_step(), false));
         {
             let mut inner = self.inner.borrow_mut();
             write_event(
@@ -295,30 +322,31 @@ impl TraceSession {
                     device: op.device.into(),
                     duration_ns: op.duration_ns,
                     timestamp_ns,
-                    storage_bytes: Some(storage_bytes),
-                    input_storage_bytes: op.input_storage_bytes,
+                    output_dense_bytes,
+                    input_dense_bytes: op.input_dense_bytes,
                 }),
             )?;
         }
 
-        let _ = category;
         Ok(())
     }
 
-    /// Record tensor metadata and an allocation event.
+    /// Record tensor metadata. Logical allocation lifetimes require explicit memory events.
     pub fn record_tensor(&self, span_id: SpanId, tensor: TensorRecord<'_>) -> Result<()> {
-        let storage_bytes = resolve_storage_bytes(tensor.storage_bytes, tensor.shape, tensor.dtype);
+        let dense_bytes =
+            resolve_dense_tensor_bytes(tensor.dense_bytes, tensor.shape, tensor.dtype);
         let mut inner = self.inner.borrow_mut();
         write_event(
             &mut inner.writer,
             &TraceEvent::Tensor(TensorEvent {
                 span_id: span_id_string(span_id.0),
                 tensor_id: tensor.tensor_id.into(),
+                label: tensor.label.map(str::to_string),
                 shape: tensor.shape.to_vec(),
                 dtype: tensor.dtype.into(),
                 device: tensor.device.into(),
                 requires_grad: tensor.requires_grad,
-                storage_bytes: Some(storage_bytes),
+                dense_bytes,
                 category: tensor.category,
             }),
         )?;
@@ -333,6 +361,7 @@ impl TraceSession {
             &mut inner.writer,
             &TraceEvent::Memory(MemoryEvent {
                 timestamp_ns,
+                storage_id: mem.storage_id.into(),
                 tensor_id: mem.tensor_id.into(),
                 span_id: span_id_string(span_id.0),
                 op_name: mem.op_name.map(str::to_string),
@@ -354,6 +383,7 @@ impl TraceSession {
             &mut inner.writer,
             &TraceEvent::Memory(MemoryEvent {
                 timestamp_ns,
+                storage_id: mem.storage_id.into(),
                 tensor_id: mem.tensor_id.into(),
                 span_id: span_id_string(span_id.0),
                 op_name: mem.op_name.map(str::to_string),
@@ -368,23 +398,76 @@ impl TraceSession {
     }
 
     /// Record a device-level memory checkpoint (cudaMemGetInfo-style).
-    pub fn record_device_memory(
-        &self,
-        device: impl Into<String>,
-        used_bytes: u64,
-        free_bytes: u64,
-        timestamp_ns: Option<u64>,
-    ) -> Result<()> {
-        let timestamp_ns = timestamp_ns.unwrap_or_else(|| self.elapsed_ns());
+    pub fn record_device_memory(&self, sample: DeviceMemoryRecord<'_>) -> Result<()> {
+        anyhow::ensure!(
+            sample.used_bytes.is_some()
+                || sample.free_bytes.is_some()
+                || sample.reserved_bytes.is_some()
+                || sample.capacity_bytes.is_some(),
+            "device-memory checkpoint must contain at least one observation"
+        );
+        let timestamp_ns = sample.timestamp_ns.unwrap_or_else(|| self.elapsed_ns());
         let mut inner = self.inner.borrow_mut();
         write_event(
             &mut inner.writer,
             &TraceEvent::DeviceMemory(DeviceMemoryEvent {
                 timestamp_ns,
-                device: device.into(),
-                used_bytes,
-                free_bytes,
-                reserved_bytes: None,
+                device: sample.device.into(),
+                used_bytes: sample.used_bytes,
+                free_bytes: sample.free_bytes,
+                reserved_bytes: sample.reserved_bytes,
+                capacity_bytes: sample.capacity_bytes,
+            }),
+        )
+    }
+
+    pub fn record_device_interval(
+        &self,
+        span_id: SpanId,
+        interval: DeviceIntervalRecord<'_>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            interval.duration_ns > 0,
+            "device interval duration must be positive"
+        );
+        let mut inner = self.inner.borrow_mut();
+        write_event(
+            &mut inner.writer,
+            &TraceEvent::DeviceInterval(DeviceIntervalEvent {
+                span_id: span_id_string(span_id.0),
+                device: interval.device.into(),
+                stream_id: interval.stream_id.into(),
+                clock_id: interval.clock_id.into(),
+                backend: interval.backend.into(),
+                start_ns: interval.start_ns,
+                duration_ns: interval.duration_ns,
+            }),
+        )
+    }
+
+    pub fn record_call_edge(&self, from: SpanId, to: SpanId, duration_ns: u64) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        write_event(
+            &mut inner.writer,
+            &TraceEvent::Edge(EdgeEvent::Call {
+                from_span: span_id_string(from.0),
+                to_span: span_id_string(to.0),
+                host_duration_ns: duration_ns,
+            }),
+        )
+    }
+
+    pub fn record_data_edge(&self, from_tensor: &str, to_tensor: &str) -> Result<()> {
+        anyhow::ensure!(
+            !from_tensor.is_empty() && !to_tensor.is_empty(),
+            "data-edge tensor IDs cannot be empty"
+        );
+        let mut inner = self.inner.borrow_mut();
+        write_event(
+            &mut inner.writer,
+            &TraceEvent::Edge(EdgeEvent::Data {
+                from_tensor: from_tensor.into(),
+                to_tensor: to_tensor.into(),
             }),
         )
     }
@@ -434,7 +517,6 @@ impl TraceSession {
                 inner.span_stack.len().saturating_sub(1)
             );
             inner.span_stack.pop();
-            inner.span_steps.pop();
             write_event(
                 &mut inner.writer,
                 &TraceEvent::SpanEnd(SpanEndEvent {
@@ -442,9 +524,39 @@ impl TraceSession {
                     duration_ns,
                 }),
             )?;
+            write_event(
+                &mut inner.writer,
+                &TraceEvent::Terminal(TerminalEvent {
+                    outcome: RunOutcome::Complete,
+                    timestamp_ns: duration_ns,
+                    reason: None,
+                }),
+            )?;
             inner.writer.flush().context("flushing trace JSONL")?;
         }
         Ok(self.path)
+    }
+
+    /// Finalize a diagnosable partial trace without presenting it as complete evidence.
+    pub fn finish_failed(self, reason: impl Into<String>) -> Result<PathBuf> {
+        let reason = reason.into();
+        anyhow::ensure!(!reason.trim().is_empty(), "failure reason cannot be empty");
+        let timestamp_ns = self.elapsed_ns();
+        let mut inner = self.inner.borrow_mut();
+        write_event(
+            &mut inner.writer,
+            &TraceEvent::Terminal(TerminalEvent {
+                outcome: RunOutcome::Failed,
+                timestamp_ns,
+                reason: Some(reason),
+            }),
+        )?;
+        inner
+            .writer
+            .flush()
+            .context("flushing failed trace JSONL")?;
+        drop(inner);
+        Ok(self.path.clone())
     }
 }
 
@@ -583,9 +695,8 @@ mod tests {
                     device: "cpu",
                     duration_ns: 1200,
                     timestamp_ns: 0,
-                    storage_bytes: None,
-                    input_storage_bytes: 0,
-                    category: None,
+                    output_dense_bytes: None,
+                    input_dense_bytes: 0,
                 },
             )
             .unwrap();
@@ -617,7 +728,7 @@ mod tests {
         let doc = parse_trace(&path).unwrap();
         assert_eq!(doc.run.entrypoint, "model::forward");
         assert_eq!(doc.ops.len(), 1);
-        assert_eq!(doc.ops[0].storage_bytes, Some(8 * 8 * 4));
+        assert_eq!(doc.ops[0].output_dense_bytes, Some(8 * 8 * 4));
         assert!(
             doc.memory.is_empty(),
             "op metadata must not fabricate tensor lifetime"

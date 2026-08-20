@@ -4,7 +4,8 @@ Follow the repository instructions in [`AGENTS.md`](AGENTS.md).
 
 ## Agent skills
 
-Matt Pocock engineering skills are installed under `.agents/skills/`. Invoke them with `/skill-name` in Cursor chat.
+Agent skills are installed globally under `~/.agents/skills/`. Invoke them with `/skill-name` in Cursor chat.
+The global `/research` skill uses the local-memory research library rather than writing new research into this repository by default.
 
 ### Issue tracker
 
@@ -16,4 +17,4 @@ Single-context layout: `CONTEXT.md` at the repo root and ADRs under `docs/adr/`.
 
 ### UI / UX
 
-HTML visualizer work: see the **UI / UX** section in [`AGENTS.md`](AGENTS.md). Key skills: `/ui-ux-pro-max`, `/web-design-guidelines`, `/design-an-interface`, `/prototype`.
+HTML visualizer work: see the **UI / UX** section in [`AGENTS.md`](AGENTS.md). Key skills: `/ui-ux-pro-max`, `/web-design-guidelines`, `/interface-design`, `/prototype`.

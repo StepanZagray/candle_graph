@@ -340,13 +340,12 @@ html, body {
   white-space: nowrap;
 }
 .status-valid,
-.status-trusted,
 .status-available,
 .status-captured,
 .status-complete { color: var(--success); border-color: color-mix(in srgb, var(--success) 38%, var(--border)); }
 .status-warning,
-.status-partial,
-.status-untrusted { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 42%, var(--border)); }
+.status-partial { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 42%, var(--border)); }
+.status-failed,
 .status-invalid { color: var(--hazard); border-color: color-mix(in srgb, var(--hazard) 42%, var(--border)); }
 .evidence-grid {
   display: grid;
@@ -405,8 +404,8 @@ html, body {
   background: var(--bg);
 }
 .notice-warning,
-.notice-partial,
-.notice-untrusted { border-left-color: var(--warning); }
+.notice-partial { border-left-color: var(--warning); }
+.notice-failed,
 .notice-invalid,
 .notice-error { border-left-color: var(--hazard); }
 .notice-missing,

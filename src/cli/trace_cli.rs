@@ -1,220 +1,163 @@
-//! Evidence CLI engine (`import`, `view`, `summary`, `query`, `compare`, `report`).
+//! Evidence CLI engine for trace/7, evidence/2, comparison/2, and atomic bundles.
+
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use std::path::Path;
 
-use crate::evidence::{build_evidence, compare_documents, EvidencePacket};
-use crate::graph::{ExecutionGraph, GraphNode};
+use crate::artifact::{publish_bundle, verify_bundle};
+use crate::comparison::compare_replicates;
+use crate::evidence::{build_evidence, EvidencePacket};
+use crate::graph::{ExecutionGraph, GraphNode, GraphNodeKind};
 use crate::trace::parse_trace;
 
-/// Bounded query kinds for trace-derived execution graphs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceQueryKind {
-    Slowest,
+    SlowestHost,
+    SlowestDevice,
     Heaviest,
     Memory,
-    Efficiency,
     Spans,
     Tensors,
     Gradients,
+    Capabilities,
 }
 
-/// Parse a trace and build its bounded application evidence.
 pub fn load_evidence(trace_path: &Path) -> Result<EvidencePacket> {
-    build_evidence(trace_path, None, None)
+    build_evidence(trace_path, None)
 }
 
-/// `import` — emit the full evidence packet JSON.
 pub fn run_import(trace_path: &Path, output: Option<&Path>) -> Result<()> {
     let evidence = load_evidence(trace_path)?;
-    let rendered = serde_json::to_string_pretty(&evidence)? + "\n";
-    super::write_output(output, rendered.as_bytes())
+    super::write_output(
+        output,
+        (serde_json::to_string_pretty(&evidence)? + "\n").as_bytes(),
+    )
 }
 
-/// `summary` — emit provenance, health, gaps, and graph summary JSON.
 pub fn run_summary(trace_path: &Path, output: Option<&Path>) -> Result<()> {
     let evidence = load_evidence(trace_path)?;
     let rendered = serde_json::to_string_pretty(&serde_json::json!({
-        "schema": "candle-graph/summary/1",
+        "schema": "candle-graph/summary/2",
         "provenance": evidence.provenance,
         "health": evidence.health,
+        "capabilities": evidence.capabilities,
         "findings": evidence.findings,
         "gaps": evidence.gaps,
-        "summary": evidence.graph.summary,
+        "summary": evidence.graph.as_ref().map(|graph| &graph.summary),
+        "timing": evidence.timing,
+        "memory": evidence.memory,
     }))? + "\n";
     super::write_output(output, rendered.as_bytes())
 }
 
-/// `query` — emit a bounded slice of graph facts.
 pub fn run_query(trace_path: &Path, kind: TraceQueryKind, output: Option<&Path>) -> Result<()> {
     let evidence = load_evidence(trace_path)?;
-    let graph = &evidence.graph;
-    let payload = match kind {
-        TraceQueryKind::Slowest => query_slowest(graph),
-        TraceQueryKind::Heaviest => query_heaviest(graph),
-        TraceQueryKind::Memory => query_memory(graph),
-        TraceQueryKind::Efficiency => query_efficiency(graph),
-        TraceQueryKind::Spans => query_spans(graph),
-        TraceQueryKind::Tensors => query_tensors(graph),
-        TraceQueryKind::Gradients => query_gradients(graph),
+    let result = match kind {
+        TraceQueryKind::Memory => serde_json::to_value(&evidence.memory)?,
+        TraceQueryKind::Capabilities => serde_json::to_value(&evidence.capabilities)?,
+        other => {
+            let graph = evidence
+                .graph
+                .as_ref()
+                .context("query requires a complete, structurally valid capture")?;
+            query_graph(graph, other)
+        }
     };
-    let payload = serde_json::json!({
-        "health": evidence.health,
-        "gaps": evidence.gaps,
-        "result": payload,
-    });
-    let rendered = serde_json::to_string_pretty(&payload)? + "\n";
+    let rendered = serde_json::to_string_pretty(&serde_json::json!({
+        "schema": "candle-graph/trace-query/2",
+        "kind": format!("{kind:?}").to_ascii_lowercase(),
+        "capabilities": evidence.capabilities,
+        "result": result,
+    }))? + "\n";
     super::write_output(output, rendered.as_bytes())
 }
 
-/// `view` — render standalone HTML from a trace (requires `visualizer` feature).
 #[cfg(feature = "visualizer")]
-pub fn run_view(
-    trace_path: &Path,
-    output: &Path,
-    baseline: Option<&Path>,
-    nsight_dir: Option<&Path>,
+pub fn run_view(trace_path: &Path, output: &Path, nsight_dir: Option<&Path>) -> Result<()> {
+    let evidence = build_evidence(trace_path, nsight_dir)?;
+    super::write_output(
+        Some(output),
+        crate::viewer::render_evidence_html(&evidence).as_bytes(),
+    )
+}
+
+pub fn run_compare(
+    baseline: &[PathBuf],
+    candidate: &[PathBuf],
+    output: Option<&Path>,
 ) -> Result<()> {
-    let evidence = build_evidence(trace_path, baseline, nsight_dir)?;
-    let html = crate::viewer::render_evidence_html(&evidence);
-    super::write_output(Some(output), html.as_bytes())
+    let parse_all = |paths: &[PathBuf], cohort: &str| -> Result<Vec<_>> {
+        paths
+            .iter()
+            .map(|path| {
+                parse_trace(path).with_context(|| format!("parse {cohort} {}", path.display()))
+            })
+            .collect()
+    };
+    let comparison = compare_replicates(
+        &parse_all(baseline, "baseline")?,
+        &parse_all(candidate, "candidate")?,
+    );
+    super::write_output(
+        output,
+        (serde_json::to_string_pretty(&comparison)? + "\n").as_bytes(),
+    )
 }
 
-/// `compare` — aggregate repeated semantic spans and compare candidate to baseline.
-pub fn run_compare(baseline: &Path, candidate: &Path, output: Option<&Path>) -> Result<()> {
-    let baseline_doc =
-        parse_trace(baseline).with_context(|| format!("parse baseline {}", baseline.display()))?;
-    let candidate_doc = parse_trace(candidate)
-        .with_context(|| format!("parse candidate {}", candidate.display()))?;
-    let comparison = compare_documents(&baseline_doc, &candidate_doc);
-    let rendered = serde_json::to_string_pretty(&comparison)? + "\n";
-    super::write_output(output, rendered.as_bytes())
+pub fn run_report(trace: &Path, nsight_dir: Option<&Path>, bundle: &Path) -> Result<()> {
+    publish_bundle(bundle, trace, nsight_dir)?;
+    Ok(())
 }
 
-/// `report` — publish durable JSON and concise Markdown from one profile run.
-pub fn run_report(
-    trace: &Path,
-    baseline: Option<&Path>,
-    nsight_dir: Option<&Path>,
-    json_output: &Path,
-    markdown_output: &Path,
-) -> Result<()> {
-    let evidence = build_evidence(trace, baseline, nsight_dir)?;
-    let json = serde_json::to_string_pretty(&evidence)? + "\n";
-    super::write_output(Some(json_output), json.as_bytes())?;
-    super::write_output(Some(markdown_output), evidence.markdown().as_bytes())
+pub fn run_verify(bundle: &Path, output: Option<&Path>) -> Result<()> {
+    let receipt = verify_bundle(bundle)?;
+    super::write_output(
+        output,
+        (serde_json::to_string_pretty(&receipt)? + "\n").as_bytes(),
+    )
 }
 
-fn query_slowest(graph: &ExecutionGraph) -> serde_json::Value {
-    let mut ops: Vec<&GraphNode> = graph
+fn query_graph(graph: &ExecutionGraph, kind: TraceQueryKind) -> serde_json::Value {
+    match kind {
+        TraceQueryKind::SlowestHost => serde_json::json!({
+            "entrypoint": graph.summary.entrypoint,
+            "outer_wall_time_ns": graph.summary.outer_wall_time_ns,
+            "slowest_host_spans": graph.summary.slowest_host_spans,
+            "slowest_host_ops": sorted_nodes(graph, |node| matches!(node.kind, GraphNodeKind::Op), |node| node.host_self_time_ns),
+        }),
+        TraceQueryKind::SlowestDevice => serde_json::json!({
+            "entrypoint": graph.summary.entrypoint,
+            "slowest_device_spans": graph.summary.slowest_device_spans,
+        }),
+        TraceQueryKind::Heaviest => serde_json::json!({
+            "entrypoint": graph.summary.entrypoint,
+            "heaviest_spans": graph.summary.heaviest_spans,
+            "heaviest_ops": sorted_nodes(graph, |node| matches!(node.kind, GraphNodeKind::Op) && node.allocated_bytes.is_some(), |node| node.allocated_bytes.unwrap_or(0)),
+        }),
+        TraceQueryKind::Spans => serde_json::json!({ "spans": graph.spans, "edges": graph.edges }),
+        TraceQueryKind::Tensors => serde_json::to_value(&graph.tensors).unwrap_or_default(),
+        TraceQueryKind::Gradients => serde_json::to_value(&graph.gradients).unwrap_or_default(),
+        TraceQueryKind::Memory | TraceQueryKind::Capabilities => {
+            unreachable!("handled without graph")
+        }
+    }
+}
+
+fn sorted_nodes(
+    graph: &ExecutionGraph,
+    include: impl Fn(&GraphNode) -> bool,
+    value: impl Fn(&GraphNode) -> u64,
+) -> Vec<&GraphNode> {
+    let mut nodes = graph
         .spans
         .iter()
-        .filter(|node| matches!(node.kind, crate::graph::GraphNodeKind::Op))
-        .collect();
-    ops.sort_by(|left, right| {
-        right
-            .self_time_ns
-            .cmp(&left.self_time_ns)
+        .filter(|node| include(node))
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| {
+        value(right)
+            .cmp(&value(left))
             .then_with(|| left.id.cmp(&right.id))
     });
-    ops.truncate(50);
-
-    serde_json::json!({
-        "schema": "candle-graph/trace-query/1",
-        "kind": "slowest",
-        "entrypoint": graph.summary.entrypoint,
-        "total_ms": graph.summary.total_ms,
-        "slowest_spans": graph.summary.slowest_spans,
-        "slowest_ops": ops,
-    })
-}
-
-fn query_heaviest(graph: &ExecutionGraph) -> serde_json::Value {
-    let mut ops: Vec<&GraphNode> = graph
-        .spans
-        .iter()
-        .filter(|node| matches!(node.kind, crate::graph::GraphNodeKind::Op))
-        .collect();
-    ops.sort_by(|left, right| {
-        right
-            .bytes
-            .cmp(&left.bytes)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    ops.truncate(50);
-
-    serde_json::json!({
-        "schema": "candle-graph/trace-query/1",
-        "kind": "heaviest",
-        "entrypoint": graph.summary.entrypoint,
-        "peak_bytes": graph.summary.memory.peak_bytes,
-        "heaviest_spans": graph.summary.heaviest_spans,
-        "heaviest_ops": ops,
-    })
-}
-
-fn query_efficiency(graph: &ExecutionGraph) -> serde_json::Value {
-    let mut ops: Vec<&GraphNode> = graph
-        .spans
-        .iter()
-        .filter(|node| matches!(node.kind, crate::graph::GraphNodeKind::Op))
-        .filter(|node| node.self_time_ns > 0 && node.bytes > 0)
-        .collect();
-    ops.sort_by(|left, right| {
-        let left_score = left.bytes as f64 / left.self_time_ns as f64;
-        let right_score = right.bytes as f64 / right.self_time_ns as f64;
-        right_score
-            .partial_cmp(&left_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    ops.truncate(50);
-
-    serde_json::json!({
-        "schema": "candle-graph/trace-query/1",
-        "kind": "efficiency",
-        "entrypoint": graph.summary.entrypoint,
-        "note": "bytes per nanosecond of self time — higher means more memory traffic per unit compute",
-        "ops": ops,
-    })
-}
-
-fn query_memory(graph: &ExecutionGraph) -> serde_json::Value {
-    serde_json::json!({
-        "schema": "candle-graph/trace-query/1",
-        "kind": "memory",
-        "entrypoint": graph.summary.entrypoint,
-        "summary": graph.summary.memory,
-        "timeline": graph.memory.timeline,
-        "peak_breakdown": graph.memory.peak_breakdown,
-        "by_device": graph.memory.by_device,
-    })
-}
-
-fn query_spans(graph: &ExecutionGraph) -> serde_json::Value {
-    serde_json::json!({
-        "schema": "candle-graph/trace-query/1",
-        "kind": "spans",
-        "entrypoint": graph.summary.entrypoint,
-        "spans": graph.spans,
-        "edges": graph.edges,
-    })
-}
-
-fn query_gradients(graph: &ExecutionGraph) -> serde_json::Value {
-    serde_json::json!({
-        "schema": "candle-graph/trace-query/1",
-        "kind": "gradients",
-        "entrypoint": graph.summary.entrypoint,
-        "gradients": graph.gradients,
-    })
-}
-
-fn query_tensors(graph: &ExecutionGraph) -> serde_json::Value {
-    serde_json::json!({
-        "schema": "candle-graph/trace-query/1",
-        "kind": "tensors",
-        "entrypoint": graph.summary.entrypoint,
-        "tensors": graph.tensors,
-    })
+    nodes.truncate(50);
+    nodes
 }

@@ -1,4 +1,4 @@
-//! Dependency-free interactive HTML visualizer for `candle-graph/viewer/4` evidence payloads.
+//! Dependency-free interactive HTML visualizer for `candle-graph/viewer/5` evidence payloads.
 //!
 //! Embeds escaped JSON, CSS, and JS into one document. No CDN or network fetches.
 
@@ -101,10 +101,10 @@ fn render_trace_document(projection: &Value) -> String {
     html.push_str("          <span role=\"listitem\"><label><input type=\"radio\" name=\"heat-mode\" value=\"time\" checked> Self time heat</label></span>\n");
     html.push_str("          <span role=\"listitem\"><label><input type=\"radio\" name=\"heat-mode\" value=\"memory\"> Memory heat</label></span>\n");
     html.push_str(
-        "          <span role=\"listitem\" class=\"lg kind-op\">Call edge (ms label)</span>\n",
+        "          <span role=\"listitem\" class=\"lg kind-op\">Call edge (host duration)</span>\n",
     );
     html.push_str(
-        "          <span role=\"listitem\" class=\"lg kind-module\">Data edge (ms label)</span>\n",
+        "          <span role=\"listitem\" class=\"lg kind-module\">Tensor data edge</span>\n",
     );
     html.push_str("        </div>\n");
     html.push_str("      </div>\n");
@@ -128,13 +128,13 @@ fn render_trace_document(projection: &Value) -> String {
     html.push_str("    <dl id=\"inspector\" data-inspector>\n");
     html.push_str("      <div><dt>Label</dt><dd data-field=\"label\">—</dd></div>\n");
     html.push_str("      <div><dt>Kind</dt><dd data-field=\"kind\">—</dd></div>\n");
-    html.push_str("      <div><dt>Self time</dt><dd data-field=\"self_time\">—</dd></div>\n");
-    html.push_str("      <div><dt>Total time</dt><dd data-field=\"total_time\">—</dd></div>\n");
+    html.push_str("      <div><dt>Host self</dt><dd data-field=\"self_time\">—</dd></div>\n");
+    html.push_str("      <div><dt>Host total</dt><dd data-field=\"total_time\">—</dd></div>\n");
     html.push_str("      <div><dt>Shape</dt><dd data-field=\"shape\">—</dd></div>\n");
     html.push_str("      <div><dt>Dtype</dt><dd data-field=\"dtype\">—</dd></div>\n");
-    html.push_str("      <div><dt>Storage</dt><dd data-field=\"storage\">—</dd></div>\n");
+    html.push_str("      <div><dt>Dense footprint</dt><dd data-field=\"dense\">—</dd></div>\n");
     html.push_str("      <div><dt>Peak live</dt><dd data-field=\"peak_bytes\">—</dd></div>\n");
-    html.push_str("      <div><dt>Requested</dt><dd data-field=\"bytes\">—</dd></div>\n");
+    html.push_str("      <div><dt>Allocated</dt><dd data-field=\"bytes\">—</dd></div>\n");
     html.push_str("    </dl>\n");
     html.push_str("    <div class=\"pane-h sub\">Peak breakdown</div>\n");
     html.push_str("    <div id=\"peak-breakdown\" class=\"scroll-area peak-table\" data-peak-breakdown tabindex=\"0\"></div>\n");

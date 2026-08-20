@@ -3,31 +3,53 @@
 > Independent tool — not affiliated with candle-rs or Hugging Face.
 
 candle-graph captures one representative Candle execution and turns it into trustworthy evidence
-for humans and building agents: semantic timing, tensor and gradient facts, explicit coverage gaps,
-baseline comparisons, and optional NVIDIA Nsight GPU evidence in one standalone HTML viewer.
+for humans and building agents: capability-qualified host/device timing, tensor and gradient facts,
+logical and physical memory evidence, repeated comparisons, and provenance-bound NVIDIA Nsight
+evidence in one standalone HTML viewer.
 
 There is no static Rust analysis. Every claim comes from one concrete run.
 
 ## What agents get
 
-- `summary`: bounded provenance, trace health, findings, gaps, and totals.
-- `query`: slow spans/ops, storage footprints, explicit memory lifecycle, span tree, tensors, or gradients.
-- `compare`: repeated semantic spans aggregated by path against an explicit baseline.
-- `report`: the same evidence packet as JSON and concise Markdown.
+- `summary`: bounded provenance, structural outcome, capability matrix, findings, gaps, and totals.
+- `query`: host/device costs, storage lifetimes, physical memory, spans, tensors, or gradients.
+- `compare`: at least five compatible baseline and candidate runs with raw samples and a 95% bootstrap interval.
+- `report`: an atomically published, content-addressed evidence bundle.
+- `verify`: deep bundle verification with a durable manifest-digest receipt.
 - `view`: Evidence, Trace, Span costs, Memory, and GPU views in one offline HTML file.
 
 Invalid hierarchy, incomplete spans, cycles, and inconsistent timings fail before graph analysis.
-Missing optional evidence is reported as a gap rather than appearing as an empty result.
+Failed captures remain diagnosable. Missing evidence is unknown, never a silent zero.
 
 ## Capture one update
 
 ```rust
-use candle_graph::{ExecutionStep, ProfileRun, SpanKind, TraceSession};
+use candle_graph::{
+    CaptureContract, CaptureSelector, ComparisonIdentity, CoverageLevel, ExecutionStep,
+    MeasurementScope, ProfileRun, SpanKind, TraceSession,
+};
 
+let update_number = 1;
+let selector = CaptureSelector::new(1)?;
+if !selector.is_selected(update_number) {
+    return Ok(());
+}
 let run = ProfileRun::training("my_crate::train::update", 1, "cuda:0")
     .measured_region_device_synchronized()
-    .tag("physical_batch", "128")
-    .tag("precision", "f32");
+    .capture_contract(CaptureContract {
+        measurement_scope: MeasurementScope::ProductionEquivalent,
+        operations: CoverageLevel::Partial,
+        tensors: CoverageLevel::Partial,
+        gradients: CoverageLevel::Partial,
+        required_semantic_labels: vec!["my_crate/update-000000000001/forward".into()],
+        ..CaptureContract::default()
+    })
+    .comparison_identity(ComparisonIdentity {
+        workload_id: "train".into(), model_id: "model-v1".into(), config_id: "default".into(),
+        data_id: "batch-set-a".into(), seed_policy: "fixed-42".into(), physical_batch: 128,
+        accumulation_steps: 1, precision: "f32".into(), device_state: "exclusive".into(),
+        pair_id: None,
+    });
 let session = TraceSession::open("application.jsonl", run)?;
 
 {
@@ -56,9 +78,12 @@ every hot-loop iteration.
 cargo candle-graph summary application.jsonl
 cargo candle-graph query application.jsonl --kind gradients
 cargo candle-graph query application.jsonl --kind tensors
-cargo candle-graph compare baseline.jsonl application.jsonl --output comparison.json
-cargo candle-graph report application.jsonl \
-  --json evidence.json --markdown EVIDENCE.md
+cargo candle-graph compare \
+  --baseline base-1.jsonl base-2.jsonl base-3.jsonl base-4.jsonl base-5.jsonl \
+  --candidate next-1.jsonl next-2.jsonl next-3.jsonl next-4.jsonl next-5.jsonl \
+  --output comparison.json
+cargo candle-graph report application.jsonl --bundle evidence-bundle
+cargo candle-graph verify evidence-bundle --output verification.json
 cargo candle-graph view application.jsonl --output viewer.html
 ```
 
@@ -67,22 +92,26 @@ export:
 
 ```bash
 cargo candle-graph report application.jsonl --nsight-dir nsight \
-  --json evidence.json --markdown EVIDENCE.md
+  --bundle evidence-bundle
 cargo candle-graph view application.jsonl --nsight-dir nsight --output viewer.html
 ```
 
-The raw `.nsys-rep` remains the source artifact. Supported reports are `cuda_gpu_trace`,
+The bundle retains the raw `.nsys-rep` and normalized inputs. A `capture-manifest.json` with schema
+`candle-graph/nsight-capture/1` binds their hashes and run/correlation IDs to the trace. Supported reports are `cuda_gpu_trace`,
 `cuda_gpu_kern_sum`, `cuda_api_sum`, `cuda_gpu_mem_time_sum`, and `nvtx_gpu_proj_trace`.
 
 ## Schemas
 
 | Schema | Role |
 | --- | --- |
-| `candle-graph/trace/6` | Execution JSONL with provenance, measured region, start times, and facts |
-| `candle-graph/graph/3` | Validated execution graph |
-| `candle-graph/evidence/1` | Agent/human packet: health, facts, gaps, graph, comparison, GPU evidence |
-| `candle-graph/comparison/1` | Baseline deltas by semantic path, memory, and gradient |
-| `candle-graph/viewer/4` | Offline unified viewer payload |
+| `candle-graph/trace/7` | Execution JSONL with capture contract, timing/memory planes, and terminal outcome |
+| `candle-graph/graph/4` | Validated call/data graph with tensor nodes |
+| `candle-graph/evidence/2` | Capability-qualified packet with typed facts and explicit unknowns |
+| `candle-graph/comparison/2` | Fail-closed replicated outer-wall comparison |
+| `candle-graph/viewer/5` | Offline unified viewer payload |
+| `candle-graph/nsight-capture/1` | Raw-report and CSV provenance binding |
+| `candle-graph/bundle/1` | Content-addressed atomic evidence bundle |
+| `candle-graph/bundle-verification/1` | Deep bundle verification receipt |
 
 See [CONTEXT.md](CONTEXT.md), [runtime guide](docs/runtime-analysis-guide.md),
 [features](docs/features.md), and [visualizer](docs/visualizer.md).
@@ -93,4 +122,5 @@ See [CONTEXT.md](CONTEXT.md), [runtime guide](docs/runtime-analysis-guide.md),
 cargo fmt -- --check
 cargo test --all-features
 cargo clippy --all-features -- -D warnings
+cargo bench --bench instrumentation_overhead --all-features
 ```
