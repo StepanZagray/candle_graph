@@ -104,10 +104,10 @@ The bundle retains the raw `.nsys-rep` and normalized inputs. A `capture-manifes
 
 | Schema | Role |
 | --- | --- |
-| `candle-graph/trace/7` | Execution JSONL with capture contract, timing/memory planes, and terminal outcome |
+| `candle-graph/trace/8` | Execution JSONL with capture contract, timing/memory planes, and terminal outcome |
 | `candle-graph/graph/4` | Validated call/data graph with tensor nodes |
 | `candle-graph/evidence/2` | Capability-qualified packet with typed facts and explicit unknowns |
-| `candle-graph/comparison/2` | Fail-closed replicated outer-wall comparison |
+| `candle-graph/comparison/3` | Fail-closed replicated outer-wall comparison |
 | `candle-graph/viewer/5` | Offline unified viewer payload |
 | `candle-graph/nsight-capture/1` | Raw-report and CSV provenance binding |
 | `candle-graph/bundle/1` | Content-addressed atomic evidence bundle |

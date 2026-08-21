@@ -275,15 +275,16 @@ fn assess_capabilities(
     memory: &MemoryProfile,
     gpu: &NsightEvidence,
 ) -> EvidenceCapabilities {
+    let trace_validation_source = || format!("{} validation", crate::trace::SCHEMA);
     let structural_trace = if health.structurally_valid {
         CapabilityState::from_coverage(
             CoverageLevel::Complete,
-            "trace/7 validation",
+            trace_validation_source(),
             "span and event invariants passed",
         )
     } else {
         CapabilityState::invalid(
-            "trace/7 validation",
+            trace_validation_source(),
             "one or more structural invariants failed",
         )
     };
@@ -294,7 +295,7 @@ fn assess_capabilities(
         .count();
     let outer_wall_time = if !health.structurally_valid {
         CapabilityState::invalid(
-            "trace/7 validation",
+            trace_validation_source(),
             "outer wall time is not qualified for a structurally invalid trace",
         )
     } else if !health.capture_complete {
@@ -313,7 +314,7 @@ fn assess_capabilities(
     };
     let nested_host_time = if !health.structurally_valid {
         CapabilityState::invalid(
-            "trace/7 validation",
+            trace_validation_source(),
             "nested host attribution requires a structurally valid trace",
         )
     } else if health.capture_complete {
@@ -461,7 +462,7 @@ fn assess_capabilities(
         ] {
             if state.is_available() {
                 *state = CapabilityState::invalid(
-                    "trace/7 validation",
+                    trace_validation_source(),
                     "structurally invalid trace cannot qualify trace-linked evidence",
                 );
             }
@@ -627,6 +628,10 @@ mod tests {
         assert_eq!(
             packet.capabilities.operation_coverage.level,
             CapabilityLevel::Partial
+        );
+        assert_eq!(
+            packet.capabilities.structural_trace.source,
+            format!("{TRACE_SCHEMA} validation")
         );
         assert!(packet.findings.is_empty());
         assert!(packet.graph.is_none());

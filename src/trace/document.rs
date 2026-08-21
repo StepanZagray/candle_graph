@@ -1,4 +1,4 @@
-//! Aggregate trace document and JSONL I/O for `candle-graph/trace/7`.
+//! Aggregate trace document and JSONL I/O for `candle-graph/trace/8`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;

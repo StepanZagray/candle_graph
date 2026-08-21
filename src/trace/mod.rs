@@ -1,4 +1,4 @@
-//! TensorFlow-Profiler-style trace protocol (`candle-graph/trace/7`).
+//! TensorFlow-Profiler-style trace protocol (`candle-graph/trace/8`).
 //!
 //! Trace-only evidence: spans, timed ops, tensor snapshots, memory events, gradient facts,
 //! and span edges. No static Rust analysis — importers aggregate JSONL into

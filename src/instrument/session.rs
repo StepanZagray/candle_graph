@@ -1,4 +1,4 @@
-//! Representative-run profiler session — emits `candle-graph/trace/7` JSONL.
+//! Representative-run profiler session — emits `candle-graph/trace/8` JSONL.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;

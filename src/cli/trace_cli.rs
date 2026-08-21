@@ -1,4 +1,4 @@
-//! Evidence CLI engine for trace/7, evidence/2, comparison/2, and atomic bundles.
+//! Evidence CLI engine for trace/8, evidence/2, comparison/3, and atomic bundles.
 
 use std::path::{Path, PathBuf};
 

@@ -10,7 +10,7 @@ use candle_graph::cli::trace_cli::{self, TraceQueryKind};
 #[command(
     name = "candle-graph",
     about = "Import and visualize Candle execution traces",
-    long_about = "Capability-qualified evidence and atomic bundles from candle-graph/trace/7 runs."
+    long_about = "Capability-qualified evidence and atomic bundles from candle-graph/trace/8 runs."
 )]
 struct Args {
     #[command(subcommand)]
