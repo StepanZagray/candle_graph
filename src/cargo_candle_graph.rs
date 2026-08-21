@@ -14,7 +14,7 @@ use candle_graph::cli::trace_cli::{self, TraceQueryKind};
     name = "cargo-candle-graph",
     bin_name = "cargo candle-graph",
     about = "Import and analyze candle-graph execution trace files",
-    long_about = "Capability-qualified evidence and atomic bundles from candle-graph/trace/8 runs."
+    long_about = "Capability-qualified evidence and atomic bundles from candle-graph/trace/9 runs."
 )]
 struct CargoArgs {
     #[command(subcommand)]
@@ -42,7 +42,7 @@ enum Command {
 
 #[derive(Parser, Debug)]
 struct ImportArgs {
-    /// Trace JSONL file (`candle-graph/trace/8`).
+    /// Trace JSONL file (`candle-graph/trace/9`).
     trace: PathBuf,
 
     #[arg(long, short, value_name = "FILE")]
@@ -52,7 +52,7 @@ struct ImportArgs {
 #[derive(Parser, Debug)]
 #[cfg(feature = "visualizer")]
 struct ViewArgs {
-    /// Trace JSONL file (`candle-graph/trace/8`).
+    /// Trace JSONL file (`candle-graph/trace/9`).
     trace: PathBuf,
 
     #[arg(long, value_name = "FILE")]
@@ -64,10 +64,15 @@ struct ViewArgs {
 
 #[derive(Parser, Debug)]
 struct CompareArgs {
-    #[arg(long, required = true, num_args = 1.., value_name = "TRACE")]
+    /// Finalized evidence bundle directories, unless `--unverified-traces` is set.
+    #[arg(long, required = true, num_args = 1.., value_name = "BUNDLE")]
     baseline: Vec<PathBuf>,
-    #[arg(long, required = true, num_args = 1.., value_name = "TRACE")]
+    /// Finalized evidence bundle directories, unless `--unverified-traces` is set.
+    #[arg(long, required = true, num_args = 1.., value_name = "BUNDLE")]
     candidate: Vec<PathBuf>,
+    /// Parse raw trace paths without bundle verification; output is always ineligible.
+    #[arg(long)]
+    unverified_traces: bool,
     #[arg(long, short, value_name = "FILE")]
     output: Option<PathBuf>,
 }
@@ -91,7 +96,7 @@ struct VerifyArgs {
 
 #[derive(Parser, Debug)]
 struct SummaryArgs {
-    /// Trace JSONL file (`candle-graph/trace/8`).
+    /// Trace JSONL file (`candle-graph/trace/9`).
     trace: PathBuf,
 
     #[arg(long, short, value_name = "FILE")]
@@ -100,7 +105,7 @@ struct SummaryArgs {
 
 #[derive(Parser, Debug)]
 struct QueryArgs {
-    /// Trace JSONL file (`candle-graph/trace/8`).
+    /// Trace JSONL file (`candle-graph/trace/9`).
     trace: PathBuf,
 
     #[arg(long, value_enum)]
@@ -154,6 +159,7 @@ fn main() -> Result<()> {
         Command::Compare(compare) => trace_cli::run_compare(
             &compare.baseline,
             &compare.candidate,
+            compare.unverified_traces,
             compare.output.as_deref(),
         ),
         Command::Report(report) => {

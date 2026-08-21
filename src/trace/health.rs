@@ -1,12 +1,13 @@
 //! Structural validation and observed evidence coverage for a parsed trace.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::capability::{CoverageLevel, GradientFamilyExpectation};
 use crate::phase::{ExecutionPhase, ExecutionStep};
 
-use super::{EdgeEvent, MemoryAction, RunOutcome, TraceDocument};
+use super::{EdgeEvent, GradientState, MemoryAction, RunOutcome, TraceDocument};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -407,6 +408,8 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
         );
     }
 
+    validate_gradient_manifest(doc, failed, &mut issues);
+
     let coverage = EvidenceCoverage {
         spans: doc.spans.len(),
         closed_spans: doc.spans.iter().filter(|span| span.closed).count(),
@@ -516,6 +519,196 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
         capture_complete: !failed,
         issues,
         coverage,
+    }
+}
+
+fn validate_gradient_manifest(doc: &TraceDocument, failed: bool, issues: &mut Vec<HealthIssue>) {
+    let mut event_ids = HashSet::new();
+    let mut observed = BTreeMap::<(&str, &str), usize>::new();
+    let mut events_by_key = BTreeMap::new();
+    for gradient in &doc.gradients {
+        if gradient.event_id.trim().is_empty() {
+            error(
+                issues,
+                "empty_gradient_event_id",
+                "gradient event IDs must not be empty",
+            );
+        }
+        if gradient.root.trim().is_empty() || gradient.key.trim().is_empty() {
+            error(
+                issues,
+                "empty_gradient_parameter_key",
+                "gradient roots and parameter keys must not be empty",
+            );
+        }
+        if !event_ids.insert(gradient.event_id.as_str()) {
+            error(
+                issues,
+                "duplicate_gradient_event_id",
+                format!(
+                    "gradient event ID {:?} occurs more than once",
+                    gradient.event_id
+                ),
+            );
+        }
+        *observed
+            .entry((gradient.root.as_str(), gradient.key.as_str()))
+            .or_default() += 1;
+        events_by_key
+            .entry((gradient.root.as_str(), gradient.key.as_str()))
+            .or_insert(gradient);
+        if !gradient.state.norm_is_valid(gradient.norm) {
+            error(
+                issues,
+                "gradient_state_norm_inconsistent",
+                format!(
+                    "gradient ({:?}, {:?}) state `{}` is inconsistent with norm {:?}",
+                    gradient.root, gradient.key, gradient.state, gradient.norm
+                ),
+            );
+        }
+    }
+
+    let declared = doc.run.capture_contract.gradients;
+    let contract = doc.run.capture_contract.gradient_contract.as_ref();
+    match (declared, contract) {
+        (CoverageLevel::Complete, None) => {
+            error(
+                issues,
+                "gradient_contract_missing",
+                "complete gradient coverage requires an exact gradient contract",
+            );
+            return;
+        }
+        (CoverageLevel::Complete, Some(_)) | (_, None) => {}
+        (_, Some(_)) => {
+            error(
+                issues,
+                "gradient_contract_without_complete_coverage",
+                "an exact gradient contract requires complete declared gradient coverage",
+            );
+            return;
+        }
+    }
+    let Some(contract) = contract else {
+        return;
+    };
+    if let Err(contract_error) = contract.validate() {
+        error(
+            issues,
+            "gradient_contract_invalid",
+            contract_error.to_string(),
+        );
+        return;
+    }
+
+    let expected = contract
+        .expected
+        .iter()
+        .map(|gradient| (gradient.root.as_str(), gradient.key.as_str()))
+        .collect::<BTreeSet<_>>();
+    for (&(root, key), &count) in &observed {
+        if count != 1 {
+            error(
+                issues,
+                "gradient_manifest_duplicate_key",
+                format!("gradient ({root:?}, {key:?}) occurs {count} times; expected exactly once"),
+            );
+        }
+        if !expected.contains(&(root, key)) {
+            error(
+                issues,
+                "gradient_manifest_undeclared_key",
+                format!("gradient ({root:?}, {key:?}) is absent from the manifest"),
+            );
+        }
+    }
+    for parameter in &contract.expected {
+        if !observed.contains_key(&(parameter.root.as_str(), parameter.key.as_str())) {
+            let root = &parameter.root;
+            let key = &parameter.key;
+            let message = format!("manifest gradient ({root:?}, {key:?}) was not captured");
+            if failed {
+                warning(issues, "gradient_manifest_missing_key", message);
+            } else {
+                error(issues, "gradient_manifest_missing_key", message);
+            }
+        }
+    }
+
+    for family in &contract.families {
+        let expected_members = contract
+            .expected
+            .iter()
+            .filter(|parameter| parameter.family == family.family)
+            .count();
+        let members = contract
+            .expected
+            .iter()
+            .filter(|parameter| parameter.family == family.family)
+            .filter_map(|parameter| {
+                events_by_key
+                    .get(&(parameter.root.as_str(), parameter.key.as_str()))
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        let family_capture_complete = members.len() == expected_members;
+        let present = members
+            .iter()
+            .filter(|gradient| gradient.state == GradientState::Present)
+            .count();
+        let attached = members
+            .iter()
+            .filter(|gradient| gradient.state != GradientState::Missing)
+            .count();
+        let non_finite = members
+            .iter()
+            .filter(|gradient| gradient.state == GradientState::NonFinite)
+            .count();
+        if non_finite > 0 {
+            error(
+                issues,
+                "gradient_family_non_finite",
+                format!(
+                    "gradient family {:?} contains {non_finite} non-finite gradients",
+                    family.family
+                ),
+            );
+        }
+        match family.expectation {
+            GradientFamilyExpectation::Active
+                if (!failed || family_capture_complete) && present < family.min_present => error(
+                issues,
+                "gradient_active_family_below_minimum",
+                format!(
+                    "active gradient family {:?} has {present} present gradients; requires at least {}",
+                    family.family, family.min_present
+                ),
+            ),
+            GradientFamilyExpectation::Inactive if attached > 0 => error(
+                issues,
+                "gradient_inactive_family_leakage",
+                format!(
+                    "inactive gradient family {:?} has {attached} attached gradients",
+                    family.family
+                ),
+            ),
+            GradientFamilyExpectation::DataConditional
+                if (!failed || family_capture_complete)
+                    && attached > 0
+                    && present < family.min_present =>
+            {
+                error(
+                    issues,
+                    "gradient_conditional_family_below_minimum",
+                    format!(
+                        "data-conditional gradient family {:?} was attached but has {present} present gradients; requires at least {}",
+                        family.family, family.min_present
+                    ),
+                )
+            }
+            _ => {}
+        }
     }
 }
 

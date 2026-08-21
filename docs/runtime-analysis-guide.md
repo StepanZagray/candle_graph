@@ -46,6 +46,28 @@ label without replacing backend tensor identity. The footprint is shape metadata
 backing-allocation size; callers must pass the backend's actual allocation bytes to explicit memory
 events. Aliases with the same `(device, storage_id)` then share one logical lifetime.
 
+## Qualify complete gradient coverage
+
+Construct a `GradientContract` from the final model `VarMap` before opening `TraceSession`. Read
+the named keys through `varmap.data()`, sort them, map every key to a caller-owned family, then pass
+the resulting contract in `CaptureContract { gradients: CoverageLevel::Complete,
+gradient_contract: Some(contract), .. }`. A complete capture records every declared `(root, key)`
+exactly once. The README contains a complete generic VarMap example.
+
+Family policies have precise meanings:
+
+- `active(family, min_present)` requires at least that many finite, positive-norm gradients and
+  therefore rejects an all-zero active family.
+- `inactive(family)` requires every member to be explicitly `Missing`.
+- `data_conditional(family, min_present)` permits every member to be `Missing`; once any gradient
+  attaches, at least `min_present` members must be finite and positive.
+
+Encode `Present` with a finite norm greater than zero, `Zero` with positive zero (`0.0`, never
+`-0.0`), and `Missing` or `NonFinite` with no norm. The ordered manifest digest hashes the
+`GRADIENT_MANIFEST_SCHEMA` bytes, one NUL byte, then every root/key/family byte string prefixed by
+its little-endian `u64` length. Current public protocol constants are `TRACE_SCHEMA` (trace/9),
+`EVIDENCE_SCHEMA` (evidence/3), and `COMPARISON_SCHEMA` (comparison/4).
+
 ## Publish evidence
 
 ```bash
@@ -56,17 +78,19 @@ cargo candle-graph report application.jsonl --nsight-dir nsight --bundle evidenc
 cargo candle-graph verify evidence-bundle --output verification.json
 cargo candle-graph view application.jsonl --nsight-dir nsight --output viewer.html
 cargo candle-graph compare \
-  --baseline base-1.jsonl base-2.jsonl base-3.jsonl base-4.jsonl base-5.jsonl \
-  --candidate next-1.jsonl next-2.jsonl next-3.jsonl next-4.jsonl next-5.jsonl
+  --baseline base-1.bundle base-2.bundle base-3.bundle base-4.bundle base-5.bundle \
+  --candidate next-1.bundle next-2.bundle next-3.bundle next-4.bundle next-5.bundle
 ```
 
 The packet reports structural validity separately from capability states. A failed terminal event
-remains inspectable but has no derived graph. Comparison requires at least five unique complete
-baseline runs and five unique complete candidate runs with identical typed identities and timing
-semantics. Each cohort must have one non-empty implementation ID, but the baseline and candidate
-IDs may intentionally differ and are reported separately. It retains raw samples, median, p95,
+remains inspectable but has no derived graph. Comparison deeply verifies every supplied finalized
+bundle, then requires at least five unique complete baseline runs and five unique complete
+candidate runs with identical typed identities and timing semantics. Each cohort must have one
+non-empty implementation ID, but the baseline and candidate IDs may intentionally differ and are
+reported separately. It retains raw samples, median, p95,
 MAD, and a deterministic 95% bootstrap interval; direction is confirmed only when the interval
-excludes zero.
+excludes zero. `compare --unverified-traces` accepts raw JSONL paths for diagnostics, records that
+trust state in comparison/4, and always withholds eligibility and confidence intervals.
 
 `report --bundle DIR` writes the trace, packet, Markdown, viewer (when enabled), Nsight inputs, and
 content hashes under a sibling temporary directory, then atomically renames it into place. An

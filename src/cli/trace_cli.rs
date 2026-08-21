@@ -1,11 +1,11 @@
-//! Evidence CLI engine for trace/8, evidence/2, comparison/3, and atomic bundles.
+//! Evidence CLI engine for trace/9, evidence/3, comparison/4, and atomic bundles.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use crate::artifact::{publish_bundle, verify_bundle};
-use crate::comparison::compare_replicates;
+use crate::comparison::{compare_unverified_traces, compare_verified_bundles};
 use crate::evidence::{build_evidence, EvidencePacket};
 use crate::graph::{ExecutionGraph, GraphNode, GraphNodeKind};
 use crate::trace::parse_trace;
@@ -84,20 +84,26 @@ pub fn run_view(trace_path: &Path, output: &Path, nsight_dir: Option<&Path>) -> 
 pub fn run_compare(
     baseline: &[PathBuf],
     candidate: &[PathBuf],
+    unverified_traces: bool,
     output: Option<&Path>,
 ) -> Result<()> {
-    let parse_all = |paths: &[PathBuf], cohort: &str| -> Result<Vec<_>> {
-        paths
-            .iter()
-            .map(|path| {
-                parse_trace(path).with_context(|| format!("parse {cohort} {}", path.display()))
-            })
-            .collect()
+    let comparison = if unverified_traces {
+        let parse_all = |paths: &[PathBuf], cohort: &str| -> Result<Vec<_>> {
+            paths
+                .iter()
+                .map(|path| {
+                    parse_trace(path)
+                        .with_context(|| format!("parse unverified {cohort} {}", path.display()))
+                })
+                .collect()
+        };
+        compare_unverified_traces(
+            &parse_all(baseline, "baseline")?,
+            &parse_all(candidate, "candidate")?,
+        )
+    } else {
+        compare_verified_bundles(baseline, candidate)?
     };
-    let comparison = compare_replicates(
-        &parse_all(baseline, "baseline")?,
-        &parse_all(candidate, "candidate")?,
-    );
     super::write_output(
         output,
         (serde_json::to_string_pretty(&comparison)? + "\n").as_bytes(),

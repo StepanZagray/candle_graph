@@ -23,6 +23,11 @@ graph, separate timing and memory planes, and optional GPU evidence.
 **Capture contract**: the producer's typed declaration of which evidence classes cover the whole
 measured region. Observed event counts can prove presence, but never upgrade coverage to complete.
 
+**Gradient contract**: a SHA-256-bound, caller-ordered manifest of expected `(root, key, family)`
+parameters plus an active, inactive, or data-conditional expectation for every family. Complete
+gradient coverage means the observed event set matched this contract exactly and passed state/norm
+and family validation.
+
 **Evidence capability**: a machine-checkable statement that one class of conclusion is supported,
 partial, unavailable, or invalid for an evidence packet.
 
@@ -37,7 +42,8 @@ Each measurement is independently optional. Capacity is never derived from used 
 metadata, or logical storage lifetimes.
 
 **Replicated comparison**: a metric-scoped comparison of at least five compatible independent
-baseline runs and five compatible independent candidate runs, retaining every raw sample.
+baseline runs and five compatible independent candidate runs, retaining every raw sample. An
+eligible comparison reads traces only from bundles deeply verified immediately beforehand.
 
 **Evidence bundle**: one atomically published directory whose manifest binds every input and
 derived artifact to the profile run.
@@ -54,13 +60,14 @@ representative update
   └─ matching NVTX labels (optional)
             │
             ▼
- application.jsonl (trace/8) ── validate ── graph/4
+ application.jsonl (trace/9) ── validate ── graph/4
             │                                │
  official nsys stats CSV ── normalize ───────┤
             │                                ▼
-            └──────────────────── evidence/2 packet
+            └──────────────────── evidence/3 packet
                                       ├─ bounded JSON / Markdown for agents
-                                      ├─ comparison/3 across repeated runs
+                                      ├─ atomic bundle/1 + verification receipt
+                                      ├─ comparison/4 across verified repeated bundles
                                       └─ viewer/5 HTML for humans
 ```
 
@@ -77,16 +84,26 @@ and reasons, never silent empty arrays. Tensor footprint and observed memory lif
 6. Fail-closed repeated-run timing comparisons with raw samples and confidence intervals.
 7. One accessible offline UI for application and optional GPU evidence.
 8. Stable normalization from official Nsight CSV, retaining raw `.nsys-rep`.
+9. Exact gradient-manifest and family validation before claiming complete gradient coverage.
+10. Bundle verification receipts on every comparison input; raw traces are diagnostic-only.
 
 ## Schemas
 
 | Schema | Role |
 | --- | --- |
-| `candle-graph/trace/8` | Execution evidence stream and terminal outcome |
+| `candle-graph/trace/9` | Execution evidence stream with exact gradient contract and terminal outcome |
 | `candle-graph/graph/4` | Validated call/data graph with separate timing planes |
-| `candle-graph/evidence/2` | Capability-qualified agent/human packet |
-| `candle-graph/comparison/3` | Replicated outer-wall comparison with cohort build identity |
+| `candle-graph/evidence/3` | Capability-qualified agent/human packet with gradient-contract facts |
+| `candle-graph/comparison/4` | Replicated outer-wall comparison with verified bundle receipts |
 | `candle-graph/viewer/5` | Embedded offline UI payload |
+| `candle-graph/gradient-manifest/1` | Ordered parameter-manifest digest domain |
 | `candle-graph/nsight-capture/1` | Nsight raw/normalized artifact provenance |
 | `candle-graph/bundle/1` | Content-addressed atomic evidence bundle |
 | `candle-graph/bundle-verification/1` | Deep verification receipt bound to one manifest digest |
+
+## 0.9 schema migration
+
+- Trace/8 is rejected. Emit trace/9; `gradients: complete` now requires `gradient_contract`.
+- Evidence/3 carries trace/9 provenance and typed gradient manifest/family facts.
+- Comparison/4 embeds per-run bundle manifest receipts. The default CLI inputs are bundle
+  directories; `--unverified-traces` accepts raw traces but always produces an ineligible result.

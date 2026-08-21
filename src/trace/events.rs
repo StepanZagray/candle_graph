@@ -1,4 +1,4 @@
-//! JSONL event records for `candle-graph/trace/8`.
+//! JSONL event records for `candle-graph/trace/9`.
 
 use serde::{Deserialize, Serialize};
 

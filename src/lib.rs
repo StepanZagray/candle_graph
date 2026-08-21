@@ -19,10 +19,20 @@ pub mod trace;
 #[cfg(feature = "visualizer")]
 pub mod viewer;
 
-pub use artifact::{publish_bundle, verify_bundle, BundleManifest, BundleVerificationReceipt};
-pub use capability::{CaptureContract, CoverageLevel, MeasurementScope};
-pub use comparison::{compare_replicates, ReplicatedComparison};
-pub use evidence::{build_evidence, EvidencePacket};
+pub use artifact::{
+    publish_bundle, verify_bundle, BundleManifest, BundleVerificationReceipt,
+    SCHEMA as BUNDLE_SCHEMA,
+};
+pub use capability::{
+    CaptureContract, CoverageLevel, ExpectedGradient, GradientContract, GradientFamilyContract,
+    GradientFamilyExpectation, MeasurementScope, GRADIENT_MANIFEST_SCHEMA,
+};
+pub use comparison::{
+    compare_unverified_traces, compare_verified_bundles, ComparisonInputVerification,
+    ComparisonInputs, ComparisonVerdict, ReplicatedComparison, VerifiedBundleInput,
+    SCHEMA as COMPARISON_SCHEMA,
+};
+pub use evidence::{build_evidence, EvidencePacket, SCHEMA as EVIDENCE_SCHEMA};
 pub use graph::{build_from_trace, ExecutionGraph};
 #[cfg(feature = "candle")]
 pub use instrument::candle;

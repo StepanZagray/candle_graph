@@ -12,9 +12,11 @@ use crate::graph::{build_from_trace, ExecutionGraph};
 use crate::nsight::{GpuEvidenceStatus, NsightEvidence, ProvenanceBindingState};
 use crate::timing::{analyze_timing, TimingProfile};
 use crate::trace::memory::{analyze_memory, MemoryProfile};
-use crate::trace::{analyze_health, parse_trace, TraceDocument, TraceHealth, TraceRunMeta};
+use crate::trace::{
+    analyze_health, parse_trace, HealthSeverity, TraceDocument, TraceHealth, TraceRunMeta,
+};
 
-pub const SCHEMA: &str = "candle-graph/evidence/2";
+pub const SCHEMA: &str = "candle-graph/evidence/3";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidencePacket {
@@ -101,6 +103,33 @@ impl EvidencePacket {
                 });
             }
         }
+        if capabilities.gradient_coverage.is_available() {
+            if let Some(contract) = document.run.capture_contract.gradient_contract.as_ref() {
+                facts.extend([
+                    EvidenceFact {
+                        code: "gradient_manifest_sha256".into(),
+                        label: "Gradient manifest SHA-256".into(),
+                        value: FactValue::Text(contract.manifest_sha256.clone()),
+                        source: "capture_contract.gradient_contract".into(),
+                        capability: CapabilityKind::Gradients,
+                    },
+                    EvidenceFact {
+                        code: "gradient_manifest_entries".into(),
+                        label: "Expected gradient parameters".into(),
+                        value: FactValue::Count(contract.expected.len() as u64),
+                        source: "capture_contract.gradient_contract".into(),
+                        capability: CapabilityKind::Gradients,
+                    },
+                    EvidenceFact {
+                        code: "gradient_family_expectations".into(),
+                        label: "Gradient family expectations".into(),
+                        value: FactValue::Count(contract.families.len() as u64),
+                        source: "capture_contract.gradient_contract".into(),
+                        capability: CapabilityKind::Gradients,
+                    },
+                ]);
+            }
+        }
         if let Some(graph) = &graph {
             if let Some(span) = graph.summary.slowest_host_spans.first() {
                 findings.push(EvidenceFinding {
@@ -124,7 +153,7 @@ impl EvidencePacket {
                     qualification: capabilities.nested_device_time.level,
                 });
             }
-            let concerning = graph
+            let non_present = graph
                 .gradients
                 .iter()
                 .filter(|gradient| {
@@ -134,8 +163,8 @@ impl EvidencePacket {
             if !graph.gradients.is_empty() {
                 facts.push(EvidenceFact {
                     code: "gradient_observations".into(),
-                    label: "Gradient facts requiring attention".into(),
-                    value: FactValue::Count(concerning as u64),
+                    label: "Non-present gradient observations".into(),
+                    value: FactValue::Count(non_present as u64),
                     source: "trace.gradient".into(),
                     capability: CapabilityKind::Gradients,
                 });
@@ -344,12 +373,7 @@ fn assess_capabilities(
         "trace tensor events",
         "tensor coverage",
     );
-    let gradient_coverage = observed_coverage(
-        document.run.capture_contract.gradients,
-        document.gradients.len(),
-        "trace gradient events",
-        "gradient coverage",
-    );
+    let gradient_coverage = assess_gradient_coverage(document, health);
     let logical_memory_coverage = observed_coverage(
         document.run.capture_contract.logical_memory,
         document.memory.len(),
@@ -489,6 +513,70 @@ fn assess_capabilities(
         }
     }
     capabilities
+}
+
+fn assess_gradient_coverage(document: &TraceDocument, health: &TraceHealth) -> CapabilityState {
+    let declared = document.run.capture_contract.gradients;
+    if declared != CoverageLevel::Complete {
+        return observed_coverage(
+            declared,
+            document.gradients.len(),
+            "trace gradient events",
+            "gradient coverage",
+        );
+    }
+
+    let Some(contract) = document.run.capture_contract.gradient_contract.as_ref() else {
+        return CapabilityState::invalid(
+            "exact gradient contract",
+            "complete gradient coverage requires a digest-bound parameter manifest",
+        );
+    };
+    if let Err(error) = contract.validate() {
+        return CapabilityState::invalid(
+            "exact gradient contract",
+            format!("gradient contract validation failed: {error}"),
+        );
+    }
+
+    let gradient_issues = health
+        .issues
+        .iter()
+        .filter(|issue| {
+            issue.code.starts_with("gradient_")
+                || matches!(
+                    issue.code.as_str(),
+                    "duplicate_gradient_event_id" | "empty_gradient_event_id"
+                )
+        })
+        .collect::<Vec<_>>();
+    if gradient_issues
+        .iter()
+        .any(|issue| issue.severity == HealthSeverity::Error)
+    {
+        return CapabilityState::invalid(
+            "exact gradient contract",
+            "gradient events did not satisfy the exact manifest and family contract",
+        );
+    }
+    if !gradient_issues.is_empty() {
+        return CapabilityState::from_coverage(
+            CoverageLevel::Partial,
+            "exact gradient contract",
+            "capture ended before every manifest and family expectation could be validated",
+        );
+    }
+
+    CapabilityState::from_coverage(
+        CoverageLevel::Complete,
+        "exact gradient contract",
+        format!(
+            "{} manifest entries and {} family expectations validated against {}",
+            contract.expected.len(),
+            contract.families.len(),
+            contract.manifest_sha256
+        ),
+    )
 }
 
 fn observed_coverage(

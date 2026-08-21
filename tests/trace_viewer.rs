@@ -1,4 +1,4 @@
-//! Standalone evidence/2 viewer/5 integration tests.
+//! Standalone evidence/3 viewer/5 integration tests.
 
 #![cfg(feature = "visualizer")]
 

@@ -10,7 +10,7 @@ use candle_graph::cli::trace_cli::{self, TraceQueryKind};
 #[command(
     name = "candle-graph",
     about = "Import and visualize Candle execution traces",
-    long_about = "Capability-qualified evidence and atomic bundles from candle-graph/trace/8 runs."
+    long_about = "Capability-qualified evidence and atomic bundles from candle-graph/trace/9 runs."
 )]
 struct Args {
     #[command(subcommand)]
@@ -48,10 +48,13 @@ struct ViewArgs {
 
 #[derive(Parser, Debug)]
 struct CompareArgs {
-    #[arg(long, required = true, num_args = 1.., value_name = "TRACE")]
+    #[arg(long, required = true, num_args = 1.., value_name = "BUNDLE")]
     baseline: Vec<PathBuf>,
-    #[arg(long, required = true, num_args = 1.., value_name = "TRACE")]
+    #[arg(long, required = true, num_args = 1.., value_name = "BUNDLE")]
     candidate: Vec<PathBuf>,
+    /// Treat baseline and candidate paths as raw traces; output is always diagnostic/ineligible.
+    #[arg(long)]
+    unverified_traces: bool,
     #[arg(long, short, value_name = "FILE")]
     output: Option<PathBuf>,
 }
@@ -133,6 +136,7 @@ fn main() -> Result<()> {
         Command::Compare(compare) => trace_cli::run_compare(
             &compare.baseline,
             &compare.candidate,
+            compare.unverified_traces,
             compare.output.as_deref(),
         ),
         Command::Report(report) => {

@@ -1,4 +1,4 @@
-//! Representative-run profiler session — emits `candle-graph/trace/8` JSONL.
+//! Representative-run profiler session — emits `candle-graph/trace/9` JSONL.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -143,6 +143,9 @@ impl TraceSession {
             run.capture_step > 0,
             "capture_step must be one-based and greater than zero"
         );
+        run.capture_contract
+            .validate()
+            .context("validate capture contract")?;
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -473,6 +476,9 @@ impl TraceSession {
     }
 
     /// Record one parameter gradient fact from a probe run.
+    ///
+    /// `Present` requires a finite positive norm, `Zero` requires positive zero, and `Missing` or
+    /// `NonFinite` require `None`. Exact-contract captures emit one event per `(root, key)`.
     pub fn record_gradient(
         &self,
         root: impl Into<String>,
@@ -480,6 +486,16 @@ impl TraceSession {
         state: GradientState,
         norm: Option<f64>,
     ) -> Result<()> {
+        let root = root.into();
+        let key = key.into();
+        anyhow::ensure!(
+            !root.trim().is_empty() && !key.trim().is_empty(),
+            "gradient roots and parameter keys must not be empty"
+        );
+        anyhow::ensure!(
+            state.norm_is_valid(norm),
+            "gradient state `{state}` is inconsistent with norm {norm:?}"
+        );
         let mut inner = self.inner.borrow_mut();
         inner.next_event_id += 1;
         let event_id = format!("gradient-{}", inner.next_event_id);
@@ -487,8 +503,8 @@ impl TraceSession {
             &mut inner.writer,
             &TraceEvent::Gradient(GradientEvent {
                 event_id,
-                root: root.into(),
-                key: key.into(),
+                root,
+                key,
                 state,
                 norm,
             }),

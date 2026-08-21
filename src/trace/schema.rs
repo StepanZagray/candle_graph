@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::capability::CaptureContract;
 
 /// Schema identifier written into every trace document and expected on parse.
-pub const SCHEMA: &str = "candle-graph/trace/8";
+pub const SCHEMA: &str = "candle-graph/trace/9";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComparisonIdentity {
@@ -106,6 +106,17 @@ pub enum GradientState {
     Missing,
     Zero,
     NonFinite,
+}
+
+impl GradientState {
+    pub(crate) fn norm_is_valid(self, norm: Option<f64>) -> bool {
+        match (self, norm) {
+            (Self::Present, Some(norm)) => norm.is_finite() && norm > 0.0,
+            (Self::Zero, Some(norm)) => norm == 0.0 && !norm.is_sign_negative(),
+            (Self::Missing | Self::NonFinite, None) => true,
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for GradientState {

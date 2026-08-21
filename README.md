@@ -45,6 +45,7 @@ let run = ProfileRun::training("my_crate::train::update", 1, "cuda:0")
         ..CaptureContract::default()
     })
     .comparison_identity(ComparisonIdentity {
+        implementation_id: Some("build-v1".into()),
         workload_id: "train".into(), model_id: "model-v1".into(), config_id: "default".into(),
         data_id: "batch-set-a".into(), seed_policy: "fixed-42".into(), physical_batch: 128,
         accumulation_steps: 1, precision: "f32".into(), device_state: "exclusive".into(),
@@ -72,20 +73,96 @@ session.finish()?;
 for comparisons, excluding trace finalization overhead. Capture exactly one selected update, not
 every hot-loop iteration.
 
+## Declare exact gradient coverage from a VarMap
+
+Build the manifest after model construction, sort the `VarMap` keys because its map iteration is
+not stable, and supply an application-owned family policy. Only add family contracts that have
+members:
+
+```rust
+use std::collections::BTreeMap;
+use candle_graph::{
+    CaptureContract, CoverageLevel, ExpectedGradient, GradientContract,
+    GradientFamilyContract, GradientFamilyExpectation, MeasurementScope,
+};
+use candle_nn::VarMap;
+
+fn contract_from_varmap(varmap: &VarMap) -> anyhow::Result<GradientContract> {
+    let mut keys = varmap
+        .data()
+        .lock()
+        .expect("VarMap lock poisoned")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+
+    let mut policies = BTreeMap::new();
+    let expected = keys
+        .into_iter()
+        .map(|key| {
+            // Replace these prefixes with the application's actual parameter-family policy.
+            let (family, expectation, min_present) = if key.starts_with("frozen.") {
+                ("frozen", GradientFamilyExpectation::Inactive, 0)
+            } else if key.starts_with("conditional.") {
+                ("conditional", GradientFamilyExpectation::DataConditional, 1)
+            } else {
+                ("trainable", GradientFamilyExpectation::Active, 1)
+            };
+            policies.insert(family.to_owned(), (expectation, min_present));
+            ExpectedGradient::new("parameters", key, family)
+        })
+        .collect();
+    let families = policies
+        .into_iter()
+        .map(|(family, (expectation, min_present))| match expectation {
+            GradientFamilyExpectation::Active => {
+                GradientFamilyContract::active(family, min_present)
+            }
+            GradientFamilyExpectation::Inactive => GradientFamilyContract::inactive(family),
+            GradientFamilyExpectation::DataConditional => {
+                GradientFamilyContract::data_conditional(family, min_present)
+            }
+        })
+        .collect();
+    GradientContract::new(expected, families)
+}
+
+let gradient_contract = contract_from_varmap(&varmap)?;
+let capture_contract = CaptureContract {
+    measurement_scope: MeasurementScope::ProductionEquivalent,
+    gradients: CoverageLevel::Complete,
+    gradient_contract: Some(gradient_contract),
+    ..CaptureContract::default()
+};
+```
+
+Record every declared `(root, key)` exactly once. `Present` requires a finite positive norm,
+`Zero` requires positive `0.0`, and `Missing`/`NonFinite` carry no numeric norm. Complete coverage
+is granted only after exact key, digest, state, and family validation. The public schema constants
+are `TRACE_SCHEMA`, `EVIDENCE_SCHEMA`, `COMPARISON_SCHEMA`, `BUNDLE_SCHEMA`, and
+`GRADIENT_MANIFEST_SCHEMA`.
+
 ## Analyze
 
 ```bash
 cargo candle-graph summary application.jsonl
 cargo candle-graph query application.jsonl --kind gradients
 cargo candle-graph query application.jsonl --kind tensors
+cargo candle-graph report base-1.jsonl --bundle base-1.bundle
+# Publish the other baseline/candidate runs the same way, then compare finalized bundles.
 cargo candle-graph compare \
-  --baseline base-1.jsonl base-2.jsonl base-3.jsonl base-4.jsonl base-5.jsonl \
-  --candidate next-1.jsonl next-2.jsonl next-3.jsonl next-4.jsonl next-5.jsonl \
+  --baseline base-1.bundle base-2.bundle base-3.bundle base-4.bundle base-5.bundle \
+  --candidate next-1.bundle next-2.bundle next-3.bundle next-4.bundle next-5.bundle \
   --output comparison.json
 cargo candle-graph report application.jsonl --bundle evidence-bundle
 cargo candle-graph verify evidence-bundle --output verification.json
 cargo candle-graph view application.jsonl --output viewer.html
 ```
+
+`compare` deeply verifies every bundle immediately before reading its bound trace. Raw trace
+comparison remains available through `--unverified-traces`, but its result is always marked
+diagnostic and ineligible for a performance verdict.
 
 Add normalized official `nsys stats --format csv` reports without parsing Nsight's unstable SQLite
 export:
@@ -104,14 +181,19 @@ The bundle retains the raw `.nsys-rep` and normalized inputs. A `capture-manifes
 
 | Schema | Role |
 | --- | --- |
-| `candle-graph/trace/8` | Execution JSONL with capture contract, timing/memory planes, and terminal outcome |
+| `candle-graph/trace/9` | Execution JSONL with exact gradient contracts, timing/memory planes, and terminal outcome |
 | `candle-graph/graph/4` | Validated call/data graph with tensor nodes |
-| `candle-graph/evidence/2` | Capability-qualified packet with typed facts and explicit unknowns |
-| `candle-graph/comparison/3` | Fail-closed replicated outer-wall comparison |
+| `candle-graph/evidence/3` | Capability-qualified packet with typed gradient-contract facts and explicit unknowns |
+| `candle-graph/comparison/4` | Bundle-verified replicated outer-wall comparison with input receipts |
 | `candle-graph/viewer/5` | Offline unified viewer payload |
+| `candle-graph/gradient-manifest/1` | Ordered `(root, key, family)` digest domain |
 | `candle-graph/nsight-capture/1` | Raw-report and CSV provenance binding |
 | `candle-graph/bundle/1` | Content-addressed atomic evidence bundle |
 | `candle-graph/bundle-verification/1` | Deep bundle verification receipt |
+
+Version 0.9 rejects trace/8. Producers declaring complete gradient coverage must supply a
+`GradientContract`; otherwise use partial or none. Comparison/4 takes finalized bundle directories
+by default. Evidence/3 and comparison/4 consumers must accept their new contract/provenance fields.
 
 See [CONTEXT.md](CONTEXT.md), [runtime guide](docs/runtime-analysis-guide.md),
 [features](docs/features.md), and [visualizer](docs/visualizer.md).

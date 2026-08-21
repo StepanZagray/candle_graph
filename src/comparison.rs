@@ -1,13 +1,16 @@
 //! Fail-closed replicated performance comparisons.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::artifact::verify_bundle;
 use crate::capability::MeasurementScope;
-use crate::trace::{analyze_health, ComparisonIdentity, TraceDocument};
+use crate::trace::{analyze_health, parse_trace, ComparisonIdentity, TraceDocument};
 
-pub const SCHEMA: &str = "candle-graph/comparison/3";
+pub const SCHEMA: &str = "candle-graph/comparison/4";
 pub const MINIMUM_RUNS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,10 +37,34 @@ pub struct ConfidenceInterval {
     pub upper_delta_ns: f64,
 }
 
+/// Trust state of the artifacts supplied to a comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonInputVerification {
+    VerifiedBundles,
+    UnverifiedTraces,
+}
+
+/// One content-addressed bundle input verified immediately before comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedBundleInput {
+    pub run_id: String,
+    pub manifest_sha256: String,
+}
+
+/// Cohort provenance that determines whether a comparison may be eligible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonInputs {
+    pub verification: ComparisonInputVerification,
+    pub baseline: Vec<VerifiedBundleInput>,
+    pub candidate: Vec<VerifiedBundleInput>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplicatedComparison {
     pub schema: String,
     pub metric: String,
+    pub inputs: ComparisonInputs,
     pub comparable: bool,
     pub paired: bool,
     pub verdict: ComparisonVerdict,
@@ -52,11 +79,81 @@ pub struct ReplicatedComparison {
     pub confidence_interval: Option<ConfidenceInterval>,
 }
 
-pub fn compare_replicates(
+/// Verify finalized evidence bundles and compare their bound trace documents.
+pub fn compare_verified_bundles<B: AsRef<Path>, C: AsRef<Path>>(
+    baseline: &[B],
+    candidate: &[C],
+) -> Result<ReplicatedComparison> {
+    let (baseline_documents, baseline_inputs) = load_verified_cohort(baseline, "baseline")?;
+    let (candidate_documents, candidate_inputs) = load_verified_cohort(candidate, "candidate")?;
+    Ok(compare_documents(
+        &baseline_documents,
+        &candidate_documents,
+        ComparisonInputs {
+            verification: ComparisonInputVerification::VerifiedBundles,
+            baseline: baseline_inputs,
+            candidate: candidate_inputs,
+        },
+    ))
+}
+
+/// Compare raw trace documents for diagnostics only. This path is always ineligible.
+pub fn compare_unverified_traces(
     baseline: &[TraceDocument],
     candidate: &[TraceDocument],
 ) -> ReplicatedComparison {
+    compare_documents(
+        baseline,
+        candidate,
+        ComparisonInputs {
+            verification: ComparisonInputVerification::UnverifiedTraces,
+            baseline: Vec::new(),
+            candidate: Vec::new(),
+        },
+    )
+}
+
+fn load_verified_cohort<P: AsRef<Path>>(
+    roots: &[P],
+    cohort: &str,
+) -> Result<(Vec<TraceDocument>, Vec<VerifiedBundleInput>)> {
+    let mut documents = Vec::with_capacity(roots.len());
+    let mut inputs = Vec::with_capacity(roots.len());
+    for (index, root) in roots.iter().enumerate() {
+        let root = root.as_ref();
+        let receipt = verify_bundle(root).with_context(|| {
+            format!("verify {cohort} bundle {} at {}", index + 1, root.display())
+        })?;
+        let document = parse_trace(root.join("trace.jsonl")).with_context(|| {
+            format!(
+                "parse verified {cohort} bundle {} trace at {}",
+                index + 1,
+                root.display()
+            )
+        })?;
+        ensure!(
+            document.run.run_id == receipt.run_id,
+            "verified {cohort} bundle {} manifest run ID {:?} does not match trace run ID {:?}",
+            index + 1,
+            receipt.run_id,
+            document.run.run_id
+        );
+        inputs.push(VerifiedBundleInput {
+            run_id: receipt.run_id,
+            manifest_sha256: receipt.manifest_sha256,
+        });
+        documents.push(document);
+    }
+    Ok((documents, inputs))
+}
+
+fn compare_documents(
+    baseline: &[TraceDocument],
+    candidate: &[TraceDocument],
+    inputs: ComparisonInputs,
+) -> ReplicatedComparison {
     let mut reasons = Vec::new();
+    validate_input_provenance(&inputs, baseline, candidate, &mut reasons);
     let baseline_samples = measured_samples(baseline, "baseline", &mut reasons);
     let candidate_samples = measured_samples(candidate, "candidate", &mut reasons);
     if baseline.len() < MINIMUM_RUNS || candidate.len() < MINIMUM_RUNS {
@@ -111,6 +208,7 @@ pub fn compare_replicates(
     ReplicatedComparison {
         schema: SCHEMA.into(),
         metric: "outer_wall_time_ns".into(),
+        inputs,
         comparable,
         paired,
         verdict,
@@ -123,6 +221,57 @@ pub fn compare_replicates(
         median_delta_ns,
         median_delta_percent,
         confidence_interval,
+    }
+}
+
+fn validate_input_provenance(
+    inputs: &ComparisonInputs,
+    baseline: &[TraceDocument],
+    candidate: &[TraceDocument],
+    reasons: &mut Vec<String>,
+) {
+    match inputs.verification {
+        ComparisonInputVerification::UnverifiedTraces => reasons.push(
+            "unverified raw trace inputs are diagnostic only; finalized verified bundles are required for an eligible comparison"
+                .into(),
+        ),
+        ComparisonInputVerification::VerifiedBundles => {
+            validate_verified_cohort(&inputs.baseline, baseline, "baseline", reasons);
+            validate_verified_cohort(&inputs.candidate, candidate, "candidate", reasons);
+        }
+    }
+}
+
+fn validate_verified_cohort(
+    inputs: &[VerifiedBundleInput],
+    documents: &[TraceDocument],
+    cohort: &str,
+    reasons: &mut Vec<String>,
+) {
+    if inputs.len() != documents.len() {
+        reasons.push(format!(
+            "{cohort} bundle receipts must correspond one-to-one with trace documents"
+        ));
+        return;
+    }
+    for (index, (input, document)) in inputs.iter().zip(documents).enumerate() {
+        if input.run_id != document.run.run_id {
+            reasons.push(format!(
+                "{cohort} bundle {} receipt run ID does not match its trace",
+                index + 1
+            ));
+        }
+        if input.manifest_sha256.len() != 64
+            || !input
+                .manifest_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            reasons.push(format!(
+                "{cohort} bundle {} receipt has an invalid manifest SHA-256",
+                index + 1
+            ));
+        }
     }
 }
 
@@ -511,6 +660,30 @@ mod tests {
         }
     }
 
+    fn compare_test_replicates(
+        baseline: &[TraceDocument],
+        candidate: &[TraceDocument],
+    ) -> ReplicatedComparison {
+        let receipts = |documents: &[TraceDocument]| {
+            documents
+                .iter()
+                .map(|document| VerifiedBundleInput {
+                    run_id: document.run.run_id.clone(),
+                    manifest_sha256: "0".repeat(64),
+                })
+                .collect()
+        };
+        compare_documents(
+            baseline,
+            candidate,
+            ComparisonInputs {
+                verification: ComparisonInputVerification::VerifiedBundles,
+                baseline: receipts(baseline),
+                candidate: receipts(candidate),
+            },
+        )
+    }
+
     #[test]
     fn statistics_expose_raw_median_p95_and_mad() {
         let stats = statistics(vec![10, 11, 12, 13, 100]);
@@ -532,7 +705,7 @@ mod tests {
             .enumerate()
             .map(|(i, value)| run("next", i, value, None))
             .collect::<Vec<_>>();
-        let result = compare_replicates(&baseline, &candidate);
+        let result = compare_test_replicates(&baseline, &candidate);
         assert!(result.comparable);
         assert_eq!(result.baseline_implementation_id.as_deref(), Some("base"));
         assert_eq!(result.candidate_implementation_id.as_deref(), Some("next"));
@@ -554,7 +727,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut candidate = (0..5).map(|i| run("next", i, 90, None)).collect::<Vec<_>>();
         candidate[4].run.run_id = candidate[3].run.run_id.clone();
-        let result = compare_replicates(&baseline, &candidate);
+        let result = compare_test_replicates(&baseline, &candidate);
         assert!(!result.comparable);
         assert_eq!(result.verdict, ComparisonVerdict::Ineligible);
         assert!(result
@@ -581,7 +754,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .pair_id = None;
-        let result = compare_replicates(&baseline, &candidate);
+        let result = compare_test_replicates(&baseline, &candidate);
         assert!(!result.comparable);
         assert!(!result.paired);
         assert!(result
@@ -615,7 +788,7 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .implementation_id = implementation_id;
-            let result = compare_replicates(&invalid, &candidate);
+            let result = compare_test_replicates(&invalid, &candidate);
             assert!(!result.comparable);
             assert_eq!(result.verdict, ComparisonVerdict::Ineligible);
             assert!(result
@@ -631,7 +804,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .implementation_id = Some("another-build".into());
-        let result = compare_replicates(&baseline, &inconsistent);
+        let result = compare_test_replicates(&baseline, &inconsistent);
         assert!(!result.comparable);
         assert!(result
             .reasons
