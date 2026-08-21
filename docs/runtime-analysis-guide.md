@@ -4,8 +4,9 @@
 
 Use `CaptureSelector::new(n)?.is_selected(invocation)` to gate a configurable one-based update or
 inference invocation before opening a session. Record a typed
-`ComparisonIdentity` and `CaptureContract`; free-form tags are descriptive and never establish
-comparison compatibility. Instrumentation is inactive outside the selected invocation.
+`ComparisonIdentity` and `CaptureContract`; set `implementation_id` to a stable generic build or
+implementation identity. Free-form tags are descriptive and never establish comparison
+compatibility. Instrumentation is inactive outside the selected invocation.
 
 On CUDA, use `device_synchronized` only when every reported semantic span is bounded by device
 synchronization. If only the single measured region is synchronized, use
@@ -62,12 +63,16 @@ cargo candle-graph compare \
 The packet reports structural validity separately from capability states. A failed terminal event
 remains inspectable but has no derived graph. Comparison requires at least five unique complete
 baseline runs and five unique complete candidate runs with identical typed identities and timing
-semantics. It retains raw samples, median, p95, MAD, and a deterministic 95% bootstrap interval;
-direction is confirmed only when the interval excludes zero.
+semantics. Each cohort must have one non-empty implementation ID, but the baseline and candidate
+IDs may intentionally differ and are reported separately. It retains raw samples, median, p95,
+MAD, and a deterministic 95% bootstrap interval; direction is confirmed only when the interval
+excludes zero.
 
 `report --bundle DIR` writes the trace, packet, Markdown, viewer (when enabled), Nsight inputs, and
 content hashes under a sibling temporary directory, then atomically renames it into place. An
 existing destination is rejected.
+Nsight input directories are flat: every entry must be a regular file. Directory entries,
+symbolic links, special files, and directory enumeration errors reject publication.
 `verify` recursively rejects missing, modified, injected, symbolic-link, or special-file entries
 and emits a receipt containing the exact `bundle.json` SHA-256.
 

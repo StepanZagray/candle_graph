@@ -11,10 +11,13 @@ use serde::{Deserialize, Serialize};
 use crate::capability::CaptureContract;
 
 /// Schema identifier written into every trace document and expected on parse.
-pub const SCHEMA: &str = "candle-graph/trace/7";
+pub const SCHEMA: &str = "candle-graph/trace/8";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComparisonIdentity {
+    /// Stable caller-owned identity for the implementation or build under test.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementation_id: Option<String>,
     pub workload_id: String,
     pub model_id: String,
     pub config_id: String,

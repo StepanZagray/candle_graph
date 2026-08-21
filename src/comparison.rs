@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::capability::MeasurementScope;
 use crate::trace::{analyze_health, ComparisonIdentity, TraceDocument};
 
-pub const SCHEMA: &str = "candle-graph/comparison/2";
+pub const SCHEMA: &str = "candle-graph/comparison/3";
 pub const MINIMUM_RUNS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +42,8 @@ pub struct ReplicatedComparison {
     pub paired: bool,
     pub verdict: ComparisonVerdict,
     pub reasons: Vec<String>,
+    pub baseline_implementation_id: Option<String>,
+    pub candidate_implementation_id: Option<String>,
     pub identity: Option<ComparisonIdentity>,
     pub baseline: SampleStatistics,
     pub candidate: SampleStatistics,
@@ -66,6 +68,9 @@ pub fn compare_replicates(
     require_consistent_capture_semantics(baseline, candidate, &mut reasons);
 
     let identity = common_identity(baseline, candidate, &mut reasons);
+    let baseline_implementation_id = cohort_implementation_id(baseline, "baseline", &mut reasons);
+    let candidate_implementation_id =
+        cohort_implementation_id(candidate, "candidate", &mut reasons);
     let paired_samples = pair_samples(baseline, candidate, &mut reasons);
     let paired = paired_samples.is_some();
     let comparable = reasons.is_empty();
@@ -110,6 +115,8 @@ pub fn compare_replicates(
         paired,
         verdict,
         reasons,
+        baseline_implementation_id,
+        candidate_implementation_id,
         identity,
         baseline: baseline_stats,
         candidate: candidate_stats,
@@ -232,8 +239,55 @@ fn common_identity(
         return None;
     }
     let mut result = first.clone();
+    result.implementation_id = None;
     result.pair_id = None;
     Some(result)
+}
+
+fn cohort_implementation_id(
+    documents: &[TraceDocument],
+    cohort: &str,
+    reasons: &mut Vec<String>,
+) -> Option<String> {
+    let implementation_ids = documents
+        .iter()
+        .map(|document| {
+            document
+                .run
+                .comparison_identity
+                .as_ref()
+                .and_then(|identity| identity.implementation_id.as_deref())
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = implementation_ids.first().copied().flatten() else {
+        reasons.push(format!("{cohort} implementation ID is missing"));
+        return None;
+    };
+    if implementation_ids.iter().any(|identity| identity.is_none()) {
+        reasons.push(format!(
+            "{cohort} implementation ID is missing from one or more runs"
+        ));
+        return None;
+    }
+    if implementation_ids
+        .iter()
+        .flatten()
+        .any(|identity| identity.trim().is_empty())
+    {
+        reasons.push(format!("{cohort} implementation ID must not be empty"));
+        return None;
+    }
+    if implementation_ids
+        .iter()
+        .flatten()
+        .any(|identity| *identity != first)
+    {
+        reasons.push(format!(
+            "{cohort} implementation ID differs within the cohort"
+        ));
+        return None;
+    }
+    Some(first.to_owned())
 }
 
 fn same_conditions(left: &ComparisonIdentity, right: &ComparisonIdentity) -> bool {
@@ -416,6 +470,7 @@ mod tests {
                     ..CaptureContract::default()
                 },
                 comparison_identity: Some(ComparisonIdentity {
+                    implementation_id: Some(cohort.into()),
                     workload_id: "infer".into(),
                     model_id: "m1".into(),
                     config_id: "c1".into(),
@@ -479,6 +534,15 @@ mod tests {
             .collect::<Vec<_>>();
         let result = compare_replicates(&baseline, &candidate);
         assert!(result.comparable);
+        assert_eq!(result.baseline_implementation_id.as_deref(), Some("base"));
+        assert_eq!(result.candidate_implementation_id.as_deref(), Some("next"));
+        assert_eq!(
+            result
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.implementation_id.as_deref()),
+            None
+        );
         assert_eq!(result.verdict, ComparisonVerdict::CandidateFaster);
         assert!(result.confidence_interval.unwrap().upper_delta_ns < 0.0);
     }
@@ -529,5 +593,49 @@ mod tests {
     #[test]
     fn paired_even_median_averages_the_middle_deltas() {
         assert_eq!(median_i128(&[-5, -1, 3, 9]), 1.0);
+    }
+
+    #[test]
+    fn missing_empty_or_inconsistent_implementation_ids_fail_closed() {
+        let baseline = (0..5)
+            .map(|i| run("base", i, 100 + i as u64, None))
+            .collect::<Vec<_>>();
+        let candidate = (0..5)
+            .map(|i| run("next", i, 90 + i as u64, None))
+            .collect::<Vec<_>>();
+
+        for (implementation_id, expected_reason) in [
+            (None, "missing"),
+            (Some("   ".to_string()), "must not be empty"),
+        ] {
+            let mut invalid = baseline.clone();
+            invalid[0]
+                .run
+                .comparison_identity
+                .as_mut()
+                .unwrap()
+                .implementation_id = implementation_id;
+            let result = compare_replicates(&invalid, &candidate);
+            assert!(!result.comparable);
+            assert_eq!(result.verdict, ComparisonVerdict::Ineligible);
+            assert!(result
+                .reasons
+                .iter()
+                .any(|reason| reason.contains(expected_reason)));
+        }
+
+        let mut inconsistent = candidate.clone();
+        inconsistent[4]
+            .run
+            .comparison_identity
+            .as_mut()
+            .unwrap()
+            .implementation_id = Some("another-build".into());
+        let result = compare_replicates(&baseline, &inconsistent);
+        assert!(!result.comparable);
+        assert!(result
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("differs within")));
     }
 }

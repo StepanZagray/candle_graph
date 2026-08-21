@@ -54,13 +54,13 @@ representative update
   └─ matching NVTX labels (optional)
             │
             ▼
- application.jsonl (trace/7) ── validate ── graph/4
+ application.jsonl (trace/8) ── validate ── graph/4
             │                                │
  official nsys stats CSV ── normalize ───────┤
             │                                ▼
             └──────────────────── evidence/2 packet
                                       ├─ bounded JSON / Markdown for agents
-                                      ├─ comparison/2 across repeated runs
+                                      ├─ comparison/3 across repeated runs
                                       └─ viewer/5 HTML for humans
 ```
 
@@ -82,10 +82,10 @@ and reasons, never silent empty arrays. Tensor footprint and observed memory lif
 
 | Schema | Role |
 | --- | --- |
-| `candle-graph/trace/7` | Execution evidence stream and terminal outcome |
+| `candle-graph/trace/8` | Execution evidence stream and terminal outcome |
 | `candle-graph/graph/4` | Validated call/data graph with separate timing planes |
 | `candle-graph/evidence/2` | Capability-qualified agent/human packet |
-| `candle-graph/comparison/2` | Replicated outer-wall comparison |
+| `candle-graph/comparison/3` | Replicated outer-wall comparison with cohort build identity |
 | `candle-graph/viewer/5` | Embedded offline UI payload |
 | `candle-graph/nsight-capture/1` | Nsight raw/normalized artifact provenance |
 | `candle-graph/bundle/1` | Content-addressed atomic evidence bundle |

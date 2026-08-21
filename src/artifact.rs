@@ -190,12 +190,31 @@ fn write_bundle(root: &Path, trace: &Path, nsight_dir: Option<&Path>) -> Result<
         fs::create_dir(root.join("nsight"))?;
         let mut sources = fs::read_dir(nsight)
             .with_context(|| format!("read Nsight directory {}", nsight.display()))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_file())
-            .collect::<Vec<_>>();
-        sources.sort();
-        for source in sources {
+            .collect::<std::io::Result<Vec<_>>>()?;
+        sources.sort_by_key(|entry| entry.file_name());
+        for entry in sources {
+            let source = entry.path();
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("inspect Nsight artifact {}", source.display()))?;
+            if file_type.is_symlink() {
+                bail!(
+                    "symbolic links are not allowed in Nsight inputs: {}",
+                    source.display()
+                );
+            }
+            if file_type.is_dir() {
+                bail!(
+                    "directories are not allowed in Nsight inputs: {}",
+                    source.display()
+                );
+            }
+            if !file_type.is_file() {
+                bail!(
+                    "special files are not allowed in Nsight inputs: {}",
+                    source.display()
+                );
+            }
             let file_name = source
                 .file_name()
                 .context("Nsight artifact missing file name")?;
@@ -368,7 +387,10 @@ mod tests {
         ));
         fs::create_dir(&root).unwrap();
         let trace = root.join("input.jsonl");
+        let nsight = root.join("nsight-input");
         let destination = root.join("bundle");
+        fs::create_dir(&nsight).unwrap();
+        fs::write(nsight.join("capture.nsys-rep"), b"retained raw capture").unwrap();
         let document = TraceDocument {
             schema: TRACE_SCHEMA.into(),
             run: TraceRunMeta {
@@ -412,10 +434,18 @@ mod tests {
             },
         };
         write_jsonl(&trace, &document.to_events()).unwrap();
-        let manifest = publish_bundle(&destination, &trace, None).unwrap();
+        let manifest = publish_bundle(&destination, &trace, Some(&nsight)).unwrap();
         assert!(destination.join("bundle.json").is_file());
         assert!(destination.join("evidence.json").is_file());
         assert!(destination.join("report.md").is_file());
+        assert_eq!(
+            fs::read(destination.join("nsight/capture.nsys-rep")).unwrap(),
+            b"retained raw capture"
+        );
+        assert!(manifest
+            .files
+            .iter()
+            .any(|file| file.path == "nsight/capture.nsys-rep"));
         assert!(manifest.files.iter().all(|file| file.sha256.len() == 64));
         let receipt = verify_bundle(&destination).unwrap();
         assert_eq!(receipt.run_id, "bundle-run");
@@ -424,7 +454,107 @@ mod tests {
         let bundled_evidence: crate::evidence::EvidencePacket =
             serde_json::from_slice(&fs::read(destination.join("evidence.json")).unwrap()).unwrap();
         assert_eq!(bundled_evidence.provenance.run_id, manifest.run_id);
-        assert!(publish_bundle(&destination, &trace, None).is_err());
+        assert!(publish_bundle(&destination, &trace, Some(&nsight)).is_err());
+
+        fs::write(
+            destination.join("nsight/capture.nsys-rep"),
+            b"tampered raw capture",
+        )
+        .unwrap();
+        assert!(verify_bundle(&destination)
+            .unwrap_err()
+            .to_string()
+            .contains("mismatch"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_rejects_non_regular_nsight_inputs() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "candle-graph-nsight-input-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let trace = root.join("input.jsonl");
+        let document = TraceDocument {
+            schema: TRACE_SCHEMA.into(),
+            run: TraceRunMeta {
+                run_id: "nsight-input-run".into(),
+                correlation_id: "nsight/input/run".into(),
+                entrypoint: "demo".into(),
+                phase: crate::ExecutionPhase::Infer,
+                timestamp: "2026-08-19T00:00:00Z".into(),
+                capture_step: 1,
+                warmup_steps: 0,
+                device: "cpu".into(),
+                measured_region_device_synchronized: false,
+                timing_mode: TimingMode::Host,
+                capture_contract: CaptureContract::default(),
+                comparison_identity: None,
+                tags: Default::default(),
+                candle_version: None,
+            },
+            spans: vec![SpanRecord {
+                id: "root".into(),
+                parent_id: None,
+                name: "demo".into(),
+                kind: SpanKind::Function,
+                measured: true,
+                start_ns: 0,
+                closed: true,
+                duration_ns: 10,
+                step: None,
+            }],
+            ops: vec![],
+            tensors: vec![],
+            memory: vec![],
+            device_memory: vec![],
+            device_intervals: vec![],
+            gradients: vec![],
+            edges: vec![],
+            terminal: TerminalEvent {
+                outcome: RunOutcome::Complete,
+                timestamp_ns: 10,
+                reason: None,
+            },
+        };
+        write_jsonl(&trace, &document.to_events()).unwrap();
+
+        let directory_input = root.join("directory-input");
+        fs::create_dir_all(directory_input.join("nested")).unwrap();
+        let error = publish_bundle(
+            &root.join("directory-bundle"),
+            &trace,
+            Some(&directory_input),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("directories are not allowed"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            use std::os::unix::net::UnixListener;
+
+            let symlink_input = root.join("symlink-input");
+            fs::create_dir(&symlink_input).unwrap();
+            fs::write(root.join("regular-input"), b"input").unwrap();
+            symlink(root.join("regular-input"), symlink_input.join("linked")).unwrap();
+            let error = publish_bundle(&root.join("symlink-bundle"), &trace, Some(&symlink_input))
+                .unwrap_err();
+            assert!(error.to_string().contains("symbolic links are not allowed"));
+
+            let special_input = root.join("special-input");
+            fs::create_dir(&special_input).unwrap();
+            let _socket = UnixListener::bind(special_input.join("socket")).unwrap();
+            let error = publish_bundle(&root.join("special-bundle"), &trace, Some(&special_input))
+                .unwrap_err();
+            assert!(error.to_string().contains("special files are not allowed"));
+        }
+
         fs::remove_dir_all(root).unwrap();
     }
 
