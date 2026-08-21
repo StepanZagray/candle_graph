@@ -55,6 +55,13 @@ fn ordered_manifest_digest_has_a_stable_golden_value() {
 }
 
 fn document(gradients: Vec<GradientEvent>) -> TraceDocument {
+    document_with_contract(gradients, contract())
+}
+
+fn document_with_contract(
+    gradients: Vec<GradientEvent>,
+    gradient_contract: GradientContract,
+) -> TraceDocument {
     TraceDocument {
         schema: TRACE_SCHEMA.into(),
         run: TraceRunMeta {
@@ -71,7 +78,7 @@ fn document(gradients: Vec<GradientEvent>) -> TraceDocument {
             capture_contract: CaptureContract {
                 measurement_scope: MeasurementScope::ProductionEquivalent,
                 gradients: CoverageLevel::Complete,
-                gradient_contract: Some(contract()),
+                gradient_contract: Some(gradient_contract),
                 ..CaptureContract::default()
             },
             comparison_identity: None,
@@ -102,6 +109,44 @@ fn document(gradients: Vec<GradientEvent>) -> TraceDocument {
             reason: None,
         },
     }
+}
+
+fn conditional_matrix_codes(states: [(GradientState, Option<f64>); 3]) -> Vec<String> {
+    let conditional_contract = GradientContract::new(
+        vec![
+            ExpectedGradient::new("parameters", "trunk.weight", "trunk"),
+            ExpectedGradient::new("parameters", "optional.a", "optional"),
+            ExpectedGradient::new("parameters", "optional.b", "optional"),
+            ExpectedGradient::new("parameters", "optional.c", "optional"),
+        ],
+        vec![
+            GradientFamilyContract::active("trunk", 1),
+            GradientFamilyContract::data_conditional("optional", 2),
+        ],
+    )
+    .unwrap();
+    let mut gradients = vec![gradient(
+        "parameters",
+        "trunk.weight",
+        GradientState::Present,
+        Some(1.0),
+    )];
+    gradients.extend(
+        ["optional.a", "optional.b", "optional.c"]
+            .into_iter()
+            .zip(states)
+            .map(|(key, (state, norm))| gradient("parameters", key, state, norm)),
+    );
+    EvidencePacket::from_document(
+        document_with_contract(gradients, conditional_contract),
+        NsightEvidence::unavailable("not captured"),
+    )
+    .unwrap()
+    .health
+    .issues
+    .into_iter()
+    .map(|issue| issue.code)
+    .collect()
 }
 
 fn valid_gradients() -> Vec<GradientEvent> {
@@ -239,7 +284,7 @@ fn active_family_rejects_an_all_zero_capture() {
 }
 
 #[test]
-fn inactive_and_attached_data_conditional_families_enforce_their_contracts() {
+fn inactive_and_data_conditional_families_enforce_their_contracts() {
     let inactive_codes = issue_codes(vec![
         gradient(
             "parameters",
@@ -279,9 +324,29 @@ fn inactive_and_attached_data_conditional_families_enforce_their_contracts() {
             Some(0.0),
         ),
     ]);
-    assert!(conditional_codes
+    assert!(!conditional_codes
         .iter()
         .any(|code| code == "gradient_conditional_family_below_minimum"));
+}
+
+#[test]
+fn multi_member_data_conditional_matrix_is_fail_closed() {
+    let missing = (GradientState::Missing, None);
+    let zero = (GradientState::Zero, Some(0.0));
+    let present = (GradientState::Present, Some(1.0));
+    let non_finite = (GradientState::NonFinite, None);
+
+    for states in [[missing; 3], [zero; 3], [present, present, missing]] {
+        assert!(!conditional_matrix_codes(states)
+            .iter()
+            .any(|code| code == "gradient_conditional_family_below_minimum"));
+    }
+    assert!(conditional_matrix_codes([present, zero, missing])
+        .iter()
+        .any(|code| code == "gradient_conditional_family_below_minimum"));
+    assert!(conditional_matrix_codes([non_finite, missing, missing])
+        .iter()
+        .any(|code| code == "gradient_family_non_finite"));
 }
 
 #[test]

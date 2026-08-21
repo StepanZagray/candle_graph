@@ -695,7 +695,7 @@ fn validate_gradient_manifest(doc: &TraceDocument, failed: bool, issues: &mut Ve
             ),
             GradientFamilyExpectation::DataConditional
                 if (!failed || family_capture_complete)
-                    && attached > 0
+                    && present > 0
                     && present < family.min_present =>
             {
                 error(

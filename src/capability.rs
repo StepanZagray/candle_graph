@@ -61,6 +61,9 @@ impl ExpectedGradient {
 pub enum GradientFamilyExpectation {
     Active,
     Inactive,
+    /// The caller's data determines whether this family is missing, attached
+    /// with an exact zero, or present. If any members are present, at least
+    /// `min_present` must be present; zero alone is not a structural failure.
     DataConditional,
 }
 
