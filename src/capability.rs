@@ -230,6 +230,17 @@ pub struct CaptureContract {
 impl CaptureContract {
     /// Validate relationships that must hold before a producer starts capture.
     pub fn validate(&self) -> Result<()> {
+        let mut semantic_labels = BTreeSet::new();
+        for label in &self.required_semantic_labels {
+            ensure!(
+                !label.trim().is_empty(),
+                "required semantic labels must not be empty"
+            );
+            ensure!(
+                semantic_labels.insert(label),
+                "required semantic label `{label}` is declared more than once"
+            );
+        }
         match (self.gradients, self.gradient_contract.as_ref()) {
             (CoverageLevel::Complete, Some(contract)) => contract.validate(),
             (CoverageLevel::Complete, None) => {

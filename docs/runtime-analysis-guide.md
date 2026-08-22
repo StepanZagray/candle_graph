@@ -19,6 +19,10 @@ kernel-level attribution.
 Every trace contains one session envelope and exactly one measured region. Training captures tag
 forward, backward, and optimizer spans with `ExecutionStep`. Use the same stable semantic labels in
 NVTX, for example `trainer/update-000000000001/forward`.
+Required semantic labels form an exact cardinality contract: declarations must be non-empty and
+unique, and every declared label must occur exactly once in a successfully completed trace. A
+missing or repeated required label makes a complete capture structurally invalid; failed captures
+retain the same finding as a diagnostic warning.
 
 ```rust
 let session = TraceSession::open(path, ProfileRun::training("train::update", 1, "cpu"))?;

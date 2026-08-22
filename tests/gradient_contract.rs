@@ -440,6 +440,21 @@ fn capture_contract_rejects_gradient_contract_coverage_mismatches() {
 }
 
 #[test]
+fn capture_contract_rejects_empty_and_duplicate_required_semantic_labels() {
+    let empty = CaptureContract {
+        required_semantic_labels: vec!["  ".into()],
+        ..CaptureContract::default()
+    };
+    assert!(empty.validate().is_err());
+
+    let duplicate = CaptureContract {
+        required_semantic_labels: vec!["train/forward".into(), "train/forward".into()],
+        ..CaptureContract::default()
+    };
+    assert!(duplicate.validate().is_err());
+}
+
+#[test]
 fn complete_coverage_without_an_exact_contract_is_invalid() {
     let mut document = document(valid_gradients());
     document.run.capture_contract.gradient_contract = None;

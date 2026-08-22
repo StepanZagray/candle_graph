@@ -489,9 +489,18 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
     }
     let mut required_labels = HashSet::new();
     for required in &doc.run.capture_contract.required_semantic_labels {
-        if !required_labels.insert(required.as_str()) {
-            warning(
+        if required.trim().is_empty() {
+            required_semantic_label_issue(
                 &mut issues,
+                failed,
+                "empty_required_semantic_label",
+                "required semantic labels must not be empty",
+            );
+        }
+        if !required_labels.insert(required.as_str()) {
+            required_semantic_label_issue(
+                &mut issues,
+                failed,
                 "duplicate_required_semantic_label",
                 format!("required semantic label `{required}` is declared more than once"),
             );
@@ -502,8 +511,9 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
             .filter(|span| span.name == *required)
             .count();
         if count != 1 {
-            warning(
+            required_semantic_label_issue(
                 &mut issues,
+                failed,
                 "required_semantic_label_cardinality",
                 format!(
                     "required semantic label `{required}` must occur exactly once; observed {count}"
@@ -735,6 +745,19 @@ fn warning(issues: &mut Vec<HealthIssue>, code: &str, message: impl Into<String>
     });
 }
 
+fn required_semantic_label_issue(
+    issues: &mut Vec<HealthIssue>,
+    failed: bool,
+    code: &str,
+    message: impl Into<String>,
+) {
+    if failed {
+        warning(issues, code, message);
+    } else {
+        error(issues, code, message);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,6 +825,49 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == "open_span" && issue.severity == HealthSeverity::Warning));
+    }
+
+    #[test]
+    fn complete_capture_requires_each_declared_semantic_label_exactly_once() {
+        let mut document = failed_document();
+        document.terminal = TerminalEvent {
+            outcome: RunOutcome::Complete,
+            timestamp_ns: 10,
+            reason: None,
+        };
+        document.spans[0].measured = true;
+        document.spans[0].closed = true;
+        document.spans[0].duration_ns = 5;
+        document.run.capture_contract.required_semantic_labels = vec!["missing".into()];
+
+        let health = analyze_health(&document);
+        assert!(!health.structurally_valid);
+        assert!(health.issues.iter().any(|issue| {
+            issue.code == "required_semantic_label_cardinality"
+                && issue.severity == HealthSeverity::Error
+        }));
+
+        document.run.capture_contract.required_semantic_labels =
+            vec!["demo".into(), "demo".into()];
+        let duplicate_health = analyze_health(&document);
+        assert!(!duplicate_health.structurally_valid);
+        assert!(duplicate_health.issues.iter().any(|issue| {
+            issue.code == "duplicate_required_semantic_label"
+                && issue.severity == HealthSeverity::Error
+        }));
+    }
+
+    #[test]
+    fn failed_capture_keeps_missing_required_labels_diagnostic() {
+        let mut document = failed_document();
+        document.run.capture_contract.required_semantic_labels = vec!["missing".into()];
+
+        let health = analyze_health(&document);
+        assert!(health.structurally_valid);
+        assert!(health.issues.iter().any(|issue| {
+            issue.code == "required_semantic_label_cardinality"
+                && issue.severity == HealthSeverity::Warning
+        }));
     }
 
     #[test]
