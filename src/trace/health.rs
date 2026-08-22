@@ -855,6 +855,20 @@ mod tests {
             issue.code == "duplicate_required_semantic_label"
                 && issue.severity == HealthSeverity::Error
         }));
+
+        document.run.capture_contract.required_semantic_labels = vec!["demo".into()];
+        let mut repeated = document.spans[0].clone();
+        repeated.id = "child".into();
+        repeated.parent_id = Some("root".into());
+        repeated.measured = false;
+        document.spans.push(repeated);
+        let repeated_health = analyze_health(&document);
+        assert!(!repeated_health.structurally_valid);
+        assert!(repeated_health.issues.iter().any(|issue| {
+            issue.code == "required_semantic_label_cardinality"
+                && issue.severity == HealthSeverity::Error
+                && issue.message.contains("observed 2")
+        }));
     }
 
     #[test]
