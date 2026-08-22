@@ -847,8 +847,7 @@ mod tests {
                 && issue.severity == HealthSeverity::Error
         }));
 
-        document.run.capture_contract.required_semantic_labels =
-            vec!["demo".into(), "demo".into()];
+        document.run.capture_contract.required_semantic_labels = vec!["demo".into(), "demo".into()];
         let duplicate_health = analyze_health(&document);
         assert!(!duplicate_health.structurally_valid);
         assert!(duplicate_health.issues.iter().any(|issue| {
