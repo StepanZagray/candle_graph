@@ -850,7 +850,7 @@ fn combined_report_availability(
     let unavailable = reports
         .iter()
         .filter_map(|(report, covered)| {
-            let availability = report_availability(evidence, *report, *covered);
+            let availability = report_availability(evidence, report, *covered);
             (!availability.is_available()).then_some((*report, availability.status))
         })
         .collect::<Vec<_>>();
@@ -889,7 +889,7 @@ fn required_report_states(
         .map(|(report, covered)| {
             (
                 (*report).to_string(),
-                serde_json::to_value(report_availability(evidence, *report, *covered))
+                serde_json::to_value(report_availability(evidence, report, *covered))
                     .expect("query availability is serializable"),
             )
         })
