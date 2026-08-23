@@ -229,8 +229,7 @@ pub fn build_from_trace(doc: &TraceDocument) -> Result<ExecutionGraph> {
         .expect("validated measured span has a graph node");
     let measured_end_ns = measured_start_ns.saturating_add(measured_duration_ns);
     let measured_host_scopes = measured_host_scopes(doc, measured_span, &measured_ids);
-    let measured_host_timings =
-        measured_host_timings(&nodes, measured_start_ns, measured_end_ns);
+    let measured_host_timings = measured_host_timings(&nodes, measured_start_ns, measured_end_ns);
     let mut slowest_host_spans = nodes
         .iter()
         .filter_map(|node| {
@@ -699,7 +698,10 @@ mod tests {
         let graph = build_from_trace(&doc).unwrap();
         let costs = &graph.summary.slowest_host_spans;
         assert_eq!(
-            costs.iter().map(|cost| cost.id.as_str()).collect::<Vec<_>>(),
+            costs
+                .iter()
+                .map(|cost| cost.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["s2", "a-worker", "z-worker", "s3"]
         );
         let measured = costs.iter().find(|cost| cost.id == "s2").unwrap();

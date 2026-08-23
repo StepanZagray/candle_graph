@@ -954,10 +954,7 @@ mod tests {
         document.spans[0].duration_ns = 5;
         document.run.capture_contract.required_semantic_labels =
             vec!["demo".into(), "prepare".into()];
-        document
-            .run
-            .capture_contract
-            .gpu_expected_semantic_labels = vec!["demo".into()];
+        document.run.capture_contract.gpu_expected_semantic_labels = vec!["demo".into()];
 
         let health = analyze_health(&document);
         assert!(!health.structurally_valid);

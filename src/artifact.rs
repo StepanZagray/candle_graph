@@ -194,9 +194,7 @@ pub(crate) fn verify_consumed_bundle_files(
             bail!("consumed bundle path is no longer a regular file: {relative}");
         }
         let actual = describe_file(root, &path)?;
-        if actual.bytes != expected.bytes
-            || !actual.sha256.eq_ignore_ascii_case(&expected.sha256)
-        {
+        if actual.bytes != expected.bytes || !actual.sha256.eq_ignore_ascii_case(&expected.sha256) {
             bail!("consumed bundle file {relative:?} changed after initial verification");
         }
     }

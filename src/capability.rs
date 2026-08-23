@@ -236,8 +236,7 @@ pub struct CaptureContract {
 
 impl CaptureContract {
     pub fn resolved_gpu_expected_semantic_labels(&self) -> Vec<String> {
-        if self.gpu_expected_semantic_labels.is_empty()
-            && self.cpu_only_semantic_labels.is_empty()
+        if self.gpu_expected_semantic_labels.is_empty() && self.cpu_only_semantic_labels.is_empty()
         {
             self.required_semantic_labels.clone()
         } else {

@@ -234,10 +234,7 @@ fn read_json(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
-fn write_packet_and_rebind_manifest(
-    bundle: &Path,
-    packet: &serde_json::Value,
-) {
+fn write_packet_and_rebind_manifest(bundle: &Path, packet: &serde_json::Value) {
     let evidence_path = bundle.join("evidence.json");
     let packet_bytes = serde_json::to_vec_pretty(packet).unwrap();
     fs::write(&evidence_path, &packet_bytes).unwrap();
@@ -252,11 +249,7 @@ fn write_packet_and_rebind_manifest(
         .unwrap();
     evidence.bytes = packet_bytes.len() as u64;
     evidence.sha256 = format!("{:x}", Sha256::digest(&packet_bytes));
-    fs::write(
-        manifest_path,
-        serde_json::to_vec_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
+    fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
 }
 
 #[test]
@@ -310,20 +303,14 @@ fn gpu_summary_and_queries_use_verified_bounded_bundle_evidence() {
     assert_eq!(summary["input"]["kind"], "verified_bundle");
     assert!(summary["input"]["gpu_identity_bound"].as_bool().unwrap());
     assert_eq!(summary["gpu"]["status"], "available");
-    assert_eq!(
-        summary["gpu"]["normalized_rows"]["kernels"]["total"],
-        1
-    );
+    assert_eq!(summary["gpu"]["normalized_rows"]["kernels"]["total"], 1);
 
     let cases = [
         (TraceQueryKind::GpuStatus, "gpu-status"),
         (TraceQueryKind::GpuCorrelation, "gpu-correlation"),
         (TraceQueryKind::GpuPhases, "gpu-phases"),
         (TraceQueryKind::GpuKernels, "gpu-kernels"),
-        (
-            TraceQueryKind::GpuAttributionGaps,
-            "gpu-attribution-gaps",
-        ),
+        (TraceQueryKind::GpuAttributionGaps, "gpu-attribution-gaps"),
     ];
     for (kind, name) in cases {
         let output = root.0.join(format!("{name}.json"));
@@ -339,14 +326,8 @@ fn gpu_summary_and_queries_use_verified_bounded_bundle_evidence() {
     assert!(correlation["result"]["complete"].as_bool().unwrap());
     assert_eq!(correlation["result"]["ledger"]["matched"]["total"], 1);
     let phases = read_json(&root.0.join("gpu-phases.json"));
-    assert_eq!(
-        phases["result"]["projected_ranges"]["population_total"],
-        1
-    );
-    assert_eq!(
-        phases["result"]["attributed_phases"]["population_total"],
-        1
-    );
+    assert_eq!(phases["result"]["projected_ranges"]["population_total"], 1);
+    assert_eq!(phases["result"]["attributed_phases"]["population_total"], 1);
     assert_eq!(
         phases["result"]["projected_ranges"]["sample_selection"],
         "earliest_original_start_rows"
@@ -367,8 +348,7 @@ fn gpu_summary_and_queries_use_verified_bounded_bundle_evidence() {
 #[test]
 fn partial_gpu_reports_remain_unknown_in_report_specific_queries() {
     let kernel_root = TempRoot::new("partial-kernel");
-    let (_, kernel_bundle) =
-        publish_bundle_with_reports(&kernel_root.0, true, false, false);
+    let (_, kernel_bundle) = publish_bundle_with_reports(&kernel_root.0, true, false, false);
 
     let status_path = kernel_root.0.join("status.json");
     run_query(
@@ -382,10 +362,7 @@ fn partial_gpu_reports_remain_unknown_in_report_specific_queries() {
         status["result"]["normalized_rows"]["kernels"]["status"],
         "available"
     );
-    assert_eq!(
-        status["result"]["normalized_rows"]["kernels"]["total"],
-        1
-    );
+    assert_eq!(status["result"]["normalized_rows"]["kernels"]["total"], 1);
     assert_eq!(
         status["result"]["normalized_rows"]["projected_ranges"]["status"],
         "unavailable"
@@ -435,14 +412,8 @@ fn partial_gpu_reports_remain_unknown_in_report_specific_queries() {
     .unwrap();
     let phases = read_json(&phases_path);
     assert_eq!(phases["result"]["status"], "unavailable");
-    assert_eq!(
-        phases["result"]["projected_ranges"]["status"],
-        "available"
-    );
-    assert_eq!(
-        phases["result"]["projected_ranges"]["population_total"],
-        1
-    );
+    assert_eq!(phases["result"]["projected_ranges"]["status"], "available");
+    assert_eq!(phases["result"]["projected_ranges"]["population_total"], 1);
     assert_eq!(
         phases["result"]["attributed_phases"]["status"],
         "unavailable"
@@ -492,13 +463,11 @@ fn summary_and_query_outputs_cannot_modify_a_verified_bundle() {
     assert!(direct_error.to_string().contains("inside verified bundle"));
 
     let injected = bundle.join("injected.json");
-    let injection_error = run_query(
-        &bundle,
-        TraceQueryKind::GpuStatus,
-        Some(&injected),
-    )
-    .unwrap_err();
-    assert!(injection_error.to_string().contains("inside verified bundle"));
+    let injection_error =
+        run_query(&bundle, TraceQueryKind::GpuStatus, Some(&injected)).unwrap_err();
+    assert!(injection_error
+        .to_string()
+        .contains("inside verified bundle"));
     assert!(!injected.exists());
 
     let dotdot = bundle.join("nsight/../dotdot.json");
@@ -516,7 +485,10 @@ fn summary_and_query_outputs_cannot_modify_a_verified_bundle() {
     let root_error = run_summary(&bundle, Some(&bundle)).unwrap_err();
     assert!(root_error.to_string().contains("inside verified bundle"));
     assert_eq!(verify_bundle(&bundle).unwrap(), initial_receipt);
-    assert_eq!(fs::read(bundle.join("evidence.json")).unwrap(), initial_evidence);
+    assert_eq!(
+        fs::read(bundle.join("evidence.json")).unwrap(),
+        initial_evidence
+    );
 }
 
 #[cfg(unix)]

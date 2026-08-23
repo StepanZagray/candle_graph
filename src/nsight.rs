@@ -314,12 +314,7 @@ impl NsightEvidence {
     }
 
     pub fn load(dir: &Path, expected_semantic_keys: &[String]) -> anyhow::Result<Self> {
-        Self::load_with_semantic_contract(
-            dir,
-            expected_semantic_keys,
-            expected_semantic_keys,
-            &[],
-        )
+        Self::load_with_semantic_contract(dir, expected_semantic_keys, expected_semantic_keys, &[])
     }
 
     pub fn load_with_semantic_contract(
@@ -1038,8 +1033,7 @@ fn parse_timeline(
             device: field(&headers, &record, &["device", "device_id"]).map(str::to_string),
             context: field(&headers, &record, &["context", "context_id", "ctx"])
                 .map(str::to_string),
-            stream: field(&headers, &record, &["stream", "stream_id", "strm"])
-                .map(str::to_string),
+            stream: field(&headers, &record, &["stream", "stream_id", "strm"]).map(str::to_string),
             correlation_id: field(&headers, &record, &["correlation_id", "corrid", "corr_id"])
                 .map(str::to_string),
             start_ns,
@@ -1258,13 +1252,9 @@ mod tests {
         let required = vec!["pipeline/gpu".into(), "pipeline/prepare".into()];
         let gpu_expected = vec!["pipeline/gpu".into()];
         let cpu_only = vec!["pipeline/prepare".into()];
-        let evidence = NsightEvidence::load_with_semantic_contract(
-            &dir,
-            &required,
-            &gpu_expected,
-            &cpu_only,
-        )
-        .unwrap();
+        let evidence =
+            NsightEvidence::load_with_semantic_contract(&dir, &required, &gpu_expected, &cpu_only)
+                .unwrap();
 
         assert_eq!(evidence.status, GpuEvidenceStatus::Available);
         assert!(evidence.correlation.complete);
@@ -1327,8 +1317,7 @@ mod tests {
     #[test]
     fn gpu_projection_of_explicit_cpu_only_span_is_reported_and_incomplete() {
         let dir = temp_dir("cpu-only-projected");
-        let mut csv =
-            include_str!("../tests/fixtures/nsight/nvtx_gpu_proj_trace.csv").to_string();
+        let mut csv = include_str!("../tests/fixtures/nsight/nvtx_gpu_proj_trace.csv").to_string();
         csv.push_str("pipeline/prepare,1300,40,1260,90,Push/Pop,4242,17,1,0,0,2,0,2\n");
         fs::write(dir.join("sample_nvtx_gpu_proj_trace.csv"), csv).unwrap();
         let required = vec!["pipeline/gpu".into(), "pipeline/prepare".into()];

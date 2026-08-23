@@ -165,11 +165,11 @@ fn load_verified_bundle(requested_path: &Path, root: &Path) -> Result<LoadedEvid
     );
 
     let evidence_path = root.join("evidence.json");
-    let packet: EvidencePacket = serde_json::from_slice(
-        &fs::read(&evidence_path)
-            .with_context(|| format!("read verified evidence packet {}", evidence_path.display()))?,
-    )
-    .with_context(|| format!("parse verified evidence packet {}", evidence_path.display()))?;
+    let packet: EvidencePacket =
+        serde_json::from_slice(&fs::read(&evidence_path).with_context(|| {
+            format!("read verified evidence packet {}", evidence_path.display())
+        })?)
+        .with_context(|| format!("parse verified evidence packet {}", evidence_path.display()))?;
     packet.validate_schema()?;
     ensure!(
         packet.provenance == document.run,
@@ -210,7 +210,10 @@ fn reject_unverified_augmented_parent(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn reject_output_inside_verified_bundle(input: &EvidenceInput, output: Option<&Path>) -> Result<()> {
+fn reject_output_inside_verified_bundle(
+    input: &EvidenceInput,
+    output: Option<&Path>,
+) -> Result<()> {
     let (Some(root), Some(output)) = (input.bundle_root.as_deref(), output) else {
         return Ok(());
     };
@@ -590,9 +593,9 @@ fn query_gpu_phases(evidence: &EvidencePacket) -> serde_json::Value {
             })
         })
         .collect::<Vec<_>>();
-    let projected_population_total = projected_availability.is_available().then(|| {
-        total_report_rows(evidence, "nvtx_gpu_proj_trace", projected_sample_total)
-    });
+    let projected_population_total = projected_availability
+        .is_available()
+        .then(|| total_report_rows(evidence, "nvtx_gpu_proj_trace", projected_sample_total));
 
     let mut attributed = if attributed_availability.is_available() {
         evidence.gpu.phase_attribution.iter().collect::<Vec<_>>()
@@ -660,9 +663,9 @@ fn query_gpu_kernels(evidence: &EvidencePacket) -> serde_json::Value {
     });
     let normalized_display_total = kernels.len();
     kernels.truncate(QUERY_ROW_LIMIT);
-    let total = availability.is_available().then(|| {
-        total_report_rows(evidence, "cuda_gpu_kern_sum", normalized_display_total)
-    });
+    let total = availability
+        .is_available()
+        .then(|| total_report_rows(evidence, "cuda_gpu_kern_sum", normalized_display_total));
     serde_json::json!({
         "status": availability.status,
         "reason": &availability.reason,
@@ -896,7 +899,9 @@ fn total_report_rows(evidence: &EvidencePacket, report_kind: &str, fallback: usi
         .limits
         .iter()
         .filter(|(name, _)| name.contains(report_kind))
-        .fold(0_usize, |sum, (_, limit)| sum.saturating_add(limit.total_rows));
+        .fold(0_usize, |sum, (_, limit)| {
+            sum.saturating_add(limit.total_rows)
+        });
     total.max(fallback)
 }
 
