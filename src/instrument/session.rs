@@ -222,6 +222,66 @@ impl TraceSession {
         self.begin_span_inner(name, kind, Some(step), false)
     }
 
+    /// Record already-completed host work without changing the live span stack.
+    ///
+    /// `start_ns` is a monotonic offset from this session's start and `duration_ns` must be
+    /// positive. The interval must have completed before this call. The closed span is attached
+    /// directly to the session root, so it may overlap live nested spans without implying a
+    /// synchronous parent/child call relationship.
+    pub fn record_completed_host_span(
+        &self,
+        name: impl Into<String>,
+        kind: SpanKind,
+        start_ns: u64,
+        duration_ns: u64,
+    ) -> Result<SpanId> {
+        anyhow::ensure!(duration_ns > 0, "completed host span duration must be positive");
+        let end_ns = start_ns
+            .checked_add(duration_ns)
+            .context("completed host span interval overflows u64 nanoseconds")?;
+        anyhow::ensure!(
+            end_ns <= self.elapsed_ns(),
+            "completed host span ends in the future relative to the trace session"
+        );
+
+        let mut inner = self.inner.borrow_mut();
+        if let Some(error) = &inner.sticky_error {
+            anyhow::bail!("trace session previously failed: {error}");
+        }
+        let root_id = inner
+            .span_stack
+            .first()
+            .copied()
+            .context("trace session root span is missing")?;
+        inner.next_span_id += 1;
+        let span_id = SpanId(inner.next_span_id);
+        let id = span_id_string(span_id.0);
+
+        if let Err(error) = write_event(
+            &mut inner.writer,
+            &TraceEvent::SpanStart(SpanStartEvent {
+                id: id.clone(),
+                parent_id: Some(span_id_string(root_id)),
+                name: name.into(),
+                start_ns,
+                kind,
+                measured: false,
+                step: None,
+            }),
+        ) {
+            inner.sticky_error.get_or_insert_with(|| error.to_string());
+            return Err(error);
+        }
+        if let Err(error) = write_event(
+            &mut inner.writer,
+            &TraceEvent::SpanEnd(SpanEndEvent { id, duration_ns }),
+        ) {
+            inner.sticky_error.get_or_insert_with(|| error.to_string());
+            return Err(error);
+        }
+        Ok(span_id)
+    }
+
     fn begin_span_inner(
         &self,
         name: impl Into<String>,
@@ -638,6 +698,7 @@ mod tests {
     use super::*;
     use crate::trace::document::parse_trace;
     use crate::trace::events::SpanStartEvent;
+    use crate::trace::health::analyze_health;
     use serde_json::Value;
     use std::io::{BufRead, BufReader};
 
@@ -773,5 +834,69 @@ mod tests {
         let doc = parse_trace(&path).unwrap();
         assert_eq!(doc.gradients.len(), 1);
         assert_eq!(doc.gradients[0].key, "encoder.weight");
+    }
+
+    #[test]
+    fn completed_host_span_is_root_attached_stack_neutral_and_overlap_valid() {
+        let path = temp_trace("completed-host-span");
+        let session =
+            TraceSession::open(&path, ProfileRun::inference("serve::request", 1, "cpu")).unwrap();
+
+        let measured = session.begin_measurement("request");
+        let live = session.begin_span("main-thread", SpanKind::Function);
+        let stack_before = session.inner.borrow().span_stack.clone();
+        let start_ns = session.elapsed_ns();
+        let end_ns = loop {
+            let elapsed = session.elapsed_ns();
+            if elapsed > start_ns {
+                break elapsed;
+            }
+            std::hint::spin_loop();
+        };
+        let duration_ns = end_ns - start_ns;
+
+        let completed_id = session
+            .record_completed_host_span(
+                "background-work",
+                SpanKind::Function,
+                start_ns,
+                duration_ns,
+            )
+            .unwrap();
+        assert_eq!(session.inner.borrow().span_stack, stack_before);
+
+        drop(live);
+        drop(measured);
+        session.finish().unwrap();
+
+        let doc = parse_trace(&path).unwrap();
+        let completed = doc
+            .spans
+            .iter()
+            .find(|span| span.id == span_id_string(completed_id.0))
+            .unwrap();
+        let measured = doc.spans.iter().find(|span| span.measured).unwrap();
+        assert_eq!(completed.parent_id.as_deref(), Some("s1"));
+        assert_eq!(completed.start_ns, start_ns);
+        assert_eq!(completed.duration_ns, duration_ns);
+        assert!(completed.closed);
+        assert!(completed.start_ns < measured.start_ns.saturating_add(measured.duration_ns));
+        assert!(measured.start_ns < completed.start_ns.saturating_add(completed.duration_ns));
+
+        let health = analyze_health(&doc);
+        assert!(health.structurally_valid, "{:?}", health.issues);
+        assert!(health.capture_complete);
+    }
+
+    #[test]
+    fn completed_host_span_requires_positive_duration() {
+        let path = temp_trace("completed-host-span-zero");
+        let session =
+            TraceSession::open(&path, ProfileRun::inference("serve::request", 1, "cpu")).unwrap();
+        let error = session
+            .record_completed_host_span("empty", SpanKind::Function, 0, 0)
+            .unwrap_err();
+        assert!(error.to_string().contains("duration must be positive"));
+        session.finish().unwrap();
     }
 }
