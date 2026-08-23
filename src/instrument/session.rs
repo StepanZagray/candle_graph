@@ -235,7 +235,10 @@ impl TraceSession {
         start_ns: u64,
         duration_ns: u64,
     ) -> Result<SpanId> {
-        anyhow::ensure!(duration_ns > 0, "completed host span duration must be positive");
+        anyhow::ensure!(
+            duration_ns > 0,
+            "completed host span duration must be positive"
+        );
         let end_ns = start_ns
             .checked_add(duration_ns)
             .context("completed host span interval overflows u64 nanoseconds")?;
@@ -909,12 +912,7 @@ mod tests {
         assert!(error.to_string().contains("duration must be positive"));
 
         let overflow = session
-            .record_completed_host_span(
-                "overflow",
-                SpanKind::Function,
-                u64::MAX,
-                1,
-            )
+            .record_completed_host_span("overflow", SpanKind::Function, u64::MAX, 1)
             .unwrap_err();
         assert!(overflow.to_string().contains("overflows"));
 
