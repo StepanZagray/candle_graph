@@ -521,6 +521,64 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
             );
         }
     }
+    let contract = &doc.run.capture_contract;
+    let explicitly_classified = !contract.gpu_expected_semantic_labels.is_empty()
+        || !contract.cpu_only_semantic_labels.is_empty();
+    if explicitly_classified {
+        let mut classified_labels = HashSet::new();
+        for (class, labels) in [
+            ("GPU-expected", &contract.gpu_expected_semantic_labels),
+            ("CPU-only", &contract.cpu_only_semantic_labels),
+        ] {
+            let mut class_labels = HashSet::new();
+            for label in labels {
+                if label.trim().is_empty() {
+                    required_semantic_label_issue(
+                        &mut issues,
+                        failed,
+                        "empty_semantic_label_classification",
+                        format!("{class} semantic labels must not be empty"),
+                    );
+                }
+                if !class_labels.insert(label.as_str()) {
+                    required_semantic_label_issue(
+                        &mut issues,
+                        failed,
+                        "duplicate_semantic_label_classification",
+                        format!("{class} semantic label `{label}` is declared more than once"),
+                    );
+                }
+                if !required_labels.contains(label.as_str()) {
+                    required_semantic_label_issue(
+                        &mut issues,
+                        failed,
+                        "unrequired_semantic_label_classification",
+                        format!(
+                            "{class} semantic label `{label}` is not a required application label"
+                        ),
+                    );
+                }
+                if !classified_labels.insert(label.as_str()) {
+                    required_semantic_label_issue(
+                        &mut issues,
+                        failed,
+                        "overlapping_semantic_label_classification",
+                        format!(
+                            "semantic label `{label}` is classified as both GPU-expected and CPU-only"
+                        ),
+                    );
+                }
+            }
+        }
+        if classified_labels != required_labels {
+            required_semantic_label_issue(
+                &mut issues,
+                failed,
+                "incomplete_semantic_label_partition",
+                "GPU-expected and CPU-only semantic labels must partition all required application labels",
+            );
+        }
+    }
 
     TraceHealth {
         structurally_valid: !issues
@@ -880,6 +938,32 @@ mod tests {
         assert!(health.issues.iter().any(|issue| {
             issue.code == "required_semantic_label_cardinality"
                 && issue.severity == HealthSeverity::Warning
+        }));
+    }
+
+    #[test]
+    fn complete_capture_rejects_an_incomplete_semantic_label_partition() {
+        let mut document = failed_document();
+        document.terminal = TerminalEvent {
+            outcome: RunOutcome::Complete,
+            timestamp_ns: 10,
+            reason: None,
+        };
+        document.spans[0].measured = true;
+        document.spans[0].closed = true;
+        document.spans[0].duration_ns = 5;
+        document.run.capture_contract.required_semantic_labels =
+            vec!["demo".into(), "prepare".into()];
+        document
+            .run
+            .capture_contract
+            .gpu_expected_semantic_labels = vec!["demo".into()];
+
+        let health = analyze_health(&document);
+        assert!(!health.structurally_valid);
+        assert!(health.issues.iter().any(|issue| {
+            issue.code == "incomplete_semantic_label_partition"
+                && issue.severity == HealthSeverity::Error
         }));
     }
 

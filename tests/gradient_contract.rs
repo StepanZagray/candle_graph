@@ -455,6 +455,34 @@ fn capture_contract_rejects_empty_and_duplicate_required_semantic_labels() {
 }
 
 #[test]
+fn capture_contract_requires_an_exact_gpu_and_cpu_semantic_partition() {
+    let valid = CaptureContract {
+        required_semantic_labels: vec!["train/forward".into(), "train/prepare".into()],
+        gpu_expected_semantic_labels: vec!["train/forward".into()],
+        cpu_only_semantic_labels: vec!["train/prepare".into()],
+        ..CaptureContract::default()
+    };
+    valid.validate().unwrap();
+    assert_eq!(
+        valid.resolved_gpu_expected_semantic_labels(),
+        vec!["train/forward".to_string()]
+    );
+
+    let unclassified = CaptureContract {
+        cpu_only_semantic_labels: Vec::new(),
+        gpu_expected_semantic_labels: vec!["train/forward".into()],
+        ..valid.clone()
+    };
+    assert!(unclassified.validate().is_err());
+
+    let overlapping = CaptureContract {
+        cpu_only_semantic_labels: vec!["train/forward".into(), "train/prepare".into()],
+        ..valid
+    };
+    assert!(overlapping.validate().is_err());
+}
+
+#[test]
 fn complete_coverage_without_an_exact_contract_is_invalid() {
     let mut document = document(valid_gradients());
     document.run.capture_contract.gradient_contract = None;

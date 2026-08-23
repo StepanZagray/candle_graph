@@ -21,7 +21,9 @@ provenance, structural health, capability states, typed facts, explicit gaps, op
 graph, separate timing and memory planes, and optional GPU evidence.
 
 **Capture contract**: the producer's typed declaration of which evidence classes cover the whole
-measured region. Observed event counts can prove presence, but never upgrade coverage to complete.
+measured region. Required application spans may be partitioned into GPU-expected and explicitly
+CPU-only semantic labels; older contracts classify every required label as GPU-expected. Observed
+event counts can prove presence, but never upgrade coverage to complete.
 
 **Gradient contract**: a SHA-256-bound, caller-ordered manifest of expected `(root, key, family)`
 parameters plus an active, inactive, or data-conditional expectation for every family. Complete

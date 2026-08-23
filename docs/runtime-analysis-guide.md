@@ -115,10 +115,14 @@ and emits a receipt containing the exact `bundle.json` SHA-256.
 
 Retain `.nsys-rep`, export supported reports with NVIDIA's `nsys stats --format csv`, and include a
 `capture-manifest.json` using schema `candle-graph/nsight-capture/1`, containing the trace
-run/correlation IDs, required labels, tool/hardware metadata, and hashes for every retained artifact.
-Exact semantic NVTX labels identify phases; correlation/device/context/stream identifiers join GPU
-rows to projected ranges, and declared operation counts must match those joined rows. Correlation is
-checked in both directions before display truncation. Candle,
+run/correlation IDs, required application labels, their GPU-expected/CPU-only partition,
+tool/hardware metadata, and hashes for every retained artifact. Older manifests without an explicit
+partition retain the legacy meaning that every required label is GPU-expected. Official
+`nvtx_gpu_proj_trace` rows use `Projected Start`, `Projected Duration`, `Orig Start`, and
+`Orig Duration`; they establish GPU projection without correlation/device/context/stream columns.
+When optional join identifiers and a CUDA GPU timeline are both available, declared operation
+counts must match the joined rows. A CPU-only label appearing in the projection report makes
+correlation incomplete. Correlation is checked in both directions before display truncation. Candle,
 device-event, and Nsight clocks are never overlaid as one clock.
 
 Run `cargo bench --bench instrumentation_overhead --all-features` to measure the disabled capture

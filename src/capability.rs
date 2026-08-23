@@ -225,9 +225,30 @@ pub struct CaptureContract {
     pub device_timing: CoverageLevel,
     #[serde(default)]
     pub required_semantic_labels: Vec<String>,
+    /// Required application spans expected to project onto the GPU. When both semantic-class
+    /// lists are empty, all required semantic labels retain the legacy GPU-expected meaning.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpu_expected_semantic_labels: Vec<String>,
+    /// Required application spans that must not appear in an Nsight GPU projection report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cpu_only_semantic_labels: Vec<String>,
 }
 
 impl CaptureContract {
+    pub fn resolved_gpu_expected_semantic_labels(&self) -> Vec<String> {
+        if self.gpu_expected_semantic_labels.is_empty()
+            && self.cpu_only_semantic_labels.is_empty()
+        {
+            self.required_semantic_labels.clone()
+        } else {
+            self.gpu_expected_semantic_labels.clone()
+        }
+    }
+
+    pub fn resolved_cpu_only_semantic_labels(&self) -> Vec<String> {
+        self.cpu_only_semantic_labels.clone()
+    }
+
     /// Validate relationships that must hold before a producer starts capture.
     pub fn validate(&self) -> Result<()> {
         let mut semantic_labels = BTreeSet::new();
@@ -237,8 +258,41 @@ impl CaptureContract {
                 "required semantic labels must not be empty"
             );
             ensure!(
-                semantic_labels.insert(label),
+                semantic_labels.insert(label.as_str()),
                 "required semantic label `{label}` is declared more than once"
+            );
+        }
+        let explicitly_classified = !self.gpu_expected_semantic_labels.is_empty()
+            || !self.cpu_only_semantic_labels.is_empty();
+        if explicitly_classified {
+            let mut classified_labels = BTreeSet::new();
+            for (class, labels) in [
+                ("GPU-expected", &self.gpu_expected_semantic_labels),
+                ("CPU-only", &self.cpu_only_semantic_labels),
+            ] {
+                let mut class_labels = BTreeSet::new();
+                for label in labels {
+                    ensure!(
+                        !label.trim().is_empty(),
+                        "{class} semantic labels must not be empty"
+                    );
+                    ensure!(
+                        class_labels.insert(label.as_str()),
+                        "{class} semantic label `{label}` is declared more than once"
+                    );
+                    ensure!(
+                        semantic_labels.contains(label.as_str()),
+                        "{class} semantic label `{label}` is not a required application label"
+                    );
+                    ensure!(
+                        classified_labels.insert(label.as_str()),
+                        "semantic label `{label}` is classified as both GPU-expected and CPU-only"
+                    );
+                }
+            }
+            ensure!(
+                classified_labels == semantic_labels,
+                "GPU-expected and CPU-only semantic labels must partition all required application labels"
             );
         }
         match (self.gradients, self.gradient_contract.as_ref()) {

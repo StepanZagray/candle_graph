@@ -65,12 +65,16 @@ pub enum FactValue {
 pub fn build_evidence(trace: &Path, nsight_dir: Option<&Path>) -> Result<EvidencePacket> {
     let document =
         parse_trace(trace).with_context(|| format!("parse trace {}", trace.display()))?;
-    let expected = document
-        .run
-        .capture_contract
-        .required_semantic_labels
-        .clone();
-    let gpu = NsightEvidence::load_optional(nsight_dir, &expected);
+    let contract = &document.run.capture_contract;
+    let required_application_labels = contract.required_semantic_labels.clone();
+    let gpu_expected_semantic_labels = contract.resolved_gpu_expected_semantic_labels();
+    let cpu_only_semantic_labels = contract.resolved_cpu_only_semantic_labels();
+    let gpu = NsightEvidence::load_optional_with_semantic_contract(
+        nsight_dir,
+        &required_application_labels,
+        &gpu_expected_semantic_labels,
+        &cpu_only_semantic_labels,
+    );
     EvidencePacket::from_document(document, gpu)
 }
 

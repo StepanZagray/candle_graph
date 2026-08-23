@@ -176,6 +176,9 @@ cargo candle-graph view application.jsonl --nsight-dir nsight --output viewer.ht
 The bundle retains the raw `.nsys-rep` and normalized inputs. A `capture-manifest.json` with schema
 `candle-graph/nsight-capture/1` binds their hashes and run/correlation IDs to the trace. Supported reports are `cuda_gpu_trace`,
 `cuda_gpu_kern_sum`, `cuda_api_sum`, `cuda_gpu_mem_time_sum`, and `nvtx_gpu_proj_trace`.
+Required application labels can be partitioned into `gpu_expected_semantic_labels` and
+`cpu_only_semantic_labels`; legacy contracts with neither field continue to classify every required
+label as GPU-expected. Projected CPU-only labels are reported as correlation failures.
 
 ## Schemas
 

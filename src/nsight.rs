@@ -45,7 +45,14 @@ pub struct CaptureManifest {
     pub commands: Vec<String>,
     pub hardware: CaptureHardware,
     pub source_revisions: BTreeMap<String, String>,
+    /// All application labels whose exact cardinality is required by the trace contract.
     pub required_semantic_labels: Vec<String>,
+    /// The required-label subset expected in `nvtx_gpu_proj_trace`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpu_expected_semantic_labels: Vec<String>,
+    /// The required-label subset that must be absent from `nvtx_gpu_proj_trace`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cpu_only_semantic_labels: Vec<String>,
     pub artifacts: Vec<ManifestArtifact>,
 }
 
@@ -145,10 +152,14 @@ pub struct CorrelationDuplicate {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NsightCorrelationLedger {
     pub expected: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cpu_only: Vec<String>,
     pub observed: Vec<String>,
     pub matched: Vec<String>,
     pub missing_expected: Vec<String>,
     pub unexpected_observed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unexpected_cpu_only: Vec<String>,
     pub duplicates: Vec<CorrelationDuplicate>,
 }
 
@@ -270,10 +281,29 @@ impl NsightEvidence {
     /// Load official CSV reports. A missing or invalid capture manifest lowers provenance
     /// confidence without suppressing independently parseable GPU evidence.
     pub fn load_optional(dir: Option<&Path>, expected_semantic_keys: &[String]) -> Self {
+        Self::load_optional_with_semantic_contract(
+            dir,
+            expected_semantic_keys,
+            expected_semantic_keys,
+            &[],
+        )
+    }
+
+    pub fn load_optional_with_semantic_contract(
+        dir: Option<&Path>,
+        required_application_labels: &[String],
+        gpu_expected_semantic_keys: &[String],
+        cpu_only_semantic_keys: &[String],
+    ) -> Self {
         let Some(dir) = dir else {
             return Self::unavailable("Nsight capture was not requested");
         };
-        match Self::load(dir, expected_semantic_keys) {
+        match Self::load_with_semantic_contract(
+            dir,
+            required_application_labels,
+            gpu_expected_semantic_keys,
+            cpu_only_semantic_keys,
+        ) {
             Ok(evidence) => evidence,
             Err(error) => Self {
                 status: GpuEvidenceStatus::Failed,
@@ -284,6 +314,20 @@ impl NsightEvidence {
     }
 
     pub fn load(dir: &Path, expected_semantic_keys: &[String]) -> anyhow::Result<Self> {
+        Self::load_with_semantic_contract(
+            dir,
+            expected_semantic_keys,
+            expected_semantic_keys,
+            &[],
+        )
+    }
+
+    pub fn load_with_semantic_contract(
+        dir: &Path,
+        required_application_labels: &[String],
+        gpu_expected_semantic_keys: &[String],
+        cpu_only_semantic_keys: &[String],
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             dir.is_dir(),
             "Nsight report directory does not exist: {}",
@@ -376,8 +420,12 @@ impl NsightEvidence {
             }
         }
 
-        result.correlation =
-            build_correlation(expected_semantic_keys, &all_nvtx_ranges, &all_gpu_timeline);
+        result.correlation = build_correlation(
+            gpu_expected_semantic_keys,
+            cpu_only_semantic_keys,
+            &all_nvtx_ranges,
+            &all_gpu_timeline,
+        );
         result.phase_attribution = attribute_gpu_phases(&all_nvtx_ranges, &all_gpu_timeline);
         all_nvtx_ranges.truncate(TIMELINE_DISPLAY_LIMIT);
         all_gpu_timeline.truncate(TIMELINE_DISPLAY_LIMIT);
@@ -386,7 +434,9 @@ impl NsightEvidence {
 
         validate_provenance(
             dir,
-            expected_semantic_keys,
+            required_application_labels,
+            gpu_expected_semantic_keys,
+            cpu_only_semantic_keys,
             &result.source_csv,
             result.raw_report.as_ref(),
             &mut result.provenance,
@@ -446,7 +496,9 @@ fn load_provenance(dir: &Path) -> NsightProvenance {
 
 fn validate_provenance(
     dir: &Path,
-    expected_semantic_keys: &[String],
+    required_application_labels: &[String],
+    gpu_expected_semantic_keys: &[String],
+    cpu_only_semantic_keys: &[String],
     csv: &[NsightArtifact],
     raw_report: Option<&NsightArtifact>,
     provenance: &mut NsightProvenance,
@@ -473,10 +525,41 @@ fn validate_provenance(
     let mut declared = BTreeSet::new();
 
     let manifest_labels = sorted_unique(manifest.required_semantic_labels.iter().cloned());
-    let expected_labels = sorted_unique(expected_semantic_keys.iter().cloned());
+    if manifest_labels.len() != manifest.required_semantic_labels.len() {
+        mismatches.push("manifest required application labels contain duplicates".into());
+    }
+    let expected_labels = sorted_unique(required_application_labels.iter().cloned());
     if manifest_labels != expected_labels {
         mismatches.push(format!(
-            "manifest semantic labels do not match the application expectation: expected {expected_labels:?}, declared {manifest_labels:?}"
+            "manifest required application labels do not match the application expectation: expected {expected_labels:?}, declared {manifest_labels:?}"
+        ));
+    }
+    let manifest_uses_legacy_semantics = manifest.gpu_expected_semantic_labels.is_empty()
+        && manifest.cpu_only_semantic_labels.is_empty();
+    let manifest_gpu_labels = if manifest_uses_legacy_semantics {
+        manifest_labels.clone()
+    } else {
+        sorted_unique(manifest.gpu_expected_semantic_labels.iter().cloned())
+    };
+    let manifest_cpu_labels = sorted_unique(manifest.cpu_only_semantic_labels.iter().cloned());
+    if !manifest_uses_legacy_semantics
+        && manifest_gpu_labels.len() != manifest.gpu_expected_semantic_labels.len()
+    {
+        mismatches.push("manifest GPU-expected labels contain duplicates".into());
+    }
+    if manifest_cpu_labels.len() != manifest.cpu_only_semantic_labels.len() {
+        mismatches.push("manifest CPU-only labels contain duplicates".into());
+    }
+    let expected_gpu_labels = sorted_unique(gpu_expected_semantic_keys.iter().cloned());
+    let expected_cpu_labels = sorted_unique(cpu_only_semantic_keys.iter().cloned());
+    if manifest_gpu_labels != expected_gpu_labels {
+        mismatches.push(format!(
+            "manifest GPU-expected labels do not match the application expectation: expected {expected_gpu_labels:?}, declared {manifest_gpu_labels:?}"
+        ));
+    }
+    if manifest_cpu_labels != expected_cpu_labels {
+        mismatches.push(format!(
+            "manifest CPU-only labels do not match the application expectation: expected {expected_cpu_labels:?}, declared {manifest_cpu_labels:?}"
         ));
     }
 
@@ -573,35 +656,47 @@ fn artifact_metadata(root: &Path, path: &Path) -> anyhow::Result<NsightArtifact>
 
 fn build_correlation(
     expected: &[String],
+    cpu_only: &[String],
     ranges: &[NsightTimelineRow],
     gpu_timeline: &[NsightTimelineRow],
 ) -> NsightCorrelation {
     if ranges.is_empty() {
         let mut correlation = empty_correlation();
         correlation.ledger.expected = sorted_unique(expected.iter().cloned());
+        correlation.ledger.cpu_only = sorted_unique(cpu_only.iter().cloned());
         correlation.ledger.missing_expected = correlation.ledger.expected.clone();
         return correlation;
     }
 
     let expected = sorted_unique(expected.iter().cloned());
+    let cpu_only = sorted_unique(cpu_only.iter().cloned());
     let mut counts = BTreeMap::<String, usize>::new();
     for key in ranges.iter().filter_map(|row| row.semantic_key.as_ref()) {
         *counts.entry(key.clone()).or_default() += 1;
     }
     let observed = counts.keys().cloned().collect::<Vec<_>>();
-    let expected_set = expected.iter().collect::<BTreeSet<_>>();
-    let observed_set = observed.iter().collect::<BTreeSet<_>>();
+    let expected_set = expected.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let cpu_only_set = cpu_only.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let observed_set = observed.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let matched = expected_set
         .intersection(&observed_set)
-        .map(|key| (*key).clone())
+        .map(|key| (*key).to_string())
         .collect();
     let missing_expected = expected_set
         .difference(&observed_set)
-        .map(|key| (*key).clone())
+        .map(|key| (*key).to_string())
         .collect();
+    let known_application_set = expected_set
+        .union(&cpu_only_set)
+        .copied()
+        .collect::<BTreeSet<_>>();
     let unexpected_observed = observed_set
-        .difference(&expected_set)
-        .map(|key| (*key).clone())
+        .difference(&known_application_set)
+        .map(|key| (*key).to_string())
+        .collect();
+    let unexpected_cpu_only = observed_set
+        .intersection(&cpu_only_set)
+        .map(|key| (*key).to_string())
         .collect();
     let duplicates = counts
         .into_iter()
@@ -611,32 +706,55 @@ fn build_correlation(
             occurrences,
         })
         .collect::<Vec<_>>();
-    let all_ranges_qualified = ranges.iter().all(|row| {
-        row.gpu_operations.is_some_and(|expected_count| {
-            matching_gpu_operations(row, gpu_timeline)
-                .is_some_and(|operations| operations.len() as u64 == expected_count)
+    let mut joinable_count_checks = 0_usize;
+    let mut unjoined_projection_rows = 0_usize;
+    let all_ranges_qualified = ranges
+        .iter()
+        .filter(|row| {
+            row.semantic_key
+                .as_ref()
+                .is_some_and(|key| expected_set.contains(key.as_str()))
         })
-    });
+        .all(|row| match row.gpu_operations {
+            Some(0) => false,
+            Some(expected_count)
+                if !gpu_timeline.is_empty() && !phase_join_keys(row).is_empty() =>
+            {
+                joinable_count_checks += 1;
+                matching_gpu_operations(row, gpu_timeline)
+                    .is_some_and(|operations| operations.len() as u64 == expected_count)
+            }
+            _ => {
+                unjoined_projection_rows += 1;
+                true
+            }
+        });
     let ledger = NsightCorrelationLedger {
         expected,
+        cpu_only,
         observed,
         matched,
         missing_expected,
         unexpected_observed,
+        unexpected_cpu_only,
         duplicates,
     };
     let complete = !ledger.expected.is_empty()
         && ledger.missing_expected.is_empty()
         && ledger.unexpected_observed.is_empty()
+        && ledger.unexpected_cpu_only.is_empty()
         && ledger.duplicates.is_empty()
         && all_ranges_qualified;
     let reason = if complete {
-        "Expected and observed semantic labels match exactly; every projected range's declared GPU operation count matches joined GPU rows; Candle and Nsight clocks remain separate".into()
+        format!(
+            "GPU-expected and observed semantic labels match exactly; {joinable_count_checks} joinable GPU operation count checks passed and {unjoined_projection_rows} projected rows rely on the official projection report; Candle and Nsight clocks remain separate"
+        )
     } else {
         format!(
-            "Correlation is incomplete: {} missing expected, {} unexpected observed, {} duplicate labels, GPU operation counts complete={all_ranges_qualified}; clocks remain separate",
+            "Correlation is incomplete: {} missing GPU-expected, {} unexpected observed, {} CPU-only projected, {} duplicate labels, joinable GPU operation counts complete={all_ranges_qualified}; clocks remain separate",
             ledger.missing_expected.len(),
             ledger.unexpected_observed.len(),
+            ledger.unexpected_cpu_only.len(),
             ledger.duplicates.len()
         )
     };
@@ -830,9 +948,24 @@ fn parse_timeline(
         has_header(&headers, &["name", "operation", "range", "kernel_name"]),
         "missing operation/name column"
     );
+    let start_headers: &[&str] = if projected {
+        &["orig_start_ns", "orig_start", "start_ns", "start"]
+    } else {
+        &["start_ns", "start"]
+    };
+    let duration_headers: &[&str] = if projected {
+        &[
+            "orig_duration_ns",
+            "orig_duration",
+            "duration_ns",
+            "duration",
+            "dur_ns",
+        ]
+    } else {
+        &["duration_ns", "duration", "dur_ns"]
+    };
     anyhow::ensure!(
-        has_header(&headers, &["start_ns", "start"])
-            && has_header(&headers, &["duration_ns", "duration", "dur_ns"]),
+        has_header(&headers, start_headers) && has_header(&headers, duration_headers),
         "missing start/duration nanoseconds columns"
     );
     if projected {
@@ -861,12 +994,9 @@ fn parse_timeline(
         if name.is_empty() {
             continue;
         }
-        let start_ns =
-            required_number(field(&headers, &record, &["start_ns", "start"]), "start_ns")?;
-        let duration_ns = required_number(
-            field(&headers, &record, &["duration_ns", "duration", "dur_ns"]),
-            "duration_ns",
-        )?;
+        let start_ns = required_number(field(&headers, &record, start_headers), "start_ns")?;
+        let duration_ns =
+            required_number(field(&headers, &record, duration_headers), "duration_ns")?;
         anyhow::ensure!(duration_ns > 0, "timeline row `{name}` has zero duration");
         let projected_start_ns = optional_number(
             field(
@@ -896,8 +1026,10 @@ fn parse_timeline(
             name,
             kind: kind.into(),
             device: field(&headers, &record, &["device", "device_id"]).map(str::to_string),
-            context: field(&headers, &record, &["context", "context_id"]).map(str::to_string),
-            stream: field(&headers, &record, &["stream", "stream_id"]).map(str::to_string),
+            context: field(&headers, &record, &["context", "context_id", "ctx"])
+                .map(str::to_string),
+            stream: field(&headers, &record, &["stream", "stream_id", "strm"])
+                .map(str::to_string),
             correlation_id: field(&headers, &record, &["correlation_id", "corrid", "corr_id"])
                 .map(str::to_string),
             start_ns,
@@ -1106,6 +1238,113 @@ mod tests {
     }
 
     #[test]
+    fn parses_official_nvtx_projection_columns_without_gpu_join_identifiers() {
+        let dir = temp_dir("official-nvtx-projection");
+        fs::write(
+            dir.join("sample_nvtx_gpu_proj_trace.csv"),
+            include_str!("../tests/fixtures/nsight/nvtx_gpu_proj_trace.csv"),
+        )
+        .unwrap();
+        let required = vec!["pipeline/gpu".into(), "pipeline/prepare".into()];
+        let gpu_expected = vec!["pipeline/gpu".into()];
+        let cpu_only = vec!["pipeline/prepare".into()];
+        let evidence = NsightEvidence::load_with_semantic_contract(
+            &dir,
+            &required,
+            &gpu_expected,
+            &cpu_only,
+        )
+        .unwrap();
+
+        assert_eq!(evidence.status, GpuEvidenceStatus::Available);
+        assert!(evidence.correlation.complete);
+        assert_eq!(evidence.correlation.ledger.expected, gpu_expected);
+        assert_eq!(evidence.correlation.ledger.cpu_only, cpu_only);
+        assert!(evidence.correlation.ledger.missing_expected.is_empty());
+        assert!(evidence.correlation.ledger.unexpected_cpu_only.is_empty());
+        assert_eq!(evidence.nvtx_ranges[0].start_ns, 700);
+        assert_eq!(evidence.nvtx_ranges[0].duration_ns, 600);
+        assert_eq!(evidence.nvtx_ranges[0].projected_start_ns, Some(1_000));
+        assert_eq!(evidence.nvtx_ranges[0].projected_duration_ns, Some(250));
+        assert_eq!(evidence.nvtx_ranges[0].gpu_operations, Some(3));
+        assert_eq!(evidence.nvtx_ranges[0].correlation_id, None);
+        assert_eq!(evidence.nvtx_ranges[0].device, None);
+        assert!(evidence.phase_attribution.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recognizes_official_cuda_context_and_stream_aliases() {
+        let dir = temp_dir("official-cuda-aliases");
+        let path = dir.join("sample_cuda_gpu_trace.csv");
+        fs::write(
+            &path,
+            include_str!("../tests/fixtures/nsight/cuda_gpu_trace.csv"),
+        )
+        .unwrap();
+
+        let row = parse_timeline(&path, "gpu_operation", false)
+            .unwrap()
+            .remove(0);
+        assert_eq!(row.context.as_deref(), Some("7"));
+        assert_eq!(row.stream.as_deref(), Some("13"));
+        assert_eq!(row.correlation_id.as_deref(), Some("41"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_capture_manifest_deserializes_with_all_required_labels_gpu_expected() {
+        let json = serde_json::json!({
+            "schema": CAPTURE_MANIFEST_SCHEMA,
+            "run": { "id": "run-1" },
+            "correlation": { "id": "update-1" },
+            "tool": { "name": "nsys", "version": "test" },
+            "commands": ["nsys profile app"],
+            "hardware": {},
+            "source_revisions": {},
+            "required_semantic_labels": ["pipeline/gpu"],
+            "artifacts": []
+        });
+        let manifest: CaptureManifest = serde_json::from_value(json).unwrap();
+        assert!(manifest.gpu_expected_semantic_labels.is_empty());
+        assert!(manifest.cpu_only_semantic_labels.is_empty());
+        assert_eq!(
+            manifest.required_semantic_labels,
+            vec!["pipeline/gpu".to_string()]
+        );
+    }
+
+    #[test]
+    fn gpu_projection_of_explicit_cpu_only_span_is_reported_and_incomplete() {
+        let dir = temp_dir("cpu-only-projected");
+        let mut csv =
+            include_str!("../tests/fixtures/nsight/nvtx_gpu_proj_trace.csv").to_string();
+        csv.push_str("pipeline/prepare,1300,40,1260,90,Push/Pop,4242,17,1,0,0,2,0,2\n");
+        fs::write(dir.join("sample_nvtx_gpu_proj_trace.csv"), csv).unwrap();
+        let required = vec!["pipeline/gpu".into(), "pipeline/prepare".into()];
+        let evidence = NsightEvidence::load_with_semantic_contract(
+            &dir,
+            &required,
+            &["pipeline/gpu".into()],
+            &["pipeline/prepare".into()],
+        )
+        .unwrap();
+
+        assert!(!evidence.correlation.complete);
+        assert_eq!(
+            evidence.correlation.ledger.unexpected_cpu_only,
+            vec!["pipeline/prepare".to_string()]
+        );
+        assert!(evidence.correlation.ledger.unexpected_observed.is_empty());
+        assert!(evidence
+            .correlation
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("1 CPU-only projected")));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn correlation_reports_missing_expected_labels() {
         let dir = temp_dir("missing-label");
         fs::write(
@@ -1172,6 +1411,8 @@ mod tests {
             hardware: CaptureHardware::default(),
             source_revisions: BTreeMap::from([("app".into(), "abc123".into())]),
             required_semantic_labels: Vec::new(),
+            gpu_expected_semantic_labels: Vec::new(),
+            cpu_only_semantic_labels: Vec::new(),
             artifacts: vec![ManifestArtifact {
                 path: "sample_cuda_gpu_kern_sum.csv".into(),
                 size_bytes: fs::metadata(&csv_path).unwrap().len(),
@@ -1232,6 +1473,8 @@ mod tests {
             hardware: CaptureHardware::default(),
             source_revisions: BTreeMap::new(),
             required_semantic_labels: vec![],
+            gpu_expected_semantic_labels: Vec::new(),
+            cpu_only_semantic_labels: Vec::new(),
             artifacts,
         };
         fs::write(
