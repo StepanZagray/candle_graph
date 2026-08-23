@@ -90,9 +90,14 @@ its little-endian `u64` length. Current public protocol constants are `TRACE_SCH
 ## Publish evidence
 
 ```bash
-cargo candle-graph summary application.jsonl
+cargo candle-graph summary evidence-bundle
 cargo candle-graph query application.jsonl --kind slowest-host
 cargo candle-graph query application.jsonl --kind slowest-device
+cargo candle-graph query evidence-bundle --kind gpu-status
+cargo candle-graph query evidence-bundle --kind gpu-correlation
+cargo candle-graph query evidence-bundle --kind gpu-phases
+cargo candle-graph query evidence-bundle --kind gpu-kernels
+cargo candle-graph query evidence-bundle --kind gpu-attribution-gaps
 cargo candle-graph report application.jsonl --nsight-dir nsight --bundle evidence-bundle
 cargo candle-graph verify evidence-bundle --output verification.json
 cargo candle-graph view application.jsonl --nsight-dir nsight --output viewer.html
@@ -100,6 +105,15 @@ cargo candle-graph compare \
   --baseline base-1.bundle base-2.bundle base-3.bundle base-4.bundle base-5.bundle \
   --candidate next-1.bundle next-2.bundle next-3.bundle next-4.bundle next-5.bundle
 ```
+
+For `summary` and `query`, pass a finalized bundle/profile directory or its `trace.jsonl` whenever
+one exists. The CLI deeply verifies the bundle and consumes its bound `evidence.json`, preserving
+normalized Nsight facts. It deeply verifies before and after reading and requires identical
+point-in-time receipts; this narrows, but cannot make a mutable filesystem transactionally atomic.
+It fails closed if the input's parent has `evidence.json` or `nsight/` but no `bundle.json`,
+regardless of the trace filename. An ordinary raw JSONL in an unaugmented directory remains a valid
+trace-only input and reports GPU evidence as explicitly unavailable. GPU phase and kernel rows are
+bounded; their total/displayed counts and truncation state are part of each query response.
 
 The packet reports structural validity separately from capability states. A failed terminal event
 remains inspectable but has no derived graph. Comparison deeply verifies every supplied finalized

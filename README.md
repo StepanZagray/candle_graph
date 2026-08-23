@@ -11,8 +11,8 @@ There is no static Rust analysis. Every claim comes from one concrete run.
 
 ## What agents get
 
-- `summary`: bounded provenance, structural outcome, capability matrix, findings, gaps, and totals.
-- `query`: host/device costs, storage lifetimes, physical memory, spans, tensors, or gradients.
+- `summary`: bounded provenance, structural outcome, capability matrix, GPU status, findings, gaps, and totals.
+- `query`: host/device costs, storage lifetimes, physical memory, spans, tensors, gradients, or bounded GPU evidence.
 - `compare`: at least five compatible baseline and candidate runs with raw samples and a 95% bootstrap interval.
 - `report`: an atomically published, content-addressed evidence bundle.
 - `verify`: deep bundle verification with a durable manifest-digest receipt.
@@ -146,8 +146,13 @@ are `TRACE_SCHEMA`, `EVIDENCE_SCHEMA`, `COMPARISON_SCHEMA`, `BUNDLE_SCHEMA`, and
 ## Analyze
 
 ```bash
-cargo candle-graph summary application.jsonl
+cargo candle-graph summary evidence-bundle
 cargo candle-graph query application.jsonl --kind slowest-host
+cargo candle-graph query evidence-bundle --kind gpu-status
+cargo candle-graph query evidence-bundle --kind gpu-correlation
+cargo candle-graph query evidence-bundle --kind gpu-phases
+cargo candle-graph query evidence-bundle --kind gpu-kernels
+cargo candle-graph query evidence-bundle --kind gpu-attribution-gaps
 cargo candle-graph query application.jsonl --kind gradients
 cargo candle-graph query application.jsonl --kind tensors
 cargo candle-graph report base-1.jsonl --bundle base-1.bundle
@@ -160,6 +165,21 @@ cargo candle-graph report application.jsonl --bundle evidence-bundle
 cargo candle-graph verify evidence-bundle --output verification.json
 cargo candle-graph view application.jsonl --output viewer.html
 ```
+
+`summary` and `query` accept a raw trace, a finalized bundle/profile directory, or that bundle's
+`trace.jsonl`. Bundle inputs are deeply verified and read from their verified `evidence.json`, so
+identity-bound normalized Nsight evidence is retained. The bundle is deeply verified before and
+after reading its trace and packet, and both point-in-time receipts must match. This narrows the
+verification/read race but does not make mutable storage atomic. A parent directory containing
+`evidence.json` or `nsight/` without `bundle.json` is rejected, regardless of the input filename,
+instead of being silently treated as trace-only. Raw trace inputs from unaugmented directories
+remain supported; their GPU status is explicitly `unavailable` because no Nsight source was
+supplied.
+
+GPU queries are bounded. `gpu-phases` separates projected Nsight ranges from exact joined GPU-busy
+attribution, and `gpu-attribution-gaps` reports missing, unexpected, CPU-only, duplicate, and
+matched-but-unattributed semantic labels. Candle host, device-event, and Nsight clocks remain
+separate in every result.
 
 `compare` deeply verifies every bundle immediately before reading its bound trace. Raw trace
 comparison remains available through `--unverified-traces`, but its result is always marked

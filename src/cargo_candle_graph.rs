@@ -1,7 +1,7 @@
 //! Cargo subcommand entrypoint: `cargo candle-graph …`.
 //!
 //! Installed as `cargo-candle-graph` so Cargo discovers it as `cargo candle-graph`.
-//! Trace-only commands: import, summarize, query, compare, report, verify, and view evidence.
+//! Trace and bundle commands: import, summarize, query, compare, report, verify, and view evidence.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -28,9 +28,9 @@ enum Command {
     /// Render a standalone HTML visualizer from a trace (requires `visualizer` feature).
     #[cfg(feature = "visualizer")]
     View(ViewArgs),
-    /// Emit profiler summary for a trace file.
+    /// Emit a profiler summary for a raw trace or verified bundle/profile.
     Summary(SummaryArgs),
-    /// Run a bounded query against trace-derived graph data.
+    /// Run a bounded query against raw-trace or verified bundle evidence.
     Query(QueryArgs),
     /// Compare a candidate profile run with an explicit baseline.
     Compare(CompareArgs),
@@ -96,8 +96,9 @@ struct VerifyArgs {
 
 #[derive(Parser, Debug)]
 struct SummaryArgs {
-    /// Trace JSONL file (`candle-graph/trace/9`).
-    trace: PathBuf,
+    /// Raw trace, finalized bundle/profile directory, or its `trace.jsonl`.
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
 
     #[arg(long, short, value_name = "FILE")]
     output: Option<PathBuf>,
@@ -105,8 +106,9 @@ struct SummaryArgs {
 
 #[derive(Parser, Debug)]
 struct QueryArgs {
-    /// Trace JSONL file (`candle-graph/trace/9`).
-    trace: PathBuf,
+    /// Raw trace, finalized bundle/profile directory, or its `trace.jsonl`.
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
 
     #[arg(long, value_enum)]
     kind: CliTraceQueryKind,
@@ -125,6 +127,11 @@ enum CliTraceQueryKind {
     Tensors,
     Gradients,
     Capabilities,
+    GpuStatus,
+    GpuCorrelation,
+    GpuPhases,
+    GpuKernels,
+    GpuAttributionGaps,
 }
 
 impl From<CliTraceQueryKind> for TraceQueryKind {
@@ -138,6 +145,11 @@ impl From<CliTraceQueryKind> for TraceQueryKind {
             CliTraceQueryKind::Tensors => Self::Tensors,
             CliTraceQueryKind::Gradients => Self::Gradients,
             CliTraceQueryKind::Capabilities => Self::Capabilities,
+            CliTraceQueryKind::GpuStatus => Self::GpuStatus,
+            CliTraceQueryKind::GpuCorrelation => Self::GpuCorrelation,
+            CliTraceQueryKind::GpuPhases => Self::GpuPhases,
+            CliTraceQueryKind::GpuKernels => Self::GpuKernels,
+            CliTraceQueryKind::GpuAttributionGaps => Self::GpuAttributionGaps,
         }
     }
 }
@@ -151,10 +163,10 @@ fn main() -> Result<()> {
             trace_cli::run_view(&view.trace, &view.output, view.nsight_dir.as_deref())
         }
         Command::Summary(summary) => {
-            trace_cli::run_summary(&summary.trace, summary.output.as_deref())
+            trace_cli::run_summary(&summary.input, summary.output.as_deref())
         }
         Command::Query(query) => {
-            trace_cli::run_query(&query.trace, query.kind.into(), query.output.as_deref())
+            trace_cli::run_query(&query.input, query.kind.into(), query.output.as_deref())
         }
         Command::Compare(compare) => trace_cli::run_compare(
             &compare.baseline,

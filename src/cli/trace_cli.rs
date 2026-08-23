@@ -1,14 +1,22 @@
 //! Evidence CLI engine for trace/9, evidence/3, comparison/4, and atomic bundles.
 
+use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, ensure, Context, Result};
+use serde::Serialize;
 
-use crate::artifact::{publish_bundle, verify_bundle};
+use crate::artifact::{publish_bundle, verify_bundle, BundleVerificationReceipt};
 use crate::comparison::{compare_unverified_traces, compare_verified_bundles};
 use crate::evidence::{build_evidence, EvidencePacket};
 use crate::graph::{ExecutionGraph, GraphNode, GraphNodeKind};
+use crate::nsight::ProvenanceBindingState;
 use crate::trace::parse_trace;
+
+const QUERY_ROW_LIMIT: usize = 50;
+const QUERY_LABEL_LIMIT: usize = 100;
+const QUERY_DIAGNOSTIC_LIMIT: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceQueryKind {
@@ -20,10 +28,173 @@ pub enum TraceQueryKind {
     Tensors,
     Gradients,
     Capabilities,
+    GpuStatus,
+    GpuCorrelation,
+    GpuPhases,
+    GpuKernels,
+    GpuAttributionGaps,
 }
 
-pub fn load_evidence(trace_path: &Path) -> Result<EvidencePacket> {
-    build_evidence(trace_path, None)
+impl TraceQueryKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SlowestHost => "slowest-host",
+            Self::SlowestDevice => "slowest-device",
+            Self::Heaviest => "heaviest",
+            Self::Memory => "memory",
+            Self::Spans => "spans",
+            Self::Tensors => "tensors",
+            Self::Gradients => "gradients",
+            Self::Capabilities => "capabilities",
+            Self::GpuStatus => "gpu-status",
+            Self::GpuCorrelation => "gpu-correlation",
+            Self::GpuPhases => "gpu-phases",
+            Self::GpuKernels => "gpu-kernels",
+            Self::GpuAttributionGaps => "gpu-attribution-gaps",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EvidenceInputKind {
+    RawTrace,
+    VerifiedBundle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct EvidenceInput {
+    kind: EvidenceInputKind,
+    requested_path: PathBuf,
+    trace_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_root: Option<PathBuf>,
+    evidence_source: &'static str,
+    gpu_identity_bound: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<BundleVerificationReceipt>,
+}
+
+struct LoadedEvidence {
+    packet: EvidencePacket,
+    input: EvidenceInput,
+}
+
+/// Load a raw trace or the verified evidence packet for a finalized bundle/profile directory.
+/// A `trace.jsonl` inside a bundle resolves to that bundle so normalized GPU evidence is retained.
+pub fn load_evidence(input: &Path) -> Result<EvidencePacket> {
+    Ok(load_evidence_input(input)?.packet)
+}
+
+fn load_evidence_input(input: &Path) -> Result<LoadedEvidence> {
+    if !input.exists() {
+        bail!("evidence input does not exist: {}", input.display());
+    }
+
+    if input.is_dir() {
+        if input.join("bundle.json").exists() {
+            return load_verified_bundle(input, input);
+        }
+        let trace = input.join("trace.jsonl");
+        ensure!(
+            trace.is_file(),
+            "input directory is neither a finalized bundle nor a raw-trace directory: {}",
+            input.display()
+        );
+        reject_unverified_augmented_parent(input)?;
+        return load_raw_trace(input, &trace);
+    }
+
+    ensure!(
+        input.is_file(),
+        "evidence input is not a regular file: {}",
+        input.display()
+    );
+    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    if parent.join("bundle.json").exists() {
+        return load_verified_bundle(input, parent);
+    }
+    reject_unverified_augmented_parent(parent)?;
+    load_raw_trace(input, input)
+}
+
+fn load_raw_trace(requested_path: &Path, trace_path: &Path) -> Result<LoadedEvidence> {
+    let packet = build_evidence(trace_path, None)?;
+    Ok(LoadedEvidence {
+        input: EvidenceInput {
+            kind: EvidenceInputKind::RawTrace,
+            requested_path: requested_path.to_path_buf(),
+            trace_path: trace_path.to_path_buf(),
+            bundle_root: None,
+            evidence_source: "trace_reconstruction",
+            gpu_identity_bound: false,
+            verification: None,
+        },
+        packet,
+    })
+}
+
+fn load_verified_bundle(requested_path: &Path, root: &Path) -> Result<LoadedEvidence> {
+    let verification = verify_bundle(root)
+        .with_context(|| format!("verify evidence bundle {}", root.display()))?;
+    let trace_path = root.join("trace.jsonl");
+    let document = parse_trace(&trace_path)
+        .with_context(|| format!("parse verified bundle trace {}", trace_path.display()))?;
+    ensure!(
+        verification.run_id == document.run.run_id,
+        "verified bundle manifest run ID {:?} does not match trace run ID {:?}",
+        verification.run_id,
+        document.run.run_id
+    );
+
+    let evidence_path = root.join("evidence.json");
+    let packet: EvidencePacket = serde_json::from_slice(
+        &fs::read(&evidence_path)
+            .with_context(|| format!("read verified evidence packet {}", evidence_path.display()))?,
+    )
+    .with_context(|| format!("parse verified evidence packet {}", evidence_path.display()))?;
+    ensure!(
+        packet.schema == crate::evidence::SCHEMA,
+        "unsupported evidence schema {:?}; expected {:?}",
+        packet.schema,
+        crate::evidence::SCHEMA
+    );
+    ensure!(
+        packet.provenance == document.run,
+        "verified evidence packet provenance does not match its trace metadata"
+    );
+    let verification_after_read = verify_bundle(root)
+        .with_context(|| format!("re-verify evidence bundle {} after reading", root.display()))?;
+    ensure!(
+        verification_after_read == verification,
+        "evidence bundle verification receipt changed while trace/evidence were being read"
+    );
+
+    let gpu_identity_bound = packet.gpu.provenance.binding == ProvenanceBindingState::Bound;
+    Ok(LoadedEvidence {
+        packet,
+        input: EvidenceInput {
+            kind: EvidenceInputKind::VerifiedBundle,
+            requested_path: requested_path.to_path_buf(),
+            trace_path,
+            bundle_root: Some(root.to_path_buf()),
+            evidence_source: "verified_evidence_json",
+            gpu_identity_bound,
+            verification: Some(verification),
+        },
+    })
+}
+
+fn reject_unverified_augmented_parent(root: &Path) -> Result<()> {
+    let evidence = root.join("evidence.json");
+    let nsight = root.join("nsight");
+    if evidence.exists() || nsight.exists() {
+        bail!(
+            "input parent {} contains augmented evidence but no bundle.json; refusing to discard unverified GPU evidence and rebuild as trace-only",
+            root.display()
+        );
+    }
+    Ok(())
 }
 
 pub fn run_import(trace_path: &Path, output: Option<&Path>) -> Result<()> {
@@ -34,27 +205,36 @@ pub fn run_import(trace_path: &Path, output: Option<&Path>) -> Result<()> {
     )
 }
 
-pub fn run_summary(trace_path: &Path, output: Option<&Path>) -> Result<()> {
-    let evidence = load_evidence(trace_path)?;
+pub fn run_summary(input_path: &Path, output: Option<&Path>) -> Result<()> {
+    let loaded = load_evidence_input(input_path)?;
+    let evidence = &loaded.packet;
     let rendered = serde_json::to_string_pretty(&serde_json::json!({
-        "schema": "candle-graph/summary/2",
-        "provenance": evidence.provenance,
-        "health": evidence.health,
-        "capabilities": evidence.capabilities,
-        "findings": evidence.findings,
-        "gaps": evidence.gaps,
+        "schema": "candle-graph/summary/3",
+        "input": &loaded.input,
+        "provenance": &evidence.provenance,
+        "health": &evidence.health,
+        "capabilities": &evidence.capabilities,
+        "findings": &evidence.findings,
+        "gaps": &evidence.gaps,
         "summary": evidence.graph.as_ref().map(|graph| &graph.summary),
-        "timing": evidence.timing,
-        "memory": evidence.memory,
+        "timing": &evidence.timing,
+        "memory": &evidence.memory,
+        "gpu": gpu_summary(evidence),
     }))? + "\n";
     super::write_output(output, rendered.as_bytes())
 }
 
-pub fn run_query(trace_path: &Path, kind: TraceQueryKind, output: Option<&Path>) -> Result<()> {
-    let evidence = load_evidence(trace_path)?;
+pub fn run_query(input_path: &Path, kind: TraceQueryKind, output: Option<&Path>) -> Result<()> {
+    let loaded = load_evidence_input(input_path)?;
+    let evidence = &loaded.packet;
     let result = match kind {
         TraceQueryKind::Memory => serde_json::to_value(&evidence.memory)?,
         TraceQueryKind::Capabilities => serde_json::to_value(&evidence.capabilities)?,
+        TraceQueryKind::GpuStatus => query_gpu_status(evidence),
+        TraceQueryKind::GpuCorrelation => query_gpu_correlation(evidence),
+        TraceQueryKind::GpuPhases => query_gpu_phases(evidence),
+        TraceQueryKind::GpuKernels => query_gpu_kernels(evidence),
+        TraceQueryKind::GpuAttributionGaps => query_gpu_attribution_gaps(evidence),
         other => {
             let graph = evidence
                 .graph
@@ -64,9 +244,10 @@ pub fn run_query(trace_path: &Path, kind: TraceQueryKind, output: Option<&Path>)
         }
     };
     let rendered = serde_json::to_string_pretty(&serde_json::json!({
-        "schema": "candle-graph/trace-query/2",
-        "kind": format!("{kind:?}").to_ascii_lowercase(),
-        "capabilities": evidence.capabilities,
+        "schema": "candle-graph/trace-query/3",
+        "kind": kind.as_str(),
+        "input": &loaded.input,
+        "capabilities": &evidence.capabilities,
         "result": result,
     }))? + "\n";
     super::write_output(output, rendered.as_bytes())
@@ -143,10 +324,286 @@ fn query_graph(graph: &ExecutionGraph, kind: TraceQueryKind) -> serde_json::Valu
         TraceQueryKind::Spans => serde_json::json!({ "spans": graph.spans, "edges": graph.edges }),
         TraceQueryKind::Tensors => serde_json::to_value(&graph.tensors).unwrap_or_default(),
         TraceQueryKind::Gradients => serde_json::to_value(&graph.gradients).unwrap_or_default(),
-        TraceQueryKind::Memory | TraceQueryKind::Capabilities => {
+        TraceQueryKind::Memory
+        | TraceQueryKind::Capabilities
+        | TraceQueryKind::GpuStatus
+        | TraceQueryKind::GpuCorrelation
+        | TraceQueryKind::GpuPhases
+        | TraceQueryKind::GpuKernels
+        | TraceQueryKind::GpuAttributionGaps => {
             unreachable!("handled without graph")
         }
     }
+}
+
+fn gpu_summary(evidence: &EvidencePacket) -> serde_json::Value {
+    serde_json::json!({
+        "status": evidence.gpu.status,
+        "reason": &evidence.gpu.reason,
+        "provenance_binding": evidence.gpu.provenance.binding,
+        "correlation_complete": evidence.gpu.correlation.complete,
+        "coverage": &evidence.gpu.coverage,
+        "normalized_rows": gpu_row_counts(evidence),
+        "attributed_phases": evidence.gpu.phase_attribution.len(),
+        "diagnostic_count": evidence.gpu.diagnostics.len().saturating_add(evidence.gpu.provenance.diagnostics.len()),
+    })
+}
+
+fn query_gpu_status(evidence: &EvidencePacket) -> serde_json::Value {
+    let diagnostics = bounded_diagnostics(evidence);
+    serde_json::json!({
+        "status": evidence.gpu.status,
+        "reason": &evidence.gpu.reason,
+        "provenance_binding": evidence.gpu.provenance.binding,
+        "capabilities": {
+            "gpu_correlation": &evidence.capabilities.gpu_correlation,
+            "provenance_binding": &evidence.capabilities.provenance_binding,
+        },
+        "coverage": &evidence.gpu.coverage,
+        "correlation_complete": evidence.gpu.correlation.complete,
+        "normalized_rows": gpu_row_counts(evidence),
+        "source_artifacts": {
+            "raw_report": evidence.gpu.raw_report.is_some(),
+            "csv_files": evidence.gpu.source_csv.len(),
+        },
+        "diagnostics": bounded_values(&diagnostics, QUERY_DIAGNOSTIC_LIMIT),
+    })
+}
+
+fn query_gpu_correlation(evidence: &EvidencePacket) -> serde_json::Value {
+    let ledger = &evidence.gpu.correlation.ledger;
+    let duplicates = ledger
+        .duplicates
+        .iter()
+        .take(QUERY_LABEL_LIMIT)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "status": evidence.gpu.status,
+        "reason": &evidence.gpu.reason,
+        "provenance_binding": evidence.gpu.provenance.binding,
+        "capabilities": {
+            "gpu_correlation": &evidence.capabilities.gpu_correlation,
+            "provenance_binding": &evidence.capabilities.provenance_binding,
+        },
+        "mode": &evidence.gpu.correlation.mode,
+        "clock_aligned": evidence.gpu.correlation.clock_aligned,
+        "complete": evidence.gpu.correlation.complete,
+        "correlation_reason": &evidence.gpu.correlation.reason,
+        "ledger": {
+            "expected": bounded_values(&ledger.expected, QUERY_LABEL_LIMIT),
+            "cpu_only": bounded_values(&ledger.cpu_only, QUERY_LABEL_LIMIT),
+            "observed": bounded_values(&ledger.observed, QUERY_LABEL_LIMIT),
+            "matched": bounded_values(&ledger.matched, QUERY_LABEL_LIMIT),
+            "missing_expected": bounded_values(&ledger.missing_expected, QUERY_LABEL_LIMIT),
+            "unexpected_observed": bounded_values(&ledger.unexpected_observed, QUERY_LABEL_LIMIT),
+            "unexpected_cpu_only": bounded_values(&ledger.unexpected_cpu_only, QUERY_LABEL_LIMIT),
+            "duplicates": {
+                "total": ledger.duplicates.len(),
+                "displayed": duplicates.len(),
+                "truncated": duplicates.len() < ledger.duplicates.len(),
+                "rows": duplicates,
+            },
+        },
+    })
+}
+
+fn query_gpu_phases(evidence: &EvidencePacket) -> serde_json::Value {
+    let mut attributed = evidence.gpu.phase_attribution.iter().collect::<Vec<_>>();
+    attributed.sort_by(|left, right| {
+        right
+            .gpu_busy_ns
+            .cmp(&left.gpu_busy_ns)
+            .then_with(|| left.semantic_key.cmp(&right.semantic_key))
+    });
+    let attributed_total = attributed.len();
+    attributed.truncate(QUERY_ROW_LIMIT);
+
+    let mut projected = evidence.gpu.nvtx_ranges.iter().collect::<Vec<_>>();
+    projected.sort_by(|left, right| {
+        right
+            .projected_duration_ns
+            .unwrap_or_default()
+            .cmp(&left.projected_duration_ns.unwrap_or_default())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let projected_display_total = projected.len();
+    projected.truncate(QUERY_ROW_LIMIT);
+    let projected_rows = projected
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "name": &row.name,
+                "semantic_key": &row.semantic_key,
+                "projected_start_ns": row.projected_start_ns,
+                "projected_duration_ns": row.projected_duration_ns,
+                "declared_gpu_operations": row.gpu_operations,
+                "join_keys": [
+                    row.correlation_id.as_ref().map(|_| "correlation_id"),
+                    row.device.as_ref().map(|_| "device"),
+                    row.context.as_ref().map(|_| "context"),
+                    row.stream.as_ref().map(|_| "stream"),
+                ].into_iter().flatten().collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let projected_total = total_report_rows(
+        evidence,
+        "nvtx_gpu_proj_trace",
+        projected_display_total,
+    );
+
+    serde_json::json!({
+        "status": evidence.gpu.status,
+        "reason": &evidence.gpu.reason,
+        "provenance_binding": evidence.gpu.provenance.binding,
+        "clock_plane": "nsight_projected_not_host_aligned",
+        "projected_ranges": {
+            "total": projected_total,
+            "displayed": projected_rows.len(),
+            "truncated": projected_rows.len() < projected_total,
+            "rows": projected_rows,
+        },
+        "attributed_phases": {
+            "total": attributed_total,
+            "displayed": attributed.len(),
+            "truncated": attributed.len() < attributed_total,
+            "rows": attributed,
+        },
+    })
+}
+
+fn query_gpu_kernels(evidence: &EvidencePacket) -> serde_json::Value {
+    let mut kernels = evidence.gpu.kernels.iter().collect::<Vec<_>>();
+    kernels.sort_by(|left, right| {
+        right
+            .total_ns
+            .cmp(&left.total_ns)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let normalized_display_total = kernels.len();
+    kernels.truncate(QUERY_ROW_LIMIT);
+    let total = total_report_rows(
+        evidence,
+        "cuda_gpu_kern_sum",
+        normalized_display_total,
+    );
+    serde_json::json!({
+        "status": evidence.gpu.status,
+        "reason": &evidence.gpu.reason,
+        "provenance_binding": evidence.gpu.provenance.binding,
+        "clock_plane": "nsight_gpu",
+        "total": total,
+        "displayed": kernels.len(),
+        "truncated": kernels.len() < total,
+        "rows": kernels,
+    })
+}
+
+fn query_gpu_attribution_gaps(evidence: &EvidencePacket) -> serde_json::Value {
+    let ledger = &evidence.gpu.correlation.ledger;
+    let attributed = evidence
+        .gpu
+        .phase_attribution
+        .iter()
+        .map(|phase| phase.semantic_key.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected = ledger
+        .expected
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let matched_without_attribution = ledger
+        .matched
+        .iter()
+        .filter(|label| !attributed.contains(label.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let attributed_unexpected = attributed
+        .difference(&expected)
+        .map(|label| (*label).to_string())
+        .collect::<Vec<_>>();
+    let truncated_reports = evidence
+        .gpu
+        .limits
+        .iter()
+        .filter(|(_, limit)| limit.truncated)
+        .map(|(report, limit)| {
+            serde_json::json!({
+                "report": report,
+                "total_rows": limit.total_rows,
+                "displayed_rows": limit.displayed_rows,
+            })
+        })
+        .take(QUERY_ROW_LIMIT)
+        .collect::<Vec<_>>();
+    let diagnostics = bounded_diagnostics(evidence);
+
+    serde_json::json!({
+        "status": evidence.gpu.status,
+        "reason": &evidence.gpu.reason,
+        "provenance_binding": evidence.gpu.provenance.binding,
+        "correlation_complete": evidence.gpu.correlation.complete,
+        "correlation_reason": &evidence.gpu.correlation.reason,
+        "missing_expected": bounded_values(&ledger.missing_expected, QUERY_LABEL_LIMIT),
+        "unexpected_observed": bounded_values(&ledger.unexpected_observed, QUERY_LABEL_LIMIT),
+        "unexpected_cpu_only": bounded_values(&ledger.unexpected_cpu_only, QUERY_LABEL_LIMIT),
+        "duplicate_labels": bounded_values(&ledger.duplicates, QUERY_LABEL_LIMIT),
+        "matched_without_exact_gpu_busy_attribution": bounded_values(&matched_without_attribution, QUERY_LABEL_LIMIT),
+        "attributed_unexpected": bounded_values(&attributed_unexpected, QUERY_LABEL_LIMIT),
+        "projected_range_rows": total_report_rows(evidence, "nvtx_gpu_proj_trace", evidence.gpu.nvtx_ranges.len()),
+        "exactly_attributed_phase_rows": evidence.gpu.phase_attribution.len(),
+        "truncated_reports": {
+            "total": evidence.gpu.limits.values().filter(|limit| limit.truncated).count(),
+            "displayed": truncated_reports.len(),
+            "truncated": truncated_reports.len() < evidence.gpu.limits.values().filter(|limit| limit.truncated).count(),
+            "rows": truncated_reports,
+        },
+        "diagnostics": bounded_values(&diagnostics, QUERY_DIAGNOSTIC_LIMIT),
+    })
+}
+
+fn gpu_row_counts(evidence: &EvidencePacket) -> serde_json::Value {
+    serde_json::json!({
+        "kernels": total_report_rows(evidence, "cuda_gpu_kern_sum", evidence.gpu.kernels.len()),
+        "runtime_calls": total_report_rows(evidence, "cuda_api_sum", evidence.gpu.runtime_calls.len()),
+        "memory_operations": total_report_rows(evidence, "cuda_gpu_mem_time_sum", evidence.gpu.memory_operations.len()),
+        "projected_ranges": total_report_rows(evidence, "nvtx_gpu_proj_trace", evidence.gpu.nvtx_ranges.len()),
+        "gpu_timeline": total_report_rows(evidence, "cuda_gpu_trace", evidence.gpu.gpu_timeline.len()),
+    })
+}
+
+fn total_report_rows(evidence: &EvidencePacket, report_kind: &str, fallback: usize) -> usize {
+    let total = evidence
+        .gpu
+        .limits
+        .iter()
+        .filter(|(name, _)| name.contains(report_kind))
+        .fold(0_usize, |sum, (_, limit)| sum.saturating_add(limit.total_rows));
+    total.max(fallback)
+}
+
+fn bounded_diagnostics(evidence: &EvidencePacket) -> Vec<String> {
+    let mut diagnostics = evidence
+        .gpu
+        .provenance
+        .diagnostics
+        .iter()
+        .chain(&evidence.gpu.diagnostics)
+        .cloned()
+        .collect::<Vec<_>>();
+    diagnostics.sort();
+    diagnostics.dedup();
+    diagnostics
+}
+
+fn bounded_values<T: Serialize>(values: &[T], limit: usize) -> serde_json::Value {
+    let displayed = values.len().min(limit);
+    serde_json::json!({
+        "total": values.len(),
+        "displayed": displayed,
+        "truncated": displayed < values.len(),
+        "rows": &values[..displayed],
+    })
 }
 
 fn sorted_nodes(
