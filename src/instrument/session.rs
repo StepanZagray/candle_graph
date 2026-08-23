@@ -362,6 +362,16 @@ impl TraceSession {
             .min(u64::MAX as u128) as u64
     }
 
+    /// Convert an [`Instant`] from this process into this trace session's
+    /// monotonic nanosecond clock without an independently sampled anchor.
+    pub fn host_timestamp_ns(&self, instant: Instant) -> Result<u64> {
+        let probe_started = self.inner.borrow().probe_started;
+        let elapsed = instant
+            .checked_duration_since(probe_started)
+            .context("host instant predates the trace session")?;
+        Ok(elapsed.as_nanos().min(u64::MAX as u128) as u64)
+    }
+
     /// Record a timed op observation attached to `span_id`.
     pub fn record_op(&self, span_id: SpanId, op: OpRecord<'_>) -> Result<()> {
         let output_dense_bytes =
@@ -897,6 +907,36 @@ mod tests {
             .record_completed_host_span("empty", SpanKind::Function, 0, 0)
             .unwrap_err();
         assert!(error.to_string().contains("duration must be positive"));
+
+        let overflow = session
+            .record_completed_host_span(
+                "overflow",
+                SpanKind::Function,
+                u64::MAX,
+                1,
+            )
+            .unwrap_err();
+        assert!(overflow.to_string().contains("overflows"));
+
+        let future = session
+            .record_completed_host_span(
+                "future",
+                SpanKind::Function,
+                session.elapsed_ns().saturating_add(60_000_000_000),
+                1,
+            )
+            .unwrap_err();
+        assert!(future.to_string().contains("ends in the future"));
+
+        let before_session = session
+            .inner
+            .borrow()
+            .probe_started
+            .checked_sub(std::time::Duration::from_nanos(1))
+            .unwrap();
+        assert!(session.host_timestamp_ns(before_session).is_err());
+        let now = Instant::now();
+        assert!(session.host_timestamp_ns(now).unwrap() <= session.elapsed_ns());
         session.finish().unwrap();
     }
 }

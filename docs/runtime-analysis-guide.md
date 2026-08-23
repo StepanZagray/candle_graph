@@ -44,11 +44,12 @@ keyed by `(device, storage_id)`, drive logical live and peak memory. `record_dev
 a `DeviceMemoryRecord` whose used/free/reserved/capacity values are independently optional. It
 never derives capacity from used plus free. Neither plane fills gaps in the other.
 
-For already-completed host work that ran concurrently with the live call stack, capture its start
-with `TraceSession::elapsed_ns()` and later call `record_completed_host_span`. The explicit positive
-duration must end no later than the recording call. This emits a closed span attached to the
-session root without pushing or popping live span guards, so overlapping intervals remain siblings
-rather than asserting a synchronous call relationship.
+For already-completed host work that ran concurrently with the live call stack, retain its
+`std::time::Instant`, convert it with `TraceSession::host_timestamp_ns`, and later call
+`record_completed_host_span`. The explicit positive duration must end no later than the recording
+call. This emits a closed span attached to the session root without pushing or popping live span
+guards, so overlapping intervals remain siblings rather than asserting a synchronous call
+relationship.
 
 With feature `candle`, `CandleCapture::from_tensor` records process-local backend tensor and
 storage identities plus a dense tensor footprint. `with_label` may attach a semantic observation
