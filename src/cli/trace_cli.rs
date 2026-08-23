@@ -578,18 +578,22 @@ fn query_gpu_phases(evidence: &EvidencePacket) -> serde_json::Value {
     let projected_rows = projected
         .into_iter()
         .map(|row| {
+            let join_keys = [
+                row.correlation_id.as_ref().map(|_| "correlation_id"),
+                row.device.as_ref().map(|_| "device"),
+                row.context.as_ref().map(|_| "context"),
+                row.stream.as_ref().map(|_| "stream"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
             serde_json::json!({
                 "name": &row.name,
                 "semantic_key": &row.semantic_key,
                 "projected_start_ns": row.projected_start_ns,
                 "projected_duration_ns": row.projected_duration_ns,
                 "declared_gpu_operations": row.gpu_operations,
-                "join_keys": [
-                    row.correlation_id.as_ref().map(|_| "correlation_id"),
-                    row.device.as_ref().map(|_| "device"),
-                    row.context.as_ref().map(|_| "context"),
-                    row.stream.as_ref().map(|_| "stream"),
-                ].into_iter().flatten().collect::<Vec<_>>(),
+                "join_keys": join_keys,
             })
         })
         .collect::<Vec<_>>();
