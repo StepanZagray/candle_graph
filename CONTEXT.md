@@ -11,7 +11,9 @@ run without pretending static source inspection can reconstruct tensor execution
 timing semantics to judge representativeness.
 
 **Measured region**: the caller-controlled part of a profile run used for totals and comparisons;
-session setup and evidence publication are outside it.
+session setup and evidence publication are outside it. Host headline attribution also includes
+structurally separate spans that overlap this interval, explicitly scoped as concurrent rather than
+reparented into the measured call tree.
 
 **GPU evidence**: optional normalized Nsight kernel, runtime, transfer, timeline, and projected NVTX
 facts. Its absence never invalidates application evidence.
@@ -94,7 +96,7 @@ and reasons, never silent empty arrays. Tensor footprint and observed memory lif
 | Schema | Role |
 | --- | --- |
 | `candle-graph/trace/9` | Execution evidence stream with exact gradient contract and terminal outcome |
-| `candle-graph/graph/4` | Validated call/data graph with separate timing planes |
+| `candle-graph/graph/4` | Validated call/data graph with separate timing planes and explicit measured host scope |
 | `candle-graph/evidence/3` | Capability-qualified agent/human packet with gradient-contract facts |
 | `candle-graph/comparison/4` | Replicated outer-wall comparison with verified bundle receipts |
 | `candle-graph/viewer/5` | Embedded offline UI payload |

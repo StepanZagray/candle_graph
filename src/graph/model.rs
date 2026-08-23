@@ -140,7 +140,43 @@ pub struct GraphSummary {
 pub struct HostSpanCost {
     pub id: String,
     pub name: String,
+    /// Structural relation to the measured region. Concurrent spans remain outside its tree.
+    #[serde(default)]
+    pub scope: MeasuredHostScope,
+    /// Full host self time across the span's complete interval.
     pub host_self_time_ns: u64,
+    /// Host self time clipped to the measured interval.
+    ///
+    /// This is optional so graph/4 documents emitted before measured-scope attribution remain
+    /// readable. Newly built graphs always populate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_overlap_self_time_ns: Option<u64>,
+    /// Inclusive duration across the span's complete interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_duration_ns: Option<u64>,
+    /// Inclusive duration intersected with the measured interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_overlap_duration_ns: Option<u64>,
+}
+
+/// How a host span entered measured-scope headline analysis.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasuredHostScope {
+    /// The span is the measured region or one of its structural descendants.
+    #[default]
+    MeasuredSubtree,
+    /// The span is structurally outside the measured subtree but its host interval overlaps it.
+    ConcurrentOverlap,
+}
+
+impl MeasuredHostScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MeasuredSubtree => "measured_subtree",
+            Self::ConcurrentOverlap => "concurrent_overlap",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,5 +206,38 @@ impl ExecutionGraph {
             .iter()
             .filter(|n| n.parent_id.as_deref() == Some(parent_id))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn older_host_cost_entries_remain_deserializable() {
+        let cost: HostSpanCost = serde_json::from_value(serde_json::json!({
+            "id": "span",
+            "name": "work",
+            "host_self_time_ns": 17
+        }))
+        .unwrap();
+
+        assert_eq!(cost.scope, MeasuredHostScope::MeasuredSubtree);
+        assert_eq!(cost.host_self_time_ns, 17);
+        assert_eq!(cost.measured_overlap_self_time_ns, None);
+        assert_eq!(cost.full_duration_ns, None);
+        assert_eq!(cost.measured_overlap_duration_ns, None);
+    }
+
+    #[test]
+    fn measured_host_scope_has_stable_wire_names() {
+        assert_eq!(
+            serde_json::to_value(MeasuredHostScope::MeasuredSubtree).unwrap(),
+            serde_json::json!("measured_subtree")
+        );
+        assert_eq!(
+            serde_json::to_value(MeasuredHostScope::ConcurrentOverlap).unwrap(),
+            serde_json::json!("concurrent_overlap")
+        );
     }
 }

@@ -136,12 +136,23 @@ impl EvidencePacket {
         }
         if let Some(graph) = &graph {
             if let Some(span) = graph.summary.slowest_host_spans.first() {
+                let overlap_self_time_ns = span
+                    .measured_overlap_self_time_ns
+                    .unwrap_or(span.host_self_time_ns);
+                let full_duration_ns = span.full_duration_ns.unwrap_or(span.host_self_time_ns);
+                let overlap_duration_ns = span
+                    .measured_overlap_duration_ns
+                    .unwrap_or(full_duration_ns);
                 findings.push(EvidenceFinding {
                     code: "largest_observed_host_self_time".into(),
                     summary: format!(
-                        "`{}` has the largest observed nested host self-time ({:.2} ms)",
+                        "`{}` has the largest observed measured-scope host self-time ({:.2} ms overlap-clipped, {:.2} ms full self-time; `{}` span duration {:.2} ms of {:.2} ms full)",
                         span.name,
-                        span.host_self_time_ns as f64 / 1_000_000.0
+                        overlap_self_time_ns as f64 / 1_000_000.0,
+                        span.host_self_time_ns as f64 / 1_000_000.0,
+                        span.scope.as_str(),
+                        overlap_duration_ns as f64 / 1_000_000.0,
+                        full_duration_ns as f64 / 1_000_000.0,
                     ),
                     source: span.id.clone(),
                     requires: vec![CapabilityKind::NestedHostTime],
@@ -354,10 +365,12 @@ fn assess_capabilities(
         CapabilityState::from_coverage(
             CoverageLevel::Complete,
             "span wall intervals",
-            "nested host spans are structurally valid",
+            "measured-subtree and concurrent-overlap host intervals are structurally valid",
         )
     } else {
-        CapabilityState::unavailable("nested host attribution requires a complete, valid capture")
+        CapabilityState::unavailable(
+            "measured-scope host attribution requires a complete, valid capture",
+        )
     };
     let nested_device_time = observed_coverage(
         timing.device_coverage,
@@ -622,7 +635,7 @@ fn capability_rows(capabilities: &EvidenceCapabilities) -> [(&'static str, &Capa
     [
         ("Structural trace", &capabilities.structural_trace),
         ("Outer wall time", &capabilities.outer_wall_time),
-        ("Nested host time", &capabilities.nested_host_time),
+        ("Measured-scope host time", &capabilities.nested_host_time),
         ("Nested device time", &capabilities.nested_device_time),
         ("Operations", &capabilities.operation_coverage),
         ("Tensors", &capabilities.tensor_coverage),

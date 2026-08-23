@@ -216,19 +216,52 @@ pub fn build_from_trace(doc: &TraceDocument) -> Result<ExecutionGraph> {
     edges.sort_by_key(edge_key);
 
     let measured_ids = measured_subtree_ids(doc);
+    let measured_span = doc
+        .spans
+        .iter()
+        .find(|span| span.measured)
+        .expect("validated traces contain one measured span");
+    let measured_start_ns = measured_span.start_ns;
+    let measured_duration_ns = nodes
+        .iter()
+        .find(|node| node.id == measured_span.id)
+        .map(|node| node.host_total_time_ns)
+        .expect("validated measured span has a graph node");
+    let measured_end_ns = measured_start_ns.saturating_add(measured_duration_ns);
+    let measured_host_scopes = measured_host_scopes(doc, measured_span, &measured_ids);
+    let measured_host_timings =
+        measured_host_timings(&nodes, measured_start_ns, measured_end_ns);
     let mut slowest_host_spans = nodes
         .iter()
-        .filter(|node| {
-            measured_ids.contains(&node.id)
-                && !matches!(node.kind, GraphNodeKind::Op | GraphNodeKind::Tensor)
-        })
-        .map(|node| HostSpanCost {
-            id: node.id.clone(),
-            name: node.name.clone(),
-            host_self_time_ns: node.host_self_time_ns,
+        .filter_map(|node| {
+            let scope = measured_host_scopes.get(&node.id).copied()?;
+            let timing = measured_host_timings.get(&node.id)?;
+            if matches!(node.kind, GraphNodeKind::Op | GraphNodeKind::Tensor) {
+                return None;
+            }
+            Some(HostSpanCost {
+                id: node.id.clone(),
+                name: node.name.clone(),
+                scope,
+                host_self_time_ns: node.host_self_time_ns,
+                measured_overlap_self_time_ns: Some(timing.self_time_ns),
+                full_duration_ns: Some(node.host_total_time_ns),
+                measured_overlap_duration_ns: Some(timing.duration_ns),
+            })
         })
         .collect::<Vec<_>>();
-    slowest_host_spans.sort_by_key(|span| std::cmp::Reverse(span.host_self_time_ns));
+    slowest_host_spans.sort_by(|left, right| {
+        right
+            .measured_overlap_self_time_ns
+            .unwrap_or(right.host_self_time_ns)
+            .cmp(
+                &left
+                    .measured_overlap_self_time_ns
+                    .unwrap_or(left.host_self_time_ns),
+            )
+            .then_with(|| right.host_self_time_ns.cmp(&left.host_self_time_ns))
+            .then_with(|| left.id.cmp(&right.id))
+    });
     slowest_host_spans.truncate(8);
     let mut slowest_device_spans = nodes
         .iter()
@@ -262,12 +295,7 @@ pub fn build_from_trace(doc: &TraceDocument) -> Result<ExecutionGraph> {
         .collect::<Vec<_>>();
     heaviest_spans.sort_by_key(|span| std::cmp::Reverse(span.allocated_bytes));
     heaviest_spans.truncate(8);
-    let outer_wall_time_ns = doc
-        .spans
-        .iter()
-        .find(|span| span.measured)
-        .map(|span| span.duration_ns)
-        .unwrap_or(0);
+    let outer_wall_time_ns = measured_duration_ns;
 
     Ok(ExecutionGraph {
         schema: SCHEMA.into(),
@@ -352,6 +380,105 @@ fn measured_subtree_ids(doc: &TraceDocument) -> HashSet<String> {
             return ids;
         }
     }
+}
+
+fn measured_host_scopes(
+    doc: &TraceDocument,
+    measured: &crate::trace::SpanRecord,
+    measured_ids: &HashSet<String>,
+) -> HashMap<String, MeasuredHostScope> {
+    let parent_by_id = doc
+        .spans
+        .iter()
+        .map(|span| (span.id.as_str(), span.parent_id.as_deref()))
+        .collect::<HashMap<_, _>>();
+    let mut measured_ancestors = HashSet::new();
+    let mut parent = measured.parent_id.as_deref();
+    while let Some(parent_id) = parent {
+        if !measured_ancestors.insert(parent_id) {
+            break;
+        }
+        parent = parent_by_id.get(parent_id).copied().flatten();
+    }
+
+    doc.spans
+        .iter()
+        .filter_map(|span| {
+            let scope = if measured_ids.contains(&span.id) {
+                MeasuredHostScope::MeasuredSubtree
+            } else if measured_ancestors.contains(span.id.as_str()) {
+                return None;
+            } else {
+                MeasuredHostScope::ConcurrentOverlap
+            };
+            Some((span.id.clone(), scope))
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MeasuredHostTiming {
+    duration_ns: u64,
+    self_time_ns: u64,
+}
+
+fn measured_host_timings(
+    nodes: &[GraphNode],
+    measured_start_ns: u64,
+    measured_end_ns: u64,
+) -> HashMap<String, MeasuredHostTiming> {
+    let mut clipped_child_intervals = HashMap::<String, Vec<(u64, u64)>>::new();
+    for child in nodes
+        .iter()
+        .filter(|child| !matches!(child.kind, GraphNodeKind::Tensor))
+    {
+        let Some(parent_id) = &child.parent_id else {
+            continue;
+        };
+        let start_ns = child.start_ns.max(measured_start_ns);
+        let end_ns = child
+            .start_ns
+            .saturating_add(child.host_total_time_ns)
+            .min(measured_end_ns);
+        if start_ns < end_ns {
+            clipped_child_intervals
+                .entry(parent_id.clone())
+                .or_default()
+                .push((start_ns, end_ns));
+        }
+    }
+
+    nodes
+        .iter()
+        .filter_map(|node| {
+            let duration_ns = interval_overlap_ns(
+                node.start_ns,
+                node.start_ns.saturating_add(node.host_total_time_ns),
+                measured_start_ns,
+                measured_end_ns,
+            );
+            if duration_ns == 0 {
+                return None;
+            }
+            let covered_ns = clipped_child_intervals
+                .get(&node.id)
+                .map(|intervals| host_interval_union(intervals))
+                .unwrap_or(0);
+            Some((
+                node.id.clone(),
+                MeasuredHostTiming {
+                    duration_ns,
+                    self_time_ns: duration_ns.saturating_sub(covered_ns),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn interval_overlap_ns(left_start: u64, left_end: u64, right_start: u64, right_end: u64) -> u64 {
+    left_end
+        .min(right_end)
+        .saturating_sub(left_start.max(right_start))
 }
 
 fn effective_span_duration(span: &crate::trace::SpanRecord, doc: &TraceDocument) -> u64 {
@@ -513,5 +640,105 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["backend:1", "backend:2"])
         );
+    }
+
+    #[test]
+    fn headline_host_scope_includes_overlapping_concurrent_spans_without_reparenting() {
+        let span = |id: &str,
+                    parent_id: Option<&str>,
+                    name: &str,
+                    measured: bool,
+                    start_ns: u64,
+                    duration_ns: u64| SpanRecord {
+            id: id.into(),
+            parent_id: parent_id.map(str::to_owned),
+            name: name.into(),
+            kind: SpanKind::Function,
+            measured,
+            start_ns,
+            closed: true,
+            duration_ns,
+            step: None,
+        };
+        let doc = TraceDocument {
+            schema: TRACE_SCHEMA.into(),
+            run: TraceRunMeta {
+                run_id: "concurrent-host-scope".into(),
+                correlation_id: "concurrent/host/scope".into(),
+                entrypoint: "demo".into(),
+                phase: crate::ExecutionPhase::Infer,
+                timestamp: "2026-08-23T00:00:00Z".into(),
+                capture_step: 1,
+                warmup_steps: 0,
+                device: "cpu".into(),
+                measured_region_device_synchronized: false,
+                timing_mode: TimingMode::Host,
+                capture_contract: CaptureContract::default(),
+                comparison_identity: None,
+                tags: Default::default(),
+                candle_version: None,
+            },
+            // Reverse the equal-cost concurrent IDs to exercise the deterministic ID tie-break.
+            spans: vec![
+                span("s1", None, "session", false, 0, 120),
+                span("s2", Some("s1"), "measured", true, 20, 60),
+                span("s3", Some("s2"), "nested", false, 30, 10),
+                span("z-worker", Some("s1"), "worker-z", false, 10, 30),
+                span("a-worker", Some("s1"), "worker-a", false, 60, 30),
+                span("outside", Some("s1"), "outside", false, 80, 10),
+            ],
+            ops: vec![],
+            tensors: vec![],
+            memory: vec![],
+            device_memory: vec![],
+            device_intervals: vec![],
+            gradients: vec![],
+            edges: vec![],
+            terminal: TerminalEvent {
+                outcome: RunOutcome::Complete,
+                timestamp_ns: 120,
+                reason: None,
+            },
+        };
+
+        let graph = build_from_trace(&doc).unwrap();
+        let costs = &graph.summary.slowest_host_spans;
+        assert_eq!(
+            costs.iter().map(|cost| cost.id.as_str()).collect::<Vec<_>>(),
+            vec!["s2", "a-worker", "z-worker", "s3"]
+        );
+        let measured = costs.iter().find(|cost| cost.id == "s2").unwrap();
+        assert_eq!(measured.scope, MeasuredHostScope::MeasuredSubtree);
+        assert_eq!(measured.host_self_time_ns, 50);
+        assert_eq!(measured.measured_overlap_self_time_ns, Some(50));
+        assert_eq!(measured.full_duration_ns, Some(60));
+        assert_eq!(measured.measured_overlap_duration_ns, Some(60));
+        let worker_z = costs.iter().find(|cost| cost.id == "z-worker").unwrap();
+        assert_eq!(worker_z.scope, MeasuredHostScope::ConcurrentOverlap);
+        assert_eq!(worker_z.host_self_time_ns, 30);
+        assert_eq!(worker_z.measured_overlap_self_time_ns, Some(20));
+        assert_eq!(worker_z.full_duration_ns, Some(30));
+        assert_eq!(worker_z.measured_overlap_duration_ns, Some(20));
+        assert!(!costs.iter().any(|cost| cost.id == "s1"));
+        assert!(!costs.iter().any(|cost| cost.id == "outside"));
+
+        let worker_node = graph.node("z-worker").unwrap();
+        assert_eq!(worker_node.parent_id.as_deref(), Some("s1"));
+        assert!(graph.edges.iter().any(|edge| matches!(
+            edge,
+            GraphEdge::Call {
+                from_span,
+                to_span,
+                ..
+            } if from_span == "s1" && to_span == "z-worker"
+        )));
+        assert!(!graph.edges.iter().any(|edge| matches!(
+            edge,
+            GraphEdge::Call {
+                from_span,
+                to_span,
+                ..
+            } if from_span == "s2" && to_span == "z-worker"
+        )));
     }
 }

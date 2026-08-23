@@ -147,6 +147,7 @@ are `TRACE_SCHEMA`, `EVIDENCE_SCHEMA`, `COMPARISON_SCHEMA`, `BUNDLE_SCHEMA`, and
 
 ```bash
 cargo candle-graph summary application.jsonl
+cargo candle-graph query application.jsonl --kind slowest-host
 cargo candle-graph query application.jsonl --kind gradients
 cargo candle-graph query application.jsonl --kind tensors
 cargo candle-graph report base-1.jsonl --bundle base-1.bundle
@@ -163,6 +164,12 @@ cargo candle-graph view application.jsonl --output viewer.html
 `compare` deeply verifies every bundle immediately before reading its bound trace. Raw trace
 comparison remains available through `--unverified-traces`, but its result is always marked
 diagnostic and ineligible for a performance verdict.
+
+The `slowest-host` headline covers both the measured subtree and structurally separate host spans
+that overlap the measured interval. Every entry declares `scope` as `measured_subtree` or
+`concurrent_overlap` and reports full plus overlap-clipped duration/self-time fields. Concurrent
+entries retain their real parent links; overlap-clipped values are attribution, not durations to
+sum with measured wall time.
 
 Add normalized official `nsys stats --format csv` reports without parsing Nsight's unstable SQLite
 export:
@@ -185,7 +192,7 @@ label as GPU-expected. Projected CPU-only labels are reported as correlation fai
 | Schema | Role |
 | --- | --- |
 | `candle-graph/trace/9` | Execution JSONL with exact gradient contracts, timing/memory planes, and terminal outcome |
-| `candle-graph/graph/4` | Validated call/data graph with tensor nodes |
+| `candle-graph/graph/4` | Validated call/data graph with tensor nodes and measured-scope host attribution |
 | `candle-graph/evidence/3` | Capability-qualified packet with typed gradient-contract facts and explicit unknowns |
 | `candle-graph/comparison/4` | Bundle-verified replicated outer-wall comparison with input receipts |
 | `candle-graph/viewer/5` | Offline unified viewer payload |

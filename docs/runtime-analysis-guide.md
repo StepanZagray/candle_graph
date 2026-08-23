@@ -51,6 +51,14 @@ call. This emits a closed span attached to the session root without pushing or p
 guards, so overlapping intervals remain siblings rather than asserting a synchronous call
 relationship.
 
+`summary` and `query --kind slowest-host` treat host timing as a measured **scope**, not as a
+synthetic call tree. `measured_subtree` entries are the measured span and its descendants;
+`concurrent_overlap` entries are structurally separate spans whose intervals intersect the
+measured interval. Each headline entry reports full and measured-overlap-clipped inclusive
+durations, plus full and clipped host self time. Rankings use clipped self time. Keep the original
+parent links when interpreting the result, and do not add concurrent durations to measured wall
+time: overlapping sibling intervals are independent attribution views, not additive totals.
+
 With feature `candle`, `CandleCapture::from_tensor` records process-local backend tensor and
 storage identities plus a dense tensor footprint. `with_label` may attach a semantic observation
 label without replacing backend tensor identity. The footprint is shape metadata, not
