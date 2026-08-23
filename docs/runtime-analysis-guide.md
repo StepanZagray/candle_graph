@@ -85,7 +85,7 @@ Encode `Present` with a finite norm greater than zero, `Zero` with positive zero
 `-0.0`), and `Missing` or `NonFinite` with no norm. The ordered manifest digest hashes the
 `GRADIENT_MANIFEST_SCHEMA` bytes, one NUL byte, then every root/key/family byte string prefixed by
 its little-endian `u64` length. Current public protocol constants are `TRACE_SCHEMA` (trace/9),
-`EVIDENCE_SCHEMA` (evidence/3), and `COMPARISON_SCHEMA` (comparison/4).
+`EVIDENCE_SCHEMA` (evidence/4), `GRAPH_SCHEMA` (graph/5), and `COMPARISON_SCHEMA` (comparison/4).
 
 ## Publish evidence
 
@@ -108,12 +108,16 @@ cargo candle-graph compare \
 
 For `summary` and `query`, pass a finalized bundle/profile directory or its `trace.jsonl` whenever
 one exists. The CLI deeply verifies the bundle and consumes its bound `evidence.json`, preserving
-normalized Nsight facts. It deeply verifies before and after reading and requires identical
-point-in-time receipts; this narrows, but cannot make a mutable filesystem transactionally atomic.
-It fails closed if the input's parent has `evidence.json` or `nsight/` but no `bundle.json`,
+normalized Nsight facts. After the read, it rechecks the manifest and the consumed trace/evidence
+files only. These point-in-time checks narrow the race but do not provide a filesystem snapshot or
+make mutable storage transactionally atomic. Output paths that resolve to or traverse the verified
+bundle root or a descendant are rejected, including existing symbolic-link aliases. The CLI fails closed if
+the input's parent has `evidence.json` or `nsight/` but no `bundle.json`,
 regardless of the trace filename. An ordinary raw JSONL in an unaugmented directory remains a valid
-trace-only input and reports GPU evidence as explicitly unavailable. GPU phase and kernel rows are
-bounded; their total/displayed counts and truncation state are part of each query response.
+trace-only input and reports GPU evidence as explicitly unavailable. Every GPU query names its
+required report status and reason; missing reports yield unknown totals rather than zero. GPU phase
+and kernel rows are bounded. Projected-range duration sorting is only within the retained
+earliest-original-start sample, whose population/sample/display truncation fields remain explicit.
 
 The packet reports structural validity separately from capability states. A failed terminal event
 remains inspectable but has no derived graph. Comparison deeply verifies every supplied finalized

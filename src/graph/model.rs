@@ -1,15 +1,16 @@
-//! Execution graph model (`candle-graph/graph/4`).
+//! Execution graph model (`candle-graph/graph/5`).
 
 use serde::{Deserialize, Serialize};
 
 use crate::trace::memory::MemoryCategory;
 
 /// Schema identifier for [`ExecutionGraph`] documents.
-pub const SCHEMA: &str = "candle-graph/graph/4";
+pub const SCHEMA: &str = "candle-graph/graph/5";
 
 /// Hierarchical execution graph built from a trace document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionGraph {
+    #[serde(deserialize_with = "deserialize_schema")]
     pub schema: String,
     /// Flat list of span and op nodes (parent links encode the tree).
     pub spans: Vec<GraphNode>,
@@ -19,6 +20,19 @@ pub struct ExecutionGraph {
     pub tensors: Vec<TensorRecord>,
     pub gradients: Vec<GradientRecord>,
     pub summary: GraphSummary,
+}
+
+fn deserialize_schema<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let schema = String::deserialize(deserializer)?;
+    if schema != SCHEMA {
+        return Err(serde::de::Error::custom(format_args!(
+            "unsupported graph schema {schema:?}; expected {SCHEMA:?}"
+        )));
+    }
+    Ok(schema)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,22 +155,15 @@ pub struct HostSpanCost {
     pub id: String,
     pub name: String,
     /// Structural relation to the measured region. Concurrent spans remain outside its tree.
-    #[serde(default)]
     pub scope: MeasuredHostScope,
     /// Full host self time across the span's complete interval.
     pub host_self_time_ns: u64,
     /// Host self time clipped to the measured interval.
-    ///
-    /// This is optional so graph/4 documents emitted before measured-scope attribution remain
-    /// readable. Newly built graphs always populate it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub measured_overlap_self_time_ns: Option<u64>,
+    pub measured_overlap_self_time_ns: u64,
     /// Inclusive duration across the span's complete interval.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub full_duration_ns: Option<u64>,
+    pub full_duration_ns: u64,
     /// Inclusive duration intersected with the measured interval.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub measured_overlap_duration_ns: Option<u64>,
+    pub measured_overlap_duration_ns: u64,
 }
 
 /// How a host span entered measured-scope headline analysis.
@@ -214,19 +221,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn older_host_cost_entries_remain_deserializable() {
-        let cost: HostSpanCost = serde_json::from_value(serde_json::json!({
+    fn measured_scope_fields_are_required() {
+        let error = serde_json::from_value::<HostSpanCost>(serde_json::json!({
             "id": "span",
             "name": "work",
             "host_self_time_ns": 17
         }))
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(cost.scope, MeasuredHostScope::MeasuredSubtree);
-        assert_eq!(cost.host_self_time_ns, 17);
-        assert_eq!(cost.measured_overlap_self_time_ns, None);
-        assert_eq!(cost.full_duration_ns, None);
-        assert_eq!(cost.measured_overlap_duration_ns, None);
+        assert!(error.to_string().contains("scope"));
     }
 
     #[test]

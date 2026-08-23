@@ -33,7 +33,7 @@ pub use comparison::{
     SCHEMA as COMPARISON_SCHEMA,
 };
 pub use evidence::{build_evidence, EvidencePacket, SCHEMA as EVIDENCE_SCHEMA};
-pub use graph::{build_from_trace, ExecutionGraph};
+pub use graph::{build_from_trace, ExecutionGraph, SCHEMA as GRAPH_SCHEMA};
 #[cfg(feature = "candle")]
 pub use instrument::candle;
 pub use instrument::{

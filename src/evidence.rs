@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::capability::{
@@ -16,10 +16,11 @@ use crate::trace::{
     analyze_health, parse_trace, HealthSeverity, TraceDocument, TraceHealth, TraceRunMeta,
 };
 
-pub const SCHEMA: &str = "candle-graph/evidence/3";
+pub const SCHEMA: &str = "candle-graph/evidence/4";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidencePacket {
+    #[serde(deserialize_with = "deserialize_schema")]
     pub schema: String,
     pub provenance: TraceRunMeta,
     pub health: TraceHealth,
@@ -33,6 +34,19 @@ pub struct EvidencePacket {
     pub timing: TimingProfile,
     pub memory: MemoryProfile,
     pub gpu: NsightEvidence,
+}
+
+fn deserialize_schema<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let schema = String::deserialize(deserializer)?;
+    if schema != SCHEMA {
+        return Err(serde::de::Error::custom(format_args!(
+            "unsupported evidence schema {schema:?}; expected {SCHEMA:?}"
+        )));
+    }
+    Ok(schema)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +93,26 @@ pub fn build_evidence(trace: &Path, nsight_dir: Option<&Path>) -> Result<Evidenc
 }
 
 impl EvidencePacket {
+    /// Reject packets from older semantic contracts, including nested graphs that only happen to
+    /// deserialize into the current Rust representation.
+    pub fn validate_schema(&self) -> Result<()> {
+        ensure!(
+            self.schema == SCHEMA,
+            "unsupported evidence schema {:?}; expected {:?}",
+            self.schema,
+            SCHEMA
+        );
+        if let Some(graph) = &self.graph {
+            ensure!(
+                graph.schema == crate::graph::SCHEMA,
+                "unsupported graph schema {:?}; expected {:?}",
+                graph.schema,
+                crate::graph::SCHEMA
+            );
+        }
+        Ok(())
+    }
+
     pub fn from_document(document: TraceDocument, mut gpu: NsightEvidence) -> Result<Self> {
         gpu.bind_to_trace(&document.run.run_id, &document.run.correlation_id);
         let health = analyze_health(&document);
@@ -136,23 +170,16 @@ impl EvidencePacket {
         }
         if let Some(graph) = &graph {
             if let Some(span) = graph.summary.slowest_host_spans.first() {
-                let overlap_self_time_ns = span
-                    .measured_overlap_self_time_ns
-                    .unwrap_or(span.host_self_time_ns);
-                let full_duration_ns = span.full_duration_ns.unwrap_or(span.host_self_time_ns);
-                let overlap_duration_ns = span
-                    .measured_overlap_duration_ns
-                    .unwrap_or(full_duration_ns);
                 findings.push(EvidenceFinding {
                     code: "largest_observed_host_self_time".into(),
                     summary: format!(
                         "`{}` has the largest observed measured-scope host self-time ({:.2} ms overlap-clipped, {:.2} ms full self-time; `{}` span duration {:.2} ms of {:.2} ms full)",
                         span.name,
-                        overlap_self_time_ns as f64 / 1_000_000.0,
+                        span.measured_overlap_self_time_ns as f64 / 1_000_000.0,
                         span.host_self_time_ns as f64 / 1_000_000.0,
                         span.scope.as_str(),
-                        overlap_duration_ns as f64 / 1_000_000.0,
-                        full_duration_ns as f64 / 1_000_000.0,
+                        span.measured_overlap_duration_ns as f64 / 1_000_000.0,
+                        span.full_duration_ns as f64 / 1_000_000.0,
                     ),
                     source: span.id.clone(),
                     requires: vec![CapabilityKind::NestedHostTime],

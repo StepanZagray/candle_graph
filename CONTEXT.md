@@ -64,11 +64,11 @@ representative update
   └─ matching NVTX labels (optional)
             │
             ▼
- application.jsonl (trace/9) ── validate ── graph/4
+ application.jsonl (trace/9) ── validate ── graph/5
             │                                │
  official nsys stats CSV ── normalize ───────┤
             │                                ▼
-            └──────────────────── evidence/3 packet
+            └──────────────────── evidence/4 packet
                                       ├─ bounded JSON / Markdown for agents
                                       ├─ atomic bundle/1 + verification receipt
                                       ├─ comparison/4 across verified repeated bundles
@@ -96,8 +96,8 @@ and reasons, never silent empty arrays. Tensor footprint and observed memory lif
 | Schema | Role |
 | --- | --- |
 | `candle-graph/trace/9` | Execution evidence stream with exact gradient contract and terminal outcome |
-| `candle-graph/graph/4` | Validated call/data graph with separate timing planes and explicit measured host scope |
-| `candle-graph/evidence/3` | Capability-qualified agent/human packet with gradient-contract facts |
+| `candle-graph/graph/5` | Validated call/data graph with mandatory separate timing planes and explicit measured host scope |
+| `candle-graph/evidence/4` | Capability-qualified agent/human packet with report-specific Nsight availability |
 | `candle-graph/comparison/4` | Replicated outer-wall comparison with verified bundle receipts |
 | `candle-graph/viewer/5` | Embedded offline UI payload |
 | `candle-graph/gradient-manifest/1` | Ordered parameter-manifest digest domain |

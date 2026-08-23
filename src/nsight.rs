@@ -427,6 +427,16 @@ impl NsightEvidence {
             &all_gpu_timeline,
         );
         result.phase_attribution = attribute_gpu_phases(&all_nvtx_ranges, &all_gpu_timeline);
+        all_nvtx_ranges.sort_by(|left, right| {
+            left.start_ns
+                .cmp(&right.start_ns)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        all_gpu_timeline.sort_by(|left, right| {
+            left.start_ns
+                .cmp(&right.start_ns)
+                .then_with(|| left.name.cmp(&right.name))
+        });
         all_nvtx_ranges.truncate(TIMELINE_DISPLAY_LIMIT);
         all_gpu_timeline.truncate(TIMELINE_DISPLAY_LIMIT);
         result.nvtx_ranges = all_nvtx_ranges;
@@ -1381,6 +1391,16 @@ mod tests {
         fs::write(dir.join("many_cuda_gpu_trace.csv"), gpu_csv).unwrap();
         let evidence = NsightEvidence::load(&dir, &expected).unwrap();
         assert_eq!(evidence.nvtx_ranges.len(), TIMELINE_DISPLAY_LIMIT);
+        assert_eq!(evidence.nvtx_ranges.first().unwrap().name, "phase/0");
+        assert_eq!(
+            evidence.nvtx_ranges.last().unwrap().name,
+            format!("phase/{}", TIMELINE_DISPLAY_LIMIT - 1)
+        );
+        let omitted_label = format!("phase/{TIMELINE_DISPLAY_LIMIT}");
+        assert!(!evidence
+            .nvtx_ranges
+            .iter()
+            .any(|row| row.name == omitted_label));
         assert_eq!(
             evidence.correlation.ledger.observed.len(),
             TIMELINE_DISPLAY_LIMIT + 1

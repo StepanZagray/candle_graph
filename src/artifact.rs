@@ -140,6 +140,69 @@ pub fn verify_bundle(root: &Path) -> Result<BundleVerificationReceipt> {
     })
 }
 
+/// Recheck the immutable identity of a previously verified manifest and only the files consumed
+/// after that verification. Callers must first run [`verify_bundle`]; this narrower second pass is
+/// a post-read race detector, not a substitute for the initial recursive verification.
+pub(crate) fn verify_consumed_bundle_files(
+    root: &Path,
+    initial: &BundleVerificationReceipt,
+    consumed: &[&str],
+) -> Result<()> {
+    if initial.schema != VERIFICATION_SCHEMA || initial.bundle_schema != SCHEMA {
+        bail!(
+            "unsupported initial bundle verification receipt {:?}/{:?}",
+            initial.schema,
+            initial.bundle_schema
+        );
+    }
+    let manifest_path = root.join("bundle.json");
+    let manifest_metadata = fs::symlink_metadata(&manifest_path)
+        .with_context(|| format!("re-read bundle manifest {}", manifest_path.display()))?;
+    if !manifest_metadata.file_type().is_file() {
+        bail!(
+            "bundle manifest changed to a non-regular file after initial verification: {}",
+            manifest_path.display()
+        );
+    }
+    let manifest_bytes = fs::read(&manifest_path)
+        .with_context(|| format!("re-read bundle manifest {}", manifest_path.display()))?;
+    if sha256_bytes(&manifest_bytes) != initial.manifest_sha256 {
+        bail!("bundle manifest changed after initial verification");
+    }
+    let manifest: BundleManifest = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("re-parse bundle manifest {}", manifest_path.display()))?;
+    if manifest.schema != initial.bundle_schema || manifest.run_id != initial.run_id {
+        bail!("bundle manifest identity changed after initial verification");
+    }
+
+    let declared = manifest
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for &relative in consumed {
+        if !is_safe_relative_path(relative) || relative == "bundle.json" {
+            bail!("unsafe or reserved consumed bundle path {relative:?}");
+        }
+        let expected = declared
+            .get(relative)
+            .with_context(|| format!("consumed bundle file is not declared: {relative}"))?;
+        let path = root.join(relative);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("re-read consumed bundle file {}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            bail!("consumed bundle path is no longer a regular file: {relative}");
+        }
+        let actual = describe_file(root, &path)?;
+        if actual.bytes != expected.bytes
+            || !actual.sha256.eq_ignore_ascii_case(&expected.sha256)
+        {
+            bail!("consumed bundle file {relative:?} changed after initial verification");
+        }
+    }
+    Ok(())
+}
+
 /// Publish all evidence into a new directory. The final path appears only after every artifact,
 /// hash, and manifest has been written successfully.
 pub fn publish_bundle(
@@ -616,23 +679,74 @@ mod tests {
         write_jsonl(&trace, &document.to_events()).unwrap();
         publish_bundle(&destination, &trace, None).unwrap();
 
+        let initial_receipt = verify_bundle(&destination).unwrap();
+        verify_consumed_bundle_files(
+            &destination,
+            &initial_receipt,
+            &["trace.jsonl", "evidence.json"],
+        )
+        .unwrap();
+
+        let report_path = destination.join("report.md");
+        let original_report = fs::read(&report_path).unwrap();
+        fs::write(&report_path, b"changed after the initial deep verification").unwrap();
+        verify_consumed_bundle_files(
+            &destination,
+            &initial_receipt,
+            &["trace.jsonl", "evidence.json"],
+        )
+        .unwrap();
+        fs::write(&report_path, &original_report).unwrap();
+
         let evidence_path = destination.join("evidence.json");
         let original_evidence = fs::read(&evidence_path).unwrap();
         fs::write(&evidence_path, b"tampered").unwrap();
+        assert!(verify_consumed_bundle_files(
+            &destination,
+            &initial_receipt,
+            &["trace.jsonl", "evidence.json"],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("changed after initial verification"));
         assert!(verify_bundle(&destination)
             .unwrap_err()
             .to_string()
             .contains("mismatch"));
         fs::write(&evidence_path, original_evidence).unwrap();
 
-        let report_path = destination.join("report.md");
-        let original_report = fs::read(&report_path).unwrap();
         fs::remove_file(&report_path).unwrap();
         assert!(verify_bundle(&destination)
             .unwrap_err()
             .to_string()
             .contains("missing"));
         fs::write(&report_path, original_report).unwrap();
+
+        let bundled_trace = destination.join("trace.jsonl");
+        let original_trace = fs::read(&bundled_trace).unwrap();
+        fs::write(&bundled_trace, b"changed trace").unwrap();
+        assert!(verify_consumed_bundle_files(
+            &destination,
+            &initial_receipt,
+            &["trace.jsonl", "evidence.json"],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("changed after initial verification"));
+        fs::write(&bundled_trace, original_trace).unwrap();
+
+        let manifest_path = destination.join("bundle.json");
+        let original_manifest = fs::read(&manifest_path).unwrap();
+        fs::write(&manifest_path, b"changed manifest").unwrap();
+        assert!(verify_consumed_bundle_files(
+            &destination,
+            &initial_receipt,
+            &["trace.jsonl", "evidence.json"],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("manifest changed"));
+        fs::write(&manifest_path, original_manifest).unwrap();
 
         fs::write(destination.join("injected.txt"), b"not declared").unwrap();
         assert!(verify_bundle(&destination)

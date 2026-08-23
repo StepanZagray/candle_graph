@@ -140,7 +140,7 @@ let capture_contract = CaptureContract {
 Record every declared `(root, key)` exactly once. `Present` requires a finite positive norm,
 `Zero` requires positive `0.0`, and `Missing`/`NonFinite` carry no numeric norm. Complete coverage
 is granted only after exact key, digest, state, and family validation. The public schema constants
-are `TRACE_SCHEMA`, `EVIDENCE_SCHEMA`, `COMPARISON_SCHEMA`, `BUNDLE_SCHEMA`, and
+are `TRACE_SCHEMA`, `EVIDENCE_SCHEMA`, `GRAPH_SCHEMA`, `COMPARISON_SCHEMA`, `BUNDLE_SCHEMA`, and
 `GRADIENT_MANIFEST_SCHEMA`.
 
 ## Analyze
@@ -168,18 +168,24 @@ cargo candle-graph view application.jsonl --output viewer.html
 
 `summary` and `query` accept a raw trace, a finalized bundle/profile directory, or that bundle's
 `trace.jsonl`. Bundle inputs are deeply verified and read from their verified `evidence.json`, so
-identity-bound normalized Nsight evidence is retained. The bundle is deeply verified before and
-after reading its trace and packet, and both point-in-time receipts must match. This narrows the
-verification/read race but does not make mutable storage atomic. A parent directory containing
+identity-bound normalized Nsight evidence is retained. After reading, the CLI rechecks the exact
+manifest plus the consumed trace and packet instead of hashing unrelated bundle files a second
+time. These point-in-time checks narrow the verification/read race but do not provide a filesystem
+snapshot or make mutable storage atomic. Summary/query output paths that resolve to or traverse the
+bundle root or anywhere below it are rejected, including existing symbolic-link aliases. A parent containing
 `evidence.json` or `nsight/` without `bundle.json` is rejected, regardless of the input filename,
 instead of being silently treated as trace-only. Raw trace inputs from unaugmented directories
 remain supported; their GPU status is explicitly `unavailable` because no Nsight source was
 supplied.
 
-GPU queries are bounded. `gpu-phases` separates projected Nsight ranges from exact joined GPU-busy
-attribution, and `gpu-attribution-gaps` reports missing, unexpected, CPU-only, duplicate, and
-matched-but-unattributed semantic labels. Candle host, device-event, and Nsight clocks remain
-separate in every result.
+GPU queries are bounded and qualify each required Nsight report independently; an absent report is
+`unavailable` with an unknown population, never `available` with an inferred zero. `gpu-phases`
+separates projected Nsight ranges from exact joined GPU-busy attribution. Projected-range duration
+ordering is explicitly limited to the retained earliest-original-start sample, not presented as a
+global ranking. `gpu-attribution-gaps` reports missing, unexpected, CPU-only, duplicate, and
+matched-but-unattributed semantic labels only when both projection and GPU-timeline reports exist.
+Candle host, device-event, and Nsight clocks remain separate in every result. `slowest-host` emits
+only measured-scope span headlines; it does not append unscoped operation rankings.
 
 `compare` deeply verifies every bundle immediately before reading its bound trace. Raw trace
 comparison remains available through `--unverified-traces`, but its result is always marked
@@ -212,8 +218,10 @@ label as GPU-expected. Projected CPU-only labels are reported as correlation fai
 | Schema | Role |
 | --- | --- |
 | `candle-graph/trace/9` | Execution JSONL with exact gradient contracts, timing/memory planes, and terminal outcome |
-| `candle-graph/graph/4` | Validated call/data graph with tensor nodes and measured-scope host attribution |
-| `candle-graph/evidence/3` | Capability-qualified packet with typed gradient-contract facts and explicit unknowns |
+| `candle-graph/graph/5` | Validated call/data graph with mandatory measured-scope and overlap timing fields |
+| `candle-graph/evidence/4` | Capability-qualified packet with report-specific Nsight availability and graph/5 semantics |
+| `candle-graph/summary/4` | CLI summary envelope with report-qualified GPU counts |
+| `candle-graph/trace-query/4` | Bounded CLI query envelope with explicit unknowns and sample semantics |
 | `candle-graph/comparison/4` | Bundle-verified replicated outer-wall comparison with input receipts |
 | `candle-graph/viewer/5` | Offline unified viewer payload |
 | `candle-graph/gradient-manifest/1` | Ordered `(root, key, family)` digest domain |
@@ -221,9 +229,9 @@ label as GPU-expected. Projected CPU-only labels are reported as correlation fai
 | `candle-graph/bundle/1` | Content-addressed atomic evidence bundle |
 | `candle-graph/bundle-verification/1` | Deep bundle verification receipt |
 
-Version 0.9 rejects trace/8. Producers declaring complete gradient coverage must supply a
+Version 0.9 rejects trace/8, evidence/3, and graph/4. Producers declaring complete gradient coverage must supply a
 `GradientContract`; otherwise use partial or none. Comparison/4 takes finalized bundle directories
-by default. Evidence/3 and comparison/4 consumers must accept their new contract/provenance fields.
+by default. Evidence/4 and comparison/4 consumers must accept their new contract/provenance fields.
 
 See [CONTEXT.md](CONTEXT.md), [runtime guide](docs/runtime-analysis-guide.md),
 [features](docs/features.md), and [visualizer](docs/visualizer.md).

@@ -1,22 +1,39 @@
-//! Evidence CLI engine for trace/9, evidence/3, comparison/4, and atomic bundles.
+//! Evidence CLI engine for trace/9, evidence/4, comparison/4, and atomic bundles.
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::Serialize;
 
-use crate::artifact::{publish_bundle, verify_bundle, BundleVerificationReceipt};
+use crate::artifact::{
+    publish_bundle, verify_bundle, verify_consumed_bundle_files, BundleVerificationReceipt,
+};
 use crate::comparison::{compare_unverified_traces, compare_verified_bundles};
 use crate::evidence::{build_evidence, EvidencePacket};
 use crate::graph::{ExecutionGraph, GraphNode, GraphNodeKind};
-use crate::nsight::ProvenanceBindingState;
+use crate::nsight::{GpuEvidenceStatus, ProvenanceBindingState};
 use crate::trace::parse_trace;
 
 const QUERY_ROW_LIMIT: usize = 50;
 const QUERY_LABEL_LIMIT: usize = 100;
 const QUERY_DIAGNOSTIC_LIMIT: usize = 50;
+const SUMMARY_SCHEMA: &str = "candle-graph/summary/4";
+const QUERY_SCHEMA: &str = "candle-graph/trace-query/4";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct QueryAvailability {
+    status: GpuEvidenceStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl QueryAvailability {
+    fn is_available(&self) -> bool {
+        self.status == GpuEvidenceStatus::Available
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceQueryKind {
@@ -153,22 +170,18 @@ fn load_verified_bundle(requested_path: &Path, root: &Path) -> Result<LoadedEvid
             .with_context(|| format!("read verified evidence packet {}", evidence_path.display()))?,
     )
     .with_context(|| format!("parse verified evidence packet {}", evidence_path.display()))?;
-    ensure!(
-        packet.schema == crate::evidence::SCHEMA,
-        "unsupported evidence schema {:?}; expected {:?}",
-        packet.schema,
-        crate::evidence::SCHEMA
-    );
+    packet.validate_schema()?;
     ensure!(
         packet.provenance == document.run,
         "verified evidence packet provenance does not match its trace metadata"
     );
-    let verification_after_read = verify_bundle(root)
-        .with_context(|| format!("re-verify evidence bundle {} after reading", root.display()))?;
-    ensure!(
-        verification_after_read == verification,
-        "evidence bundle verification receipt changed while trace/evidence were being read"
-    );
+    verify_consumed_bundle_files(root, &verification, &["trace.jsonl", "evidence.json"])
+        .with_context(|| {
+            format!(
+                "post-read verify consumed files in evidence bundle {}",
+                root.display()
+            )
+        })?;
 
     let gpu_identity_bound = packet.gpu.provenance.binding == ProvenanceBindingState::Bound;
     Ok(LoadedEvidence {
@@ -197,6 +210,66 @@ fn reject_unverified_augmented_parent(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn reject_output_inside_verified_bundle(input: &EvidenceInput, output: Option<&Path>) -> Result<()> {
+    let (Some(root), Some(output)) = (input.bundle_root.as_deref(), output) else {
+        return Ok(());
+    };
+    let resolved_root = fs::canonicalize(root)
+        .with_context(|| format!("resolve verified bundle root {}", root.display()))?;
+    let (resolved_output, traversed_bundle) = resolve_write_path(output, &resolved_root)?;
+    if traversed_bundle || resolved_output.starts_with(&resolved_root) {
+        bail!(
+            "refusing to write summary/query output {} inside verified bundle {}",
+            output.display(),
+            root.display()
+        );
+    }
+    Ok(())
+}
+
+/// Resolve every existing path component (including symbolic links), while retaining a normalized
+/// suffix for a not-yet-created output. This mirrors the path that `create_dir_all`/`write` would
+/// reach closely enough to reject lexical `..` and pre-existing symlink aliases into a bundle.
+fn resolve_write_path(path: &Path, forbidden_root: &Path) -> Result<(PathBuf, bool)> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve current directory for output path")?
+            .join(path)
+    };
+    let mut resolved = PathBuf::new();
+    let mut traversed_forbidden_root = false;
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                match fs::symlink_metadata(&resolved) {
+                    Ok(_) => {
+                        resolved = fs::canonicalize(&resolved).with_context(|| {
+                            format!("resolve output path component {}", resolved.display())
+                        })?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("inspect output path component {}", resolved.display())
+                        });
+                    }
+                }
+            }
+        }
+        traversed_forbidden_root |= resolved.starts_with(forbidden_root);
+    }
+    Ok((resolved, traversed_forbidden_root))
+}
+
 pub fn run_import(trace_path: &Path, output: Option<&Path>) -> Result<()> {
     let evidence = load_evidence(trace_path)?;
     super::write_output(
@@ -207,9 +280,10 @@ pub fn run_import(trace_path: &Path, output: Option<&Path>) -> Result<()> {
 
 pub fn run_summary(input_path: &Path, output: Option<&Path>) -> Result<()> {
     let loaded = load_evidence_input(input_path)?;
+    reject_output_inside_verified_bundle(&loaded.input, output)?;
     let evidence = &loaded.packet;
     let rendered = serde_json::to_string_pretty(&serde_json::json!({
-        "schema": "candle-graph/summary/3",
+        "schema": SUMMARY_SCHEMA,
         "input": &loaded.input,
         "provenance": &evidence.provenance,
         "health": &evidence.health,
@@ -226,6 +300,7 @@ pub fn run_summary(input_path: &Path, output: Option<&Path>) -> Result<()> {
 
 pub fn run_query(input_path: &Path, kind: TraceQueryKind, output: Option<&Path>) -> Result<()> {
     let loaded = load_evidence_input(input_path)?;
+    reject_output_inside_verified_bundle(&loaded.input, output)?;
     let evidence = &loaded.packet;
     let result = match kind {
         TraceQueryKind::Memory => serde_json::to_value(&evidence.memory)?,
@@ -244,7 +319,7 @@ pub fn run_query(input_path: &Path, kind: TraceQueryKind, output: Option<&Path>)
         }
     };
     let rendered = serde_json::to_string_pretty(&serde_json::json!({
-        "schema": "candle-graph/trace-query/3",
+        "schema": QUERY_SCHEMA,
         "kind": kind.as_str(),
         "input": &loaded.input,
         "capabilities": &evidence.capabilities,
@@ -310,7 +385,6 @@ fn query_graph(graph: &ExecutionGraph, kind: TraceQueryKind) -> serde_json::Valu
             "entrypoint": graph.summary.entrypoint,
             "outer_wall_time_ns": graph.summary.outer_wall_time_ns,
             "slowest_host_spans": graph.summary.slowest_host_spans,
-            "slowest_host_ops": sorted_nodes(graph, |node| matches!(node.kind, GraphNodeKind::Op), |node| node.host_self_time_ns),
         }),
         TraceQueryKind::SlowestDevice => serde_json::json!({
             "entrypoint": graph.summary.entrypoint,
@@ -337,20 +411,45 @@ fn query_graph(graph: &ExecutionGraph, kind: TraceQueryKind) -> serde_json::Valu
 }
 
 fn gpu_summary(evidence: &EvidencePacket) -> serde_json::Value {
+    let correlation = report_availability(
+        evidence,
+        "nvtx_gpu_proj_trace",
+        evidence.gpu.coverage.nvtx_projection,
+    );
+    let phase_attribution = combined_report_availability(
+        evidence,
+        &[
+            ("nvtx_gpu_proj_trace", evidence.gpu.coverage.nvtx_projection),
+            ("cuda_gpu_trace", evidence.gpu.coverage.gpu_timeline),
+        ],
+    );
     serde_json::json!({
         "status": evidence.gpu.status,
         "reason": &evidence.gpu.reason,
         "provenance_binding": evidence.gpu.provenance.binding,
-        "correlation_complete": evidence.gpu.correlation.complete,
+        "correlation": {
+            "status": correlation.status,
+            "reason": &correlation.reason,
+            "complete": correlation.is_available().then_some(evidence.gpu.correlation.complete),
+        },
         "coverage": &evidence.gpu.coverage,
         "normalized_rows": gpu_row_counts(evidence),
-        "attributed_phases": evidence.gpu.phase_attribution.len(),
+        "attributed_phases": {
+            "status": phase_attribution.status,
+            "reason": &phase_attribution.reason,
+            "total": phase_attribution.is_available().then_some(evidence.gpu.phase_attribution.len()),
+        },
         "diagnostic_count": evidence.gpu.diagnostics.len().saturating_add(evidence.gpu.provenance.diagnostics.len()),
     })
 }
 
 fn query_gpu_status(evidence: &EvidencePacket) -> serde_json::Value {
     let diagnostics = bounded_diagnostics(evidence);
+    let correlation = report_availability(
+        evidence,
+        "nvtx_gpu_proj_trace",
+        evidence.gpu.coverage.nvtx_projection,
+    );
     serde_json::json!({
         "status": evidence.gpu.status,
         "reason": &evidence.gpu.reason,
@@ -360,7 +459,11 @@ fn query_gpu_status(evidence: &EvidencePacket) -> serde_json::Value {
             "provenance_binding": &evidence.capabilities.provenance_binding,
         },
         "coverage": &evidence.gpu.coverage,
-        "correlation_complete": evidence.gpu.correlation.complete,
+        "correlation": {
+            "status": correlation.status,
+            "reason": &correlation.reason,
+            "complete": correlation.is_available().then_some(evidence.gpu.correlation.complete),
+        },
         "normalized_rows": gpu_row_counts(evidence),
         "source_artifacts": {
             "raw_report": evidence.gpu.raw_report.is_some(),
@@ -371,6 +474,32 @@ fn query_gpu_status(evidence: &EvidencePacket) -> serde_json::Value {
 }
 
 fn query_gpu_correlation(evidence: &EvidencePacket) -> serde_json::Value {
+    let availability = report_availability(
+        evidence,
+        "nvtx_gpu_proj_trace",
+        evidence.gpu.coverage.nvtx_projection,
+    );
+    let required_reports = required_report_states(
+        evidence,
+        &[("nvtx_gpu_proj_trace", evidence.gpu.coverage.nvtx_projection)],
+    );
+    if !availability.is_available() {
+        return serde_json::json!({
+            "status": availability.status,
+            "reason": &availability.reason,
+            "provenance_binding": evidence.gpu.provenance.binding,
+            "required_reports": required_reports,
+            "capabilities": {
+                "gpu_correlation": &evidence.capabilities.gpu_correlation,
+                "provenance_binding": &evidence.capabilities.provenance_binding,
+            },
+            "mode": null,
+            "clock_aligned": null,
+            "complete": null,
+            "correlation_reason": null,
+            "ledger": null,
+        });
+    }
     let ledger = &evidence.gpu.correlation.ledger;
     let duplicates = ledger
         .duplicates
@@ -378,9 +507,10 @@ fn query_gpu_correlation(evidence: &EvidencePacket) -> serde_json::Value {
         .take(QUERY_LABEL_LIMIT)
         .collect::<Vec<_>>();
     serde_json::json!({
-        "status": evidence.gpu.status,
-        "reason": &evidence.gpu.reason,
+        "status": availability.status,
+        "reason": &availability.reason,
         "provenance_binding": evidence.gpu.provenance.binding,
+        "required_reports": required_reports,
         "capabilities": {
             "gpu_correlation": &evidence.capabilities.gpu_correlation,
             "provenance_binding": &evidence.capabilities.provenance_binding,
@@ -408,17 +538,31 @@ fn query_gpu_correlation(evidence: &EvidencePacket) -> serde_json::Value {
 }
 
 fn query_gpu_phases(evidence: &EvidencePacket) -> serde_json::Value {
-    let mut attributed = evidence.gpu.phase_attribution.iter().collect::<Vec<_>>();
-    attributed.sort_by(|left, right| {
-        right
-            .gpu_busy_ns
-            .cmp(&left.gpu_busy_ns)
-            .then_with(|| left.semantic_key.cmp(&right.semantic_key))
-    });
-    let attributed_total = attributed.len();
-    attributed.truncate(QUERY_ROW_LIMIT);
+    let projected_availability = report_availability(
+        evidence,
+        "nvtx_gpu_proj_trace",
+        evidence.gpu.coverage.nvtx_projection,
+    );
+    let attributed_availability = combined_report_availability(
+        evidence,
+        &[
+            ("nvtx_gpu_proj_trace", evidence.gpu.coverage.nvtx_projection),
+            ("cuda_gpu_trace", evidence.gpu.coverage.gpu_timeline),
+        ],
+    );
+    let required_reports = required_report_states(
+        evidence,
+        &[
+            ("nvtx_gpu_proj_trace", evidence.gpu.coverage.nvtx_projection),
+            ("cuda_gpu_trace", evidence.gpu.coverage.gpu_timeline),
+        ],
+    );
 
-    let mut projected = evidence.gpu.nvtx_ranges.iter().collect::<Vec<_>>();
+    let mut projected = if projected_availability.is_available() {
+        evidence.gpu.nvtx_ranges.iter().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     projected.sort_by(|left, right| {
         right
             .projected_duration_ns
@@ -426,7 +570,7 @@ fn query_gpu_phases(evidence: &EvidencePacket) -> serde_json::Value {
             .cmp(&left.projected_duration_ns.unwrap_or_default())
             .then_with(|| left.name.cmp(&right.name))
     });
-    let projected_display_total = projected.len();
+    let projected_sample_total = projected.len();
     projected.truncate(QUERY_ROW_LIMIT);
     let projected_rows = projected
         .into_iter()
@@ -446,34 +590,68 @@ fn query_gpu_phases(evidence: &EvidencePacket) -> serde_json::Value {
             })
         })
         .collect::<Vec<_>>();
-    let projected_total = total_report_rows(
-        evidence,
-        "nvtx_gpu_proj_trace",
-        projected_display_total,
-    );
+    let projected_population_total = projected_availability.is_available().then(|| {
+        total_report_rows(evidence, "nvtx_gpu_proj_trace", projected_sample_total)
+    });
+
+    let mut attributed = if attributed_availability.is_available() {
+        evidence.gpu.phase_attribution.iter().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    attributed.sort_by(|left, right| {
+        right
+            .gpu_busy_ns
+            .cmp(&left.gpu_busy_ns)
+            .then_with(|| left.semantic_key.cmp(&right.semantic_key))
+    });
+    let attributed_total = attributed_availability
+        .is_available()
+        .then_some(attributed.len());
+    attributed.truncate(QUERY_ROW_LIMIT);
 
     serde_json::json!({
-        "status": evidence.gpu.status,
-        "reason": &evidence.gpu.reason,
+        "status": attributed_availability.status,
+        "reason": &attributed_availability.reason,
         "provenance_binding": evidence.gpu.provenance.binding,
+        "required_reports": required_reports,
         "clock_plane": "nsight_projected_not_host_aligned",
         "projected_ranges": {
-            "total": projected_total,
+            "status": projected_availability.status,
+            "reason": &projected_availability.reason,
+            "population_total": projected_population_total,
+            "retained_sample_total": projected_availability.is_available().then_some(projected_sample_total),
             "displayed": projected_rows.len(),
-            "truncated": projected_rows.len() < projected_total,
+            "population_truncated_before_ranking": projected_population_total.map(|total| projected_sample_total < total),
+            "display_truncated": projected_availability.is_available().then_some(projected_rows.len() < projected_sample_total),
+            "sample_selection": "earliest_original_start_rows",
+            "ordering": "projected_duration_ns_desc_within_retained_sample",
+            "global_duration_ranking": false,
             "rows": projected_rows,
         },
         "attributed_phases": {
-            "total": attributed_total,
+            "status": attributed_availability.status,
+            "reason": &attributed_availability.reason,
+            "population_total": attributed_total,
             "displayed": attributed.len(),
-            "truncated": attributed.len() < attributed_total,
+            "display_truncated": attributed_total.map(|total| attributed.len() < total),
+            "ordering": "gpu_busy_ns_desc_across_normalized_population",
             "rows": attributed,
         },
     })
 }
 
 fn query_gpu_kernels(evidence: &EvidencePacket) -> serde_json::Value {
-    let mut kernels = evidence.gpu.kernels.iter().collect::<Vec<_>>();
+    let availability = report_availability(
+        evidence,
+        "cuda_gpu_kern_sum",
+        evidence.gpu.coverage.kernel_summary,
+    );
+    let mut kernels = if availability.is_available() {
+        evidence.gpu.kernels.iter().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     kernels.sort_by(|left, right| {
         right
             .total_ns
@@ -482,24 +660,60 @@ fn query_gpu_kernels(evidence: &EvidencePacket) -> serde_json::Value {
     });
     let normalized_display_total = kernels.len();
     kernels.truncate(QUERY_ROW_LIMIT);
-    let total = total_report_rows(
-        evidence,
-        "cuda_gpu_kern_sum",
-        normalized_display_total,
-    );
+    let total = availability.is_available().then(|| {
+        total_report_rows(evidence, "cuda_gpu_kern_sum", normalized_display_total)
+    });
     serde_json::json!({
-        "status": evidence.gpu.status,
-        "reason": &evidence.gpu.reason,
+        "status": availability.status,
+        "reason": &availability.reason,
         "provenance_binding": evidence.gpu.provenance.binding,
+        "required_reports": required_report_states(
+            evidence,
+            &[("cuda_gpu_kern_sum", evidence.gpu.coverage.kernel_summary)],
+        ),
         "clock_plane": "nsight_gpu",
-        "total": total,
+        "population_total": total,
         "displayed": kernels.len(),
-        "truncated": kernels.len() < total,
+        "display_truncated": total.map(|total| kernels.len() < total),
         "rows": kernels,
     })
 }
 
 fn query_gpu_attribution_gaps(evidence: &EvidencePacket) -> serde_json::Value {
+    let availability = combined_report_availability(
+        evidence,
+        &[
+            ("nvtx_gpu_proj_trace", evidence.gpu.coverage.nvtx_projection),
+            ("cuda_gpu_trace", evidence.gpu.coverage.gpu_timeline),
+        ],
+    );
+    let required_reports = required_report_states(
+        evidence,
+        &[
+            ("nvtx_gpu_proj_trace", evidence.gpu.coverage.nvtx_projection),
+            ("cuda_gpu_trace", evidence.gpu.coverage.gpu_timeline),
+        ],
+    );
+    if !availability.is_available() {
+        return serde_json::json!({
+            "status": availability.status,
+            "reason": &availability.reason,
+            "provenance_binding": evidence.gpu.provenance.binding,
+            "required_reports": required_reports,
+            "correlation_complete": null,
+            "correlation_reason": null,
+            "missing_expected": null,
+            "unexpected_observed": null,
+            "unexpected_cpu_only": null,
+            "duplicate_labels": null,
+            "matched_without_exact_gpu_busy_attribution": null,
+            "attributed_unexpected": null,
+            "projected_range_rows": null,
+            "exactly_attributed_phase_rows": null,
+            "truncated_reports": null,
+            "diagnostics": bounded_values(&bounded_diagnostics(evidence), QUERY_DIAGNOSTIC_LIMIT),
+        });
+    }
     let ledger = &evidence.gpu.correlation.ledger;
     let attributed = evidence
         .gpu
@@ -539,9 +753,10 @@ fn query_gpu_attribution_gaps(evidence: &EvidencePacket) -> serde_json::Value {
     let diagnostics = bounded_diagnostics(evidence);
 
     serde_json::json!({
-        "status": evidence.gpu.status,
-        "reason": &evidence.gpu.reason,
+        "status": availability.status,
+        "reason": &availability.reason,
         "provenance_binding": evidence.gpu.provenance.binding,
+        "required_reports": required_reports,
         "correlation_complete": evidence.gpu.correlation.complete,
         "correlation_reason": &evidence.gpu.correlation.reason,
         "missing_expected": bounded_values(&ledger.missing_expected, QUERY_LABEL_LIMIT),
@@ -564,12 +779,115 @@ fn query_gpu_attribution_gaps(evidence: &EvidencePacket) -> serde_json::Value {
 
 fn gpu_row_counts(evidence: &EvidencePacket) -> serde_json::Value {
     serde_json::json!({
-        "kernels": total_report_rows(evidence, "cuda_gpu_kern_sum", evidence.gpu.kernels.len()),
-        "runtime_calls": total_report_rows(evidence, "cuda_api_sum", evidence.gpu.runtime_calls.len()),
-        "memory_operations": total_report_rows(evidence, "cuda_gpu_mem_time_sum", evidence.gpu.memory_operations.len()),
-        "projected_ranges": total_report_rows(evidence, "nvtx_gpu_proj_trace", evidence.gpu.nvtx_ranges.len()),
-        "gpu_timeline": total_report_rows(evidence, "cuda_gpu_trace", evidence.gpu.gpu_timeline.len()),
+        "kernels": report_row_count(evidence, "cuda_gpu_kern_sum", evidence.gpu.coverage.kernel_summary, evidence.gpu.kernels.len()),
+        "runtime_calls": report_row_count(evidence, "cuda_api_sum", evidence.gpu.coverage.runtime_summary, evidence.gpu.runtime_calls.len()),
+        "memory_operations": report_row_count(evidence, "cuda_gpu_mem_time_sum", evidence.gpu.coverage.memory_summary, evidence.gpu.memory_operations.len()),
+        "projected_ranges": report_row_count(evidence, "nvtx_gpu_proj_trace", evidence.gpu.coverage.nvtx_projection, evidence.gpu.nvtx_ranges.len()),
+        "gpu_timeline": report_row_count(evidence, "cuda_gpu_trace", evidence.gpu.coverage.gpu_timeline, evidence.gpu.gpu_timeline.len()),
     })
+}
+
+fn report_row_count(
+    evidence: &EvidencePacket,
+    report_kind: &str,
+    covered: bool,
+    fallback: usize,
+) -> serde_json::Value {
+    let availability = report_availability(evidence, report_kind, covered);
+    serde_json::json!({
+        "status": availability.status,
+        "reason": &availability.reason,
+        "total": availability.is_available().then(|| total_report_rows(evidence, report_kind, fallback)),
+    })
+}
+
+fn report_availability(
+    evidence: &EvidencePacket,
+    report_kind: &str,
+    covered: bool,
+) -> QueryAvailability {
+    let parse_failed = evidence
+        .gpu
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.contains(report_kind));
+    if covered && !parse_failed {
+        return QueryAvailability {
+            status: GpuEvidenceStatus::Available,
+            reason: None,
+        };
+    }
+    let failed = parse_failed || evidence.gpu.status == GpuEvidenceStatus::Failed;
+    QueryAvailability {
+        status: if failed {
+            GpuEvidenceStatus::Failed
+        } else {
+            GpuEvidenceStatus::Unavailable
+        },
+        reason: Some(if failed {
+            format!(
+                "Nsight report `{report_kind}` failed to normalize; its row population is unknown, not zero"
+            )
+        } else {
+            format!(
+                "Nsight report `{report_kind}` was not normalized; its row population is unknown, not zero"
+            )
+        }),
+    }
+}
+
+fn combined_report_availability(
+    evidence: &EvidencePacket,
+    reports: &[(&str, bool)],
+) -> QueryAvailability {
+    let unavailable = reports
+        .iter()
+        .filter_map(|(report, covered)| {
+            let availability = report_availability(evidence, *report, *covered);
+            (!availability.is_available()).then_some((*report, availability.status))
+        })
+        .collect::<Vec<_>>();
+    if unavailable.is_empty() {
+        return QueryAvailability {
+            status: GpuEvidenceStatus::Available,
+            reason: None,
+        };
+    }
+    let failed = unavailable
+        .iter()
+        .any(|(_, status)| *status == GpuEvidenceStatus::Failed);
+    let names = unavailable
+        .iter()
+        .map(|(report, _)| *report)
+        .collect::<Vec<_>>();
+    QueryAvailability {
+        status: if failed {
+            GpuEvidenceStatus::Failed
+        } else {
+            GpuEvidenceStatus::Unavailable
+        },
+        reason: Some(format!(
+            "required normalized Nsight report(s) unavailable: {}; the derived result is unknown, not zero",
+            names.join(", ")
+        )),
+    }
+}
+
+fn required_report_states(
+    evidence: &EvidencePacket,
+    reports: &[(&str, bool)],
+) -> serde_json::Value {
+    let states = reports
+        .iter()
+        .map(|(report, covered)| {
+            (
+                (*report).to_string(),
+                serde_json::to_value(report_availability(evidence, *report, *covered))
+                    .expect("query availability is serializable"),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    serde_json::to_value(states).expect("required report states are serializable")
 }
 
 fn total_report_rows(evidence: &EvidencePacket, report_kind: &str, fallback: usize) -> usize {

@@ -12,8 +12,8 @@ use candle_graph::trace::{
     write_jsonl, RunOutcome, SpanRecord, TerminalEvent, TraceRunMeta, SCHEMA as TRACE_SCHEMA,
 };
 use candle_graph::{
-    publish_bundle, CaptureContract, CoverageLevel, ExecutionPhase, MeasurementScope, SpanKind,
-    TimingMode, TraceDocument,
+    publish_bundle, verify_bundle, BundleManifest, CaptureContract, CoverageLevel, ExecutionPhase,
+    MeasurementScope, SpanKind, TimingMode, TraceDocument,
 };
 use sha2::{Digest, Sha256};
 
@@ -118,6 +118,31 @@ fn manifest_artifact(root: &Path, path: &Path) -> ManifestArtifact {
 }
 
 fn publish_augmented_bundle(root: &Path) -> (PathBuf, PathBuf) {
+    publish_bundle_with_reports(root, true, true, true)
+}
+
+fn publish_bundle_with_reports(
+    root: &Path,
+    include_kernels: bool,
+    include_projection: bool,
+    include_gpu_timeline: bool,
+) -> (PathBuf, PathBuf) {
+    publish_bundle_with_report_options(
+        root,
+        include_kernels,
+        include_projection,
+        include_gpu_timeline,
+        false,
+    )
+}
+
+fn publish_bundle_with_report_options(
+    root: &Path,
+    include_kernels: bool,
+    include_projection: bool,
+    include_gpu_timeline: bool,
+    include_broken_kernel: bool,
+) -> (PathBuf, PathBuf) {
     let trace = root.join("raw.jsonl");
     write_jsonl(&trace, &trace_document().to_events()).unwrap();
 
@@ -125,26 +150,49 @@ fn publish_augmented_bundle(root: &Path) -> (PathBuf, PathBuf) {
     fs::create_dir(&nsight).unwrap();
     let raw = nsight.join("capture.nsys-rep");
     let kernels = nsight.join("sample_cuda_gpu_kern_sum.csv");
+    let broken_kernel = nsight.join("broken_cuda_gpu_kern_sum.csv");
     let projection = nsight.join("sample_nvtx_gpu_proj_trace.csv");
     let gpu_timeline = nsight.join("sample_cuda_gpu_trace.csv");
     fs::write(&raw, b"retained raw report").unwrap();
-    fs::write(
-        &kernels,
-        "Total Time (ns),Instances,Avg (ns),Min (ns),Max (ns),Name\n1200,2,600,500,700,gemm\n",
-    )
-    .unwrap();
-    fs::write(
-        &projection,
-        "Name,Start (ns),Duration (ns),Projected Start (ns),Projected Duration (ns),Num GPU Ops,CorrId\nphase/gpu,10,100,20,80,2,1\n",
-    )
-    .unwrap();
-    fs::write(
-        &gpu_timeline,
-        "Name,Start (ns),Duration (ns),CorrId\nkernel/a,20,40,1\nkernel/b,50,20,1\n",
-    )
-    .unwrap();
-    let artifacts = [&raw, &kernels, &projection, &gpu_timeline]
-        .into_iter()
+    if include_kernels {
+        fs::write(
+            &kernels,
+            "Total Time (ns),Instances,Avg (ns),Min (ns),Max (ns),Name\n1200,2,600,500,700,gemm\n",
+        )
+        .unwrap();
+    }
+    if include_broken_kernel {
+        fs::write(&broken_kernel, "unsupported,columns\n1,2\n").unwrap();
+    }
+    if include_projection {
+        fs::write(
+            &projection,
+            "Name,Start (ns),Duration (ns),Projected Start (ns),Projected Duration (ns),Num GPU Ops,CorrId\nphase/gpu,10,100,20,80,2,1\n",
+        )
+        .unwrap();
+    }
+    if include_gpu_timeline {
+        fs::write(
+            &gpu_timeline,
+            "Name,Start (ns),Duration (ns),CorrId\nkernel/a,20,40,1\nkernel/b,50,20,1\n",
+        )
+        .unwrap();
+    }
+    let mut artifact_paths = vec![raw];
+    if include_kernels {
+        artifact_paths.push(kernels);
+    }
+    if include_broken_kernel {
+        artifact_paths.push(broken_kernel);
+    }
+    if include_projection {
+        artifact_paths.push(projection);
+    }
+    if include_gpu_timeline {
+        artifact_paths.push(gpu_timeline);
+    }
+    let artifacts = artifact_paths
+        .iter()
         .map(|path| manifest_artifact(&nsight, path))
         .collect();
     let manifest = CaptureManifest {
@@ -186,6 +234,31 @@ fn read_json(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
+fn write_packet_and_rebind_manifest(
+    bundle: &Path,
+    packet: &serde_json::Value,
+) {
+    let evidence_path = bundle.join("evidence.json");
+    let packet_bytes = serde_json::to_vec_pretty(packet).unwrap();
+    fs::write(&evidence_path, &packet_bytes).unwrap();
+
+    let manifest_path = bundle.join("bundle.json");
+    let mut manifest: BundleManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let evidence = manifest
+        .files
+        .iter_mut()
+        .find(|file| file.path == "evidence.json")
+        .unwrap();
+    evidence.bytes = packet_bytes.len() as u64;
+    evidence.sha256 = format!("{:x}", Sha256::digest(&packet_bytes));
+    fs::write(
+        manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn bundle_root_and_bundled_trace_retain_verified_gpu_evidence() {
     let root = TempRoot::new("bundle-input");
@@ -219,7 +292,11 @@ fn raw_trace_gpu_status_is_explicitly_unavailable() {
         query["result"]["reason"],
         "Nsight capture was not requested"
     );
-    assert_eq!(query["result"]["normalized_rows"]["kernels"], 0);
+    assert_eq!(
+        query["result"]["normalized_rows"]["kernels"]["status"],
+        "unavailable"
+    );
+    assert!(query["result"]["normalized_rows"]["kernels"]["total"].is_null());
 }
 
 #[test]
@@ -229,11 +306,14 @@ fn gpu_summary_and_queries_use_verified_bounded_bundle_evidence() {
     let summary_path = root.0.join("summary.json");
     run_summary(&bundle, Some(&summary_path)).unwrap();
     let summary = read_json(&summary_path);
-    assert_eq!(summary["schema"], "candle-graph/summary/3");
+    assert_eq!(summary["schema"], "candle-graph/summary/4");
     assert_eq!(summary["input"]["kind"], "verified_bundle");
     assert!(summary["input"]["gpu_identity_bound"].as_bool().unwrap());
     assert_eq!(summary["gpu"]["status"], "available");
-    assert_eq!(summary["gpu"]["normalized_rows"]["kernels"], 1);
+    assert_eq!(
+        summary["gpu"]["normalized_rows"]["kernels"]["total"],
+        1
+    );
 
     let cases = [
         (TraceQueryKind::GpuStatus, "gpu-status"),
@@ -249,7 +329,7 @@ fn gpu_summary_and_queries_use_verified_bounded_bundle_evidence() {
         let output = root.0.join(format!("{name}.json"));
         run_query(&bundle, kind, Some(&output)).unwrap();
         let query = read_json(&output);
-        assert_eq!(query["schema"], "candle-graph/trace-query/3");
+        assert_eq!(query["schema"], "candle-graph/trace-query/4");
         assert_eq!(query["kind"], name);
         assert_eq!(query["input"]["kind"], "verified_bundle");
         assert_eq!(query["result"]["status"], "available");
@@ -259,8 +339,22 @@ fn gpu_summary_and_queries_use_verified_bounded_bundle_evidence() {
     assert!(correlation["result"]["complete"].as_bool().unwrap());
     assert_eq!(correlation["result"]["ledger"]["matched"]["total"], 1);
     let phases = read_json(&root.0.join("gpu-phases.json"));
-    assert_eq!(phases["result"]["projected_ranges"]["total"], 1);
-    assert_eq!(phases["result"]["attributed_phases"]["total"], 1);
+    assert_eq!(
+        phases["result"]["projected_ranges"]["population_total"],
+        1
+    );
+    assert_eq!(
+        phases["result"]["attributed_phases"]["population_total"],
+        1
+    );
+    assert_eq!(
+        phases["result"]["projected_ranges"]["sample_selection"],
+        "earliest_original_start_rows"
+    );
+    assert_eq!(
+        phases["result"]["projected_ranges"]["global_duration_ranking"],
+        false
+    );
     let kernels = read_json(&root.0.join("gpu-kernels.json"));
     assert_eq!(kernels["result"]["rows"][0]["name"], "gemm");
     let gaps = read_json(&root.0.join("gpu-attribution-gaps.json"));
@@ -268,6 +362,210 @@ fn gpu_summary_and_queries_use_verified_bounded_bundle_evidence() {
         gaps["result"]["matched_without_exact_gpu_busy_attribution"]["total"],
         0
     );
+}
+
+#[test]
+fn partial_gpu_reports_remain_unknown_in_report_specific_queries() {
+    let kernel_root = TempRoot::new("partial-kernel");
+    let (_, kernel_bundle) =
+        publish_bundle_with_reports(&kernel_root.0, true, false, false);
+
+    let status_path = kernel_root.0.join("status.json");
+    run_query(
+        &kernel_bundle,
+        TraceQueryKind::GpuStatus,
+        Some(&status_path),
+    )
+    .unwrap();
+    let status = read_json(&status_path);
+    assert_eq!(
+        status["result"]["normalized_rows"]["kernels"]["status"],
+        "available"
+    );
+    assert_eq!(
+        status["result"]["normalized_rows"]["kernels"]["total"],
+        1
+    );
+    assert_eq!(
+        status["result"]["normalized_rows"]["projected_ranges"]["status"],
+        "unavailable"
+    );
+    assert!(status["result"]["normalized_rows"]["projected_ranges"]["total"].is_null());
+
+    for (kind, name) in [
+        (TraceQueryKind::GpuCorrelation, "correlation"),
+        (TraceQueryKind::GpuPhases, "phases"),
+        (TraceQueryKind::GpuAttributionGaps, "gaps"),
+    ] {
+        let output = kernel_root.0.join(format!("{name}.json"));
+        run_query(&kernel_bundle, kind, Some(&output)).unwrap();
+        let query = read_json(&output);
+        assert_eq!(query["result"]["status"], "unavailable");
+        assert!(query["result"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("unknown, not zero"));
+    }
+    let correlation = read_json(&kernel_root.0.join("correlation.json"));
+    assert!(correlation["result"]["complete"].is_null());
+    assert!(correlation["result"]["ledger"].is_null());
+    let gaps = read_json(&kernel_root.0.join("gaps.json"));
+    assert!(gaps["result"]["missing_expected"].is_null());
+
+    let projection_root = TempRoot::new("partial-projection");
+    let (_, projection_bundle) =
+        publish_bundle_with_reports(&projection_root.0, false, true, false);
+    let correlation_path = projection_root.0.join("correlation.json");
+    run_query(
+        &projection_bundle,
+        TraceQueryKind::GpuCorrelation,
+        Some(&correlation_path),
+    )
+    .unwrap();
+    let correlation = read_json(&correlation_path);
+    assert_eq!(correlation["result"]["status"], "available");
+    assert_eq!(correlation["result"]["complete"], true);
+
+    let phases_path = projection_root.0.join("phases.json");
+    run_query(
+        &projection_bundle,
+        TraceQueryKind::GpuPhases,
+        Some(&phases_path),
+    )
+    .unwrap();
+    let phases = read_json(&phases_path);
+    assert_eq!(phases["result"]["status"], "unavailable");
+    assert_eq!(
+        phases["result"]["projected_ranges"]["status"],
+        "available"
+    );
+    assert_eq!(
+        phases["result"]["projected_ranges"]["population_total"],
+        1
+    );
+    assert_eq!(
+        phases["result"]["attributed_phases"]["status"],
+        "unavailable"
+    );
+    assert!(phases["result"]["attributed_phases"]["population_total"].is_null());
+
+    let kernels_path = projection_root.0.join("kernels.json");
+    run_query(
+        &projection_bundle,
+        TraceQueryKind::GpuKernels,
+        Some(&kernels_path),
+    )
+    .unwrap();
+    let kernels = read_json(&kernels_path);
+    assert_eq!(kernels["result"]["status"], "unavailable");
+    assert!(kernels["result"]["population_total"].is_null());
+    assert_eq!(kernels["result"]["rows"].as_array().unwrap().len(), 0);
+
+    let broken_root = TempRoot::new("partial-broken-kernel");
+    let (_, broken_bundle) =
+        publish_bundle_with_report_options(&broken_root.0, true, true, true, true);
+    let broken_path = broken_root.0.join("kernels.json");
+    run_query(
+        &broken_bundle,
+        TraceQueryKind::GpuKernels,
+        Some(&broken_path),
+    )
+    .unwrap();
+    let broken = read_json(&broken_path);
+    assert_eq!(broken["result"]["status"], "failed");
+    assert!(broken["result"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("failed to normalize"));
+    assert!(broken["result"]["population_total"].is_null());
+}
+
+#[test]
+fn summary_and_query_outputs_cannot_modify_a_verified_bundle() {
+    let root = TempRoot::new("protected-output");
+    let (_, bundle) = publish_augmented_bundle(&root.0);
+    let initial_receipt = verify_bundle(&bundle).unwrap();
+    let initial_evidence = fs::read(bundle.join("evidence.json")).unwrap();
+
+    let direct_overwrite = bundle.join("evidence.json");
+    let direct_error = run_summary(&bundle, Some(&direct_overwrite)).unwrap_err();
+    assert!(direct_error.to_string().contains("inside verified bundle"));
+
+    let injected = bundle.join("injected.json");
+    let injection_error = run_query(
+        &bundle,
+        TraceQueryKind::GpuStatus,
+        Some(&injected),
+    )
+    .unwrap_err();
+    assert!(injection_error.to_string().contains("inside verified bundle"));
+    assert!(!injected.exists());
+
+    let dotdot = bundle.join("nsight/../dotdot.json");
+    let dotdot_error = run_summary(&bundle, Some(&dotdot)).unwrap_err();
+    assert!(dotdot_error.to_string().contains("inside verified bundle"));
+    assert!(!bundle.join("dotdot.json").exists());
+
+    let traversing = bundle.join("new-directory/../../outside.json");
+    let traversing_error = run_summary(&bundle, Some(&traversing)).unwrap_err();
+    assert!(traversing_error
+        .to_string()
+        .contains("inside verified bundle"));
+    assert!(!bundle.join("new-directory").exists());
+
+    let root_error = run_summary(&bundle, Some(&bundle)).unwrap_err();
+    assert!(root_error.to_string().contains("inside verified bundle"));
+    assert_eq!(verify_bundle(&bundle).unwrap(), initial_receipt);
+    assert_eq!(fs::read(bundle.join("evidence.json")).unwrap(), initial_evidence);
+}
+
+#[cfg(unix)]
+#[test]
+fn output_symlink_alias_into_verified_bundle_is_rejected() {
+    let root = TempRoot::new("protected-output-symlink");
+    let (_, bundle) = publish_augmented_bundle(&root.0);
+    let initial_receipt = verify_bundle(&bundle).unwrap();
+    let alias = root.0.join("bundle-alias");
+    std::os::unix::fs::symlink(&bundle, &alias).unwrap();
+    let output = alias.join("injected.json");
+
+    let error = run_query(&bundle, TraceQueryKind::GpuStatus, Some(&output)).unwrap_err();
+    assert!(error.to_string().contains("inside verified bundle"));
+    assert!(!bundle.join("injected.json").exists());
+    assert_eq!(verify_bundle(&bundle).unwrap(), initial_receipt);
+}
+
+#[test]
+fn verified_bundle_consumer_rejects_old_evidence_and_graph_schemas() {
+    let evidence_root = TempRoot::new("old-evidence-schema");
+    let (_, evidence_bundle) = publish_augmented_bundle(&evidence_root.0);
+    let mut packet = read_json(&evidence_bundle.join("evidence.json"));
+    packet["schema"] = serde_json::json!("candle-graph/evidence/3");
+    write_packet_and_rebind_manifest(&evidence_bundle, &packet);
+    verify_bundle(&evidence_bundle).unwrap();
+    let error = load_evidence(&evidence_bundle).unwrap_err();
+    assert!(format!("{error:#}").contains("unsupported evidence schema"));
+
+    let graph_root = TempRoot::new("old-graph-schema");
+    let (_, graph_bundle) = publish_augmented_bundle(&graph_root.0);
+    let mut packet = read_json(&graph_bundle.join("evidence.json"));
+    packet["graph"]["schema"] = serde_json::json!("candle-graph/graph/4");
+    write_packet_and_rebind_manifest(&graph_bundle, &packet);
+    verify_bundle(&graph_bundle).unwrap();
+    let error = load_evidence(&graph_bundle).unwrap_err();
+    assert!(format!("{error:#}").contains("unsupported graph schema"));
+}
+
+#[test]
+fn slowest_host_query_only_reports_measured_scope_headlines() {
+    let root = TempRoot::new("slowest-host-scope");
+    let (trace, _) = publish_augmented_bundle(&root.0);
+    let output = root.0.join("slowest-host.json");
+    run_query(&trace, TraceQueryKind::SlowestHost, Some(&output)).unwrap();
+    let query = read_json(&output);
+
+    assert!(query["result"].get("slowest_host_spans").is_some());
+    assert!(query["result"].get("slowest_host_ops").is_none());
 }
 
 #[test]

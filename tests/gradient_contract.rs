@@ -21,7 +21,8 @@ fn gradient(root: &str, key: &str, state: GradientState, norm: Option<f64>) -> G
 #[test]
 fn public_schema_constants_identify_the_breaking_contract_revision() {
     assert_eq!(candle_graph::TRACE_SCHEMA, "candle-graph/trace/9");
-    assert_eq!(candle_graph::EVIDENCE_SCHEMA, "candle-graph/evidence/3");
+    assert_eq!(candle_graph::EVIDENCE_SCHEMA, "candle-graph/evidence/4");
+    assert_eq!(candle_graph::GRAPH_SCHEMA, "candle-graph/graph/5");
     assert_eq!(candle_graph::COMPARISON_SCHEMA, "candle-graph/comparison/4");
     assert_eq!(candle_graph::BUNDLE_SCHEMA, "candle-graph/bundle/1");
     assert_eq!(

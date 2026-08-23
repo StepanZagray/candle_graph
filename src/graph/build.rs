@@ -244,21 +244,16 @@ pub fn build_from_trace(doc: &TraceDocument) -> Result<ExecutionGraph> {
                 name: node.name.clone(),
                 scope,
                 host_self_time_ns: node.host_self_time_ns,
-                measured_overlap_self_time_ns: Some(timing.self_time_ns),
-                full_duration_ns: Some(node.host_total_time_ns),
-                measured_overlap_duration_ns: Some(timing.duration_ns),
+                measured_overlap_self_time_ns: timing.self_time_ns,
+                full_duration_ns: node.host_total_time_ns,
+                measured_overlap_duration_ns: timing.duration_ns,
             })
         })
         .collect::<Vec<_>>();
     slowest_host_spans.sort_by(|left, right| {
         right
             .measured_overlap_self_time_ns
-            .unwrap_or(right.host_self_time_ns)
-            .cmp(
-                &left
-                    .measured_overlap_self_time_ns
-                    .unwrap_or(left.host_self_time_ns),
-            )
+            .cmp(&left.measured_overlap_self_time_ns)
             .then_with(|| right.host_self_time_ns.cmp(&left.host_self_time_ns))
             .then_with(|| left.id.cmp(&right.id))
     });
@@ -710,15 +705,15 @@ mod tests {
         let measured = costs.iter().find(|cost| cost.id == "s2").unwrap();
         assert_eq!(measured.scope, MeasuredHostScope::MeasuredSubtree);
         assert_eq!(measured.host_self_time_ns, 50);
-        assert_eq!(measured.measured_overlap_self_time_ns, Some(50));
-        assert_eq!(measured.full_duration_ns, Some(60));
-        assert_eq!(measured.measured_overlap_duration_ns, Some(60));
+        assert_eq!(measured.measured_overlap_self_time_ns, 50);
+        assert_eq!(measured.full_duration_ns, 60);
+        assert_eq!(measured.measured_overlap_duration_ns, 60);
         let worker_z = costs.iter().find(|cost| cost.id == "z-worker").unwrap();
         assert_eq!(worker_z.scope, MeasuredHostScope::ConcurrentOverlap);
         assert_eq!(worker_z.host_self_time_ns, 30);
-        assert_eq!(worker_z.measured_overlap_self_time_ns, Some(20));
-        assert_eq!(worker_z.full_duration_ns, Some(30));
-        assert_eq!(worker_z.measured_overlap_duration_ns, Some(20));
+        assert_eq!(worker_z.measured_overlap_self_time_ns, 20);
+        assert_eq!(worker_z.full_duration_ns, 30);
+        assert_eq!(worker_z.measured_overlap_duration_ns, 20);
         assert!(!costs.iter().any(|cost| cost.id == "s1"));
         assert!(!costs.iter().any(|cost| cost.id == "outside"));
 
