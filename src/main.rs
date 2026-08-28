@@ -10,7 +10,7 @@ use candle_graph::cli::trace_cli::{self, TraceQueryKind};
 #[command(
     name = "candle-graph",
     about = "Import and visualize Candle execution traces",
-    long_about = "Capability-qualified evidence and atomic bundles from candle-graph/trace/9 runs."
+    long_about = "Capability-qualified evidence and atomic bundles from candle-graph/trace/10 runs."
 )]
 struct Args {
     #[command(subcommand)]
@@ -104,6 +104,7 @@ enum CliTraceQueryKind {
     Memory,
     Spans,
     Tensors,
+    TensorStats,
     Gradients,
     Capabilities,
     GpuStatus,
@@ -122,6 +123,7 @@ impl From<CliTraceQueryKind> for TraceQueryKind {
             CliTraceQueryKind::Memory => Self::Memory,
             CliTraceQueryKind::Spans => Self::Spans,
             CliTraceQueryKind::Tensors => Self::Tensors,
+            CliTraceQueryKind::TensorStats => Self::TensorStats,
             CliTraceQueryKind::Gradients => Self::Gradients,
             CliTraceQueryKind::Capabilities => Self::Capabilities,
             CliTraceQueryKind::GpuStatus => Self::GpuStatus,

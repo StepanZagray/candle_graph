@@ -605,6 +605,7 @@ mod tests {
                     category: MemoryCategory::Activation,
                 })
                 .collect(),
+            tensor_stats: vec![],
             memory: vec![],
             device_memory: vec![],
             device_intervals: vec![],
@@ -683,6 +684,7 @@ mod tests {
             ],
             ops: vec![],
             tensors: vec![],
+            tensor_stats: vec![],
             memory: vec![],
             device_memory: vec![],
             device_intervals: vec![],

@@ -14,7 +14,7 @@ use candle_graph::cli::trace_cli::{self, TraceQueryKind};
     name = "cargo-candle-graph",
     bin_name = "cargo candle-graph",
     about = "Import and analyze candle-graph execution trace files",
-    long_about = "Capability-qualified evidence and atomic bundles from candle-graph/trace/9 runs."
+    long_about = "Capability-qualified evidence and atomic bundles from candle-graph/trace/10 runs."
 )]
 struct CargoArgs {
     #[command(subcommand)]
@@ -42,7 +42,7 @@ enum Command {
 
 #[derive(Parser, Debug)]
 struct ImportArgs {
-    /// Trace JSONL file (`candle-graph/trace/9`).
+    /// Trace JSONL file (`candle-graph/trace/10`).
     trace: PathBuf,
 
     #[arg(long, short, value_name = "FILE")]
@@ -52,7 +52,7 @@ struct ImportArgs {
 #[derive(Parser, Debug)]
 #[cfg(feature = "visualizer")]
 struct ViewArgs {
-    /// Trace JSONL file (`candle-graph/trace/9`).
+    /// Trace JSONL file (`candle-graph/trace/10`).
     trace: PathBuf,
 
     #[arg(long, value_name = "FILE")]
@@ -125,6 +125,7 @@ enum CliTraceQueryKind {
     Memory,
     Spans,
     Tensors,
+    TensorStats,
     Gradients,
     Capabilities,
     GpuStatus,
@@ -143,6 +144,7 @@ impl From<CliTraceQueryKind> for TraceQueryKind {
             CliTraceQueryKind::Memory => Self::Memory,
             CliTraceQueryKind::Spans => Self::Spans,
             CliTraceQueryKind::Tensors => Self::Tensors,
+            CliTraceQueryKind::TensorStats => Self::TensorStats,
             CliTraceQueryKind::Gradients => Self::Gradients,
             CliTraceQueryKind::Capabilities => Self::Capabilities,
             CliTraceQueryKind::GpuStatus => Self::GpuStatus,

@@ -1,4 +1,4 @@
-//! JSONL event records for `candle-graph/trace/9`.
+//! JSONL event records for `candle-graph/trace/10`.
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,7 @@ pub enum TraceEvent {
     SpanEnd(SpanEndEvent),
     Op(OpEvent),
     Tensor(TensorEvent),
+    TensorStats(TensorStatsEvent),
     Memory(MemoryEvent),
     DeviceMemory(DeviceMemoryEvent),
     DeviceInterval(DeviceIntervalEvent),
@@ -108,6 +109,22 @@ pub struct TensorEvent {
     pub dense_bytes: Option<u64>,
     #[serde(default)]
     pub category: MemoryCategory,
+}
+
+/// Numerical summary of a caller-labeled tensor at capture time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TensorStatsEvent {
+    pub span_id: String,
+    /// Caller-owned semantic label (stable across runs; used for joins).
+    pub label: String,
+    pub shape: Vec<usize>,
+    pub dtype: String,
+    pub elements: u64,
+    /// Count of non-finite elements (NaN or +-inf).
+    pub non_finite: u64,
+    pub rms: f64,
+    pub abs_max: f64,
+    pub mean: f64,
 }
 
 /// Tensor allocation or deallocation (TensorFlow Memory Profile timeline).

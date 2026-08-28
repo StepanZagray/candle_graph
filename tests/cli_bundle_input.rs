@@ -9,7 +9,8 @@ use candle_graph::nsight::{
     GpuEvidenceStatus, ManifestArtifact, ProvenanceBindingState, CAPTURE_MANIFEST_SCHEMA,
 };
 use candle_graph::trace::{
-    write_jsonl, RunOutcome, SpanRecord, TerminalEvent, TraceRunMeta, SCHEMA as TRACE_SCHEMA,
+    write_jsonl, RunOutcome, SpanRecord, TensorStatsEvent, TerminalEvent, TraceRunMeta,
+    SCHEMA as TRACE_SCHEMA,
 };
 use candle_graph::{
     publish_bundle, verify_bundle, BundleManifest, CaptureContract, CoverageLevel, ExecutionPhase,
@@ -91,6 +92,7 @@ fn trace_document() -> TraceDocument {
         ],
         ops: Vec::new(),
         tensors: Vec::new(),
+        tensor_stats: Vec::new(),
         memory: Vec::new(),
         device_memory: Vec::new(),
         device_intervals: Vec::new(),
@@ -538,6 +540,50 @@ fn slowest_host_query_only_reports_measured_scope_headlines() {
 
     assert!(query["result"].get("slowest_host_spans").is_some());
     assert!(query["result"].get("slowest_host_ops").is_none());
+}
+
+#[test]
+fn summary_and_query_surface_ordered_tensor_stats() {
+    let root = TempRoot::new("tensor-stats");
+    let trace = root.0.join("trace.jsonl");
+    let mut document = trace_document();
+    document.tensor_stats = vec![
+        TensorStatsEvent {
+            span_id: "gpu".into(),
+            label: "seam/out_y".into(),
+            shape: vec![2, 3],
+            dtype: "f32".into(),
+            elements: 6,
+            non_finite: 0,
+            rms: 1.0,
+            abs_max: 2.0,
+            mean: 0.25,
+        },
+        TensorStatsEvent {
+            span_id: "gpu".into(),
+            label: "seam/gate_logits".into(),
+            shape: vec![2],
+            dtype: "f32".into(),
+            elements: 2,
+            non_finite: 1,
+            rms: 0.0,
+            abs_max: 0.0,
+            mean: 0.0,
+        },
+    ];
+    write_jsonl(&trace, &document.to_events()).unwrap();
+
+    let summary_path = root.0.join("summary.json");
+    run_summary(&trace, Some(&summary_path)).unwrap();
+    let summary = read_json(&summary_path);
+    assert_eq!(summary["tensor_stats"]["events"], 2);
+    assert_eq!(summary["tensor_stats"]["non_finite_events"], 1);
+
+    let query_path = root.0.join("query.json");
+    run_query(&trace, TraceQueryKind::TensorStats, Some(&query_path)).unwrap();
+    let query = read_json(&query_path);
+    assert_eq!(query["result"][0]["label"], "seam/out_y");
+    assert_eq!(query["result"][1]["label"], "seam/gate_logits");
 }
 
 #[test]

@@ -209,6 +209,11 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
         .iter()
         .map(|x| ("operation", x.span_id.as_str()))
         .chain(doc.tensors.iter().map(|x| ("tensor", x.span_id.as_str())))
+        .chain(
+            doc.tensor_stats
+                .iter()
+                .map(|x| ("tensor stats", x.span_id.as_str())),
+        )
         .chain(doc.memory.iter().map(|x| ("memory", x.span_id.as_str())))
         .chain(
             doc.device_intervals
@@ -857,6 +862,7 @@ mod tests {
             }],
             ops: vec![],
             tensors: vec![],
+            tensor_stats: vec![],
             memory: vec![],
             device_memory: vec![],
             device_intervals: vec![],

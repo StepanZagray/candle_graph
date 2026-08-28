@@ -1,4 +1,4 @@
-//! Representative-run profiler session — emits `candle-graph/trace/9` JSONL.
+//! Representative-run profiler session — emits `candle-graph/trace/10` JSONL.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -12,6 +12,8 @@ use serde::Serialize;
 
 use crate::capability::CaptureContract;
 use crate::phase::ExecutionPhase;
+#[cfg(feature = "candle")]
+use crate::trace::events::TensorStatsEvent;
 use crate::trace::events::{
     DeviceIntervalEvent, DeviceMemoryEvent, EdgeEvent, GradientEvent, MemoryEvent, OpEvent,
     SpanEndEvent, SpanStartEvent, TensorEvent, TerminalEvent, TraceEvent,
@@ -427,6 +429,67 @@ impl TraceSession {
             }),
         )?;
         Ok(())
+    }
+
+    /// Record device-reduced numerical statistics for a caller-labeled Candle tensor.
+    #[cfg(feature = "candle")]
+    pub fn record_tensor_stats(
+        &self,
+        span_id: &str,
+        label: &str,
+        tensor: &candle_core::Tensor,
+    ) -> Result<()> {
+        use candle_core::DType;
+
+        let elements = tensor.elem_count() as u64;
+        let (non_finite, rms, abs_max, mean) = if elements == 0 {
+            (0, 0.0, 0.0, 0.0)
+        } else {
+            let x = tensor
+                .detach()
+                .to_dtype(DType::F32)
+                .with_context(|| format!("cast tensor stats {label:?} to f32"))?;
+            let finite = x
+                .sub(&x)
+                .and_then(|delta| delta.eq(0.0))
+                .and_then(|mask| mask.to_dtype(DType::U32))
+                .and_then(|mask| mask.sum_all())
+                .and_then(|count| count.to_scalar::<u32>())
+                .with_context(|| format!("count finite elements for tensor stats {label:?}"))?
+                as u64;
+            let read = |value: candle_core::Result<candle_core::Tensor>, name: &str| {
+                value
+                    .and_then(|value| value.to_scalar::<f32>())
+                    .map(f64::from)
+                    .with_context(|| format!("reduce {name} for tensor stats {label:?}"))
+            };
+            let rms = read(x.sqr().and_then(|x2| x2.mean_all()?.sqrt()), "rms")?;
+            let abs_max = read(x.abs().and_then(|abs| abs.max_all()), "abs_max")?;
+            let mean = read(x.mean_all(), "mean")?;
+            // JSON has no NaN/inf number representation. The explicit
+            // non-finite count is authoritative; keep the remaining fields
+            // serializable when an all-element reduction is non-finite.
+            let json_number = |value: f64| if value.is_finite() { value } else { 0.0 };
+            (
+                elements.saturating_sub(finite),
+                json_number(rms),
+                json_number(abs_max),
+                json_number(mean),
+            )
+        };
+        let event = TensorStatsEvent {
+            span_id: span_id.to_string(),
+            label: label.to_string(),
+            shape: tensor.dims().to_vec(),
+            dtype: format!("{:?}", tensor.dtype()).to_ascii_lowercase(),
+            elements,
+            non_finite,
+            rms,
+            abs_max,
+            mean,
+        };
+        let mut inner = self.inner.borrow_mut();
+        write_event(&mut inner.writer, &TraceEvent::TensorStats(event))
     }
 
     /// Record an explicit tensor allocation (TensorFlow memory timeline).
@@ -847,6 +910,46 @@ mod tests {
         let doc = parse_trace(&path).unwrap();
         assert_eq!(doc.gradients.len(), 1);
         assert_eq!(doc.gradients[0].key, "encoder.weight");
+    }
+
+    #[cfg(feature = "candle")]
+    #[test]
+    fn tensor_stats_reduce_finite_non_finite_and_empty_tensors() {
+        use candle_core::{Device, Tensor};
+
+        let path = temp_trace("tensor-stats");
+        let session =
+            TraceSession::open(&path, ProfileRun::training("train::loss", 1, "cpu")).unwrap();
+        let span = session.begin_span("forward", SpanKind::Function);
+        let span_id = format!("s{}", span.id().raw());
+        let finite = Tensor::from_vec(vec![1.0f32, -2.0, 3.0, -4.0], (4,), &Device::Cpu).unwrap();
+        session
+            .record_tensor_stats(&span_id, "finite", &finite)
+            .unwrap();
+        let corrupt =
+            Tensor::from_vec(vec![1.0f32, f32::NAN, f32::INFINITY], (3,), &Device::Cpu).unwrap();
+        session
+            .record_tensor_stats(&span_id, "corrupt", &corrupt)
+            .unwrap();
+        let empty = Tensor::zeros((0,), candle_core::DType::F32, &Device::Cpu).unwrap();
+        session
+            .record_tensor_stats(&span_id, "empty", &empty)
+            .unwrap();
+        drop(span);
+        session.finish().unwrap();
+
+        let doc = parse_trace(&path).unwrap();
+        assert_eq!(doc.tensor_stats.len(), 3);
+        let finite = &doc.tensor_stats[0];
+        assert_eq!(finite.elements, 4);
+        assert_eq!(finite.non_finite, 0);
+        assert!((finite.rms - 7.5f64.sqrt()).abs() < 1e-6);
+        assert_eq!(finite.abs_max, 4.0);
+        assert_eq!(finite.mean, -0.5);
+        assert_eq!(doc.tensor_stats[1].non_finite, 2);
+        assert_eq!(doc.tensor_stats[2].elements, 0);
+        assert_eq!(doc.tensor_stats[2].non_finite, 0);
+        assert_eq!(doc.tensor_stats[2].rms, 0.0);
     }
 
     #[test]

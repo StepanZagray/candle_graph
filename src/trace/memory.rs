@@ -669,6 +669,7 @@ mod tests {
             spans: vec![],
             ops: vec![],
             tensors: vec![],
+            tensor_stats: vec![],
             memory: vec![],
             device_memory: vec![],
             device_intervals: vec![],

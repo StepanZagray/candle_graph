@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::capability::CaptureContract;
 
 /// Schema identifier written into every trace document and expected on parse.
-pub const SCHEMA: &str = "candle-graph/trace/9";
+pub const SCHEMA: &str = "candle-graph/trace/10";
+pub const PREVIOUS_SCHEMA: &str = "candle-graph/trace/9";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComparisonIdentity {

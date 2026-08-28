@@ -47,6 +47,7 @@ fn document(outcome: RunOutcome) -> TraceDocument {
         }],
         ops: vec![],
         tensors: vec![],
+        tensor_stats: vec![],
         memory: vec![],
         device_memory: vec![],
         device_intervals: vec![],

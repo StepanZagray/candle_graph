@@ -483,6 +483,7 @@ mod tests {
             }],
             ops: vec![],
             tensors: vec![],
+            tensor_stats: vec![],
             memory: vec![],
             device_memory: vec![],
             device_intervals: vec![],
@@ -572,6 +573,7 @@ mod tests {
             }],
             ops: vec![],
             tensors: vec![],
+            tensor_stats: vec![],
             memory: vec![],
             device_memory: vec![],
             device_intervals: vec![],
@@ -610,10 +612,19 @@ mod tests {
 
             let special_input = root.join("special-input");
             fs::create_dir(&special_input).unwrap();
-            let _socket = UnixListener::bind(special_input.join("socket")).unwrap();
-            let error = publish_bundle(&root.join("special-bundle"), &trace, Some(&special_input))
-                .unwrap_err();
-            assert!(error.to_string().contains("special files are not allowed"));
+            match UnixListener::bind(special_input.join("socket")) {
+                Ok(_socket) => {
+                    let error =
+                        publish_bundle(&root.join("special-bundle"), &trace, Some(&special_input))
+                            .unwrap_err();
+                    assert!(error.to_string().contains("special files are not allowed"));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    // Sandboxes may forbid AF_UNIX creation; the symlink case
+                    // above still exercises non-regular input rejection.
+                }
+                Err(error) => panic!("create special-file fixture: {error}"),
+            }
         }
 
         fs::remove_dir_all(root).unwrap();
@@ -663,6 +674,7 @@ mod tests {
             }],
             ops: vec![],
             tensors: vec![],
+            tensor_stats: vec![],
             memory: vec![],
             device_memory: vec![],
             device_intervals: vec![],

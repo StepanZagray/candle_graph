@@ -1,4 +1,4 @@
-//! Aggregate trace document and JSONL I/O for `candle-graph/trace/9`.
+//! Aggregate trace document and JSONL I/O for `candle-graph/trace/10`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use super::events::{
     DeviceIntervalEvent, DeviceMemoryEvent, EdgeEvent, GradientEvent, MemoryEvent, OpEvent,
-    SpanEndEvent, SpanStartEvent, TensorEvent, TerminalEvent, TraceEvent,
+    SpanEndEvent, SpanStartEvent, TensorEvent, TensorStatsEvent, TerminalEvent, TraceEvent,
 };
 use super::memory::{resolve_dense_tensor_bytes, MemoryAction};
-use super::schema::{RunOutcome, SpanRecord, TraceRunMeta, TraceSummary, SCHEMA};
+use super::schema::{RunOutcome, SpanRecord, TraceRunMeta, TraceSummary, PREVIOUS_SCHEMA, SCHEMA};
 
 /// Full trace document assembled from JSONL events.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -26,6 +26,8 @@ pub struct TraceDocument {
     pub ops: Vec<OpEvent>,
     #[serde(default)]
     pub tensors: Vec<TensorEvent>,
+    #[serde(default)]
+    pub tensor_stats: Vec<TensorStatsEvent>,
     #[serde(default)]
     pub memory: Vec<MemoryEvent>,
     #[serde(default)]
@@ -49,6 +51,7 @@ impl TraceDocument {
         let mut span_closed: HashSet<String> = HashSet::new();
         let mut ops = Vec::new();
         let mut tensors = Vec::new();
+        let mut tensor_stats = Vec::new();
         let mut memory = Vec::new();
         let mut device_memory = Vec::new();
         let mut device_intervals = Vec::new();
@@ -105,6 +108,24 @@ impl TraceDocument {
                     );
                     tensors.push(tensor);
                 }
+                TraceEvent::TensorStats(stats) => {
+                    let shape_elements = stats
+                        .shape
+                        .iter()
+                        .try_fold(1u64, |total, &dim| total.checked_mul(dim as u64));
+                    if stats.label.trim().is_empty()
+                        || shape_elements != Some(stats.elements)
+                        || stats.non_finite > stats.elements
+                        || !stats.rms.is_finite()
+                        || stats.rms < 0.0
+                        || !stats.abs_max.is_finite()
+                        || stats.abs_max < 0.0
+                        || !stats.mean.is_finite()
+                    {
+                        bail!("invalid tensor_stats event at index {index}");
+                    }
+                    tensor_stats.push(stats);
+                }
                 TraceEvent::Memory(mem) => memory.push(mem),
                 TraceEvent::DeviceMemory(snapshot) => device_memory.push(snapshot),
                 TraceEvent::DeviceInterval(interval) => device_intervals.push(interval),
@@ -122,8 +143,10 @@ impl TraceDocument {
         let run = run.context("trace stream is missing a meta event with run metadata")?;
         let terminal = terminal.context("trace stream is missing its terminal event")?;
 
-        if schema != SCHEMA {
-            bail!("unsupported trace schema {schema:?}; expected {SCHEMA:?}");
+        if schema != SCHEMA && schema != PREVIOUS_SCHEMA {
+            bail!(
+                "unsupported trace schema {schema:?}; expected {SCHEMA:?} or {PREVIOUS_SCHEMA:?}"
+            );
         }
 
         let mut spans: Vec<SpanRecord> = span_starts
@@ -183,6 +206,7 @@ impl TraceDocument {
             spans,
             ops,
             tensors,
+            tensor_stats,
             memory,
             device_memory,
             device_intervals,
@@ -290,6 +314,12 @@ impl TraceDocument {
 
         events.extend(self.ops.iter().cloned().map(TraceEvent::Op));
         events.extend(self.tensors.iter().cloned().map(TraceEvent::Tensor));
+        events.extend(
+            self.tensor_stats
+                .iter()
+                .cloned()
+                .map(TraceEvent::TensorStats),
+        );
         events.extend(self.memory.iter().cloned().map(TraceEvent::Memory));
         events.extend(
             self.device_memory
@@ -507,6 +537,38 @@ mod tests {
         assert_eq!(parsed, TraceDocument::from_events(events.clone()).unwrap());
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tensor_stats_round_trip_and_previous_schema_remains_readable() {
+        let stats = TensorStatsEvent {
+            span_id: "s1".into(),
+            label: "seam/out_y".into(),
+            shape: vec![2, 3],
+            dtype: "f32".into(),
+            elements: 6,
+            non_finite: 0,
+            rms: 1.5,
+            abs_max: 3.0,
+            mean: -0.25,
+        };
+        let events = vec![
+            TraceEvent::Meta {
+                schema: PREVIOUS_SCHEMA.into(),
+                run: Box::new(sample_meta()),
+            },
+            TraceEvent::TensorStats(stats.clone()),
+            TraceEvent::Terminal(TerminalEvent {
+                outcome: RunOutcome::Complete,
+                timestamp_ns: 0,
+                reason: None,
+            }),
+        ];
+        let document = TraceDocument::from_events(events).unwrap();
+        assert_eq!(document.schema, PREVIOUS_SCHEMA);
+        assert_eq!(document.tensor_stats, vec![stats]);
+        let rebuilt = TraceDocument::from_events(document.to_events()).unwrap();
+        assert_eq!(rebuilt, document);
     }
 
     #[test]

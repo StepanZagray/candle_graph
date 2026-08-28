@@ -1,4 +1,4 @@
-//! Evidence CLI engine for trace/9, evidence/4, comparison/4, and atomic bundles.
+//! Evidence CLI engine for trace/10, evidence/4, comparison/4, and atomic bundles.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -43,6 +43,7 @@ pub enum TraceQueryKind {
     Memory,
     Spans,
     Tensors,
+    TensorStats,
     Gradients,
     Capabilities,
     GpuStatus,
@@ -61,6 +62,7 @@ impl TraceQueryKind {
             Self::Memory => "memory",
             Self::Spans => "spans",
             Self::Tensors => "tensors",
+            Self::TensorStats => "tensor-stats",
             Self::Gradients => "gradients",
             Self::Capabilities => "capabilities",
             Self::GpuStatus => "gpu-status",
@@ -294,6 +296,10 @@ pub fn run_summary(input_path: &Path, output: Option<&Path>) -> Result<()> {
         "findings": &evidence.findings,
         "gaps": &evidence.gaps,
         "summary": evidence.graph.as_ref().map(|graph| &graph.summary),
+        "tensor_stats": {
+            "events": evidence.tensor_stats.len(),
+            "non_finite_events": evidence.tensor_stats.iter().filter(|event| event.non_finite > 0).count(),
+        },
         "timing": &evidence.timing,
         "memory": &evidence.memory,
         "gpu": gpu_summary(evidence),
@@ -307,6 +313,7 @@ pub fn run_query(input_path: &Path, kind: TraceQueryKind, output: Option<&Path>)
     let evidence = &loaded.packet;
     let result = match kind {
         TraceQueryKind::Memory => serde_json::to_value(&evidence.memory)?,
+        TraceQueryKind::TensorStats => serde_json::to_value(&evidence.tensor_stats)?,
         TraceQueryKind::Capabilities => serde_json::to_value(&evidence.capabilities)?,
         TraceQueryKind::GpuStatus => query_gpu_status(evidence),
         TraceQueryKind::GpuCorrelation => query_gpu_correlation(evidence),
@@ -402,6 +409,7 @@ fn query_graph(graph: &ExecutionGraph, kind: TraceQueryKind) -> serde_json::Valu
         TraceQueryKind::Tensors => serde_json::to_value(&graph.tensors).unwrap_or_default(),
         TraceQueryKind::Gradients => serde_json::to_value(&graph.gradients).unwrap_or_default(),
         TraceQueryKind::Memory
+        | TraceQueryKind::TensorStats
         | TraceQueryKind::Capabilities
         | TraceQueryKind::GpuStatus
         | TraceQueryKind::GpuCorrelation

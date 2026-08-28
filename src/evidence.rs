@@ -13,7 +13,8 @@ use crate::nsight::{GpuEvidenceStatus, NsightEvidence, ProvenanceBindingState};
 use crate::timing::{analyze_timing, TimingProfile};
 use crate::trace::memory::{analyze_memory, MemoryProfile};
 use crate::trace::{
-    analyze_health, parse_trace, HealthSeverity, TraceDocument, TraceHealth, TraceRunMeta,
+    analyze_health, parse_trace, HealthSeverity, TensorStatsEvent, TraceDocument, TraceHealth,
+    TraceRunMeta,
 };
 
 pub const SCHEMA: &str = "candle-graph/evidence/4";
@@ -31,6 +32,9 @@ pub struct EvidencePacket {
     /// Failed or structurally invalid captures remain diagnosable without a derived graph.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph: Option<ExecutionGraph>,
+    /// Ordered caller-labeled numerical summaries from the trace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tensor_stats: Vec<TensorStatsEvent>,
     pub timing: TimingProfile,
     pub memory: MemoryProfile,
     pub gpu: NsightEvidence,
@@ -122,6 +126,7 @@ impl EvidencePacket {
         let graph = (health.capture_complete && health.structurally_valid)
             .then(|| build_from_trace(&document))
             .transpose()?;
+        let tensor_stats = document.tensor_stats.clone();
         let mut findings = Vec::new();
         let mut facts = Vec::new();
 
@@ -284,6 +289,7 @@ impl EvidencePacket {
             facts,
             gaps,
             graph,
+            tensor_stats,
             timing,
             memory,
             gpu,
@@ -743,6 +749,7 @@ mod tests {
                 input_dense_bytes: 0,
             }],
             tensors: vec![],
+            tensor_stats: vec![],
             memory: vec![],
             device_memory: vec![],
             device_intervals: vec![],
@@ -807,6 +814,7 @@ mod tests {
             }],
             ops: vec![],
             tensors: vec![],
+            tensor_stats: vec![],
             memory: vec![],
             device_memory: vec![],
             device_intervals: vec![],

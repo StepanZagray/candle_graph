@@ -82,6 +82,7 @@ fn run(cohort: &str, index: usize, duration_ns: u64) -> TraceDocument {
         }],
         ops: vec![],
         tensors: vec![],
+        tensor_stats: vec![],
         memory: vec![],
         device_memory: vec![],
         device_intervals: vec![],

@@ -64,7 +64,7 @@ representative update
   └─ matching NVTX labels (optional)
             │
             ▼
- application.jsonl (trace/9) ── validate ── graph/5
+ application.jsonl (trace/10) ── validate ── graph/5
             │                                │
  official nsys stats CSV ── normalize ───────┤
             │                                ▼
@@ -95,7 +95,7 @@ and reasons, never silent empty arrays. Tensor footprint and observed memory lif
 
 | Schema | Role |
 | --- | --- |
-| `candle-graph/trace/9` | Execution evidence stream with exact gradient contract and terminal outcome |
+| `candle-graph/trace/10` | Execution evidence stream with exact gradient contract, caller-labeled tensor statistics, and terminal outcome |
 | `candle-graph/graph/5` | Validated call/data graph with mandatory separate timing planes and explicit measured host scope |
 | `candle-graph/evidence/4` | Capability-qualified agent/human packet with report-specific Nsight availability |
 | `candle-graph/comparison/4` | Replicated outer-wall comparison with verified bundle receipts |
@@ -111,3 +111,8 @@ and reasons, never silent empty arrays. Tensor footprint and observed memory lif
 - Evidence/3 carries trace/9 provenance and typed gradient manifest/family facts.
 - Comparison/4 embeds per-run bundle manifest receipts. The default CLI inputs are bundle
   directories; `--unverified-traces` accepts raw traces but always produces an ineligible result.
+
+## 0.10 schema migration
+
+- Trace/9 remains readable. Trace/10 adds caller-labeled `tensor_stats` events for numerical
+  mechanism evidence; older traces simply contain no such events.

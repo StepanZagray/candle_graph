@@ -84,7 +84,7 @@ Family policies have precise meanings:
 Encode `Present` with a finite norm greater than zero, `Zero` with positive zero (`0.0`, never
 `-0.0`), and `Missing` or `NonFinite` with no norm. The ordered manifest digest hashes the
 `GRADIENT_MANIFEST_SCHEMA` bytes, one NUL byte, then every root/key/family byte string prefixed by
-its little-endian `u64` length. Current public protocol constants are `TRACE_SCHEMA` (trace/9),
+its little-endian `u64` length. Current public protocol constants are `TRACE_SCHEMA` (trace/10),
 `EVIDENCE_SCHEMA` (evidence/4), `GRAPH_SCHEMA` (graph/5), and `COMPARISON_SCHEMA` (comparison/4).
 
 ## Publish evidence

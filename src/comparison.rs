@@ -37,6 +37,24 @@ pub struct ConfidenceInterval {
     pub upper_delta_ns: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TensorStatsComparisonRow {
+    pub label: String,
+    pub rms_a: f64,
+    pub rms_b: f64,
+    pub rms_ratio: Option<f64>,
+    pub abs_max_ratio: Option<f64>,
+    pub non_finite_a: u64,
+    pub non_finite_b: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TensorStatsComparison {
+    pub matched: Vec<TensorStatsComparisonRow>,
+    pub unmatched_a: Vec<String>,
+    pub unmatched_b: Vec<String>,
+}
+
 /// Trust state of the artifacts supplied to a comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +95,9 @@ pub struct ReplicatedComparison {
     pub median_delta_ns: f64,
     pub median_delta_percent: Option<f64>,
     pub confidence_interval: Option<ConfidenceInterval>,
+    /// Numerical mechanism comparison, independent of timing eligibility.
+    #[serde(default)]
+    pub tensor_stats: TensorStatsComparison,
 }
 
 /// Verify finalized evidence bundles and compare their bound trace documents.
@@ -204,6 +225,7 @@ fn compare_documents(
         Some(ci) if ci.lower_delta_ns > 0.0 => ComparisonVerdict::CandidateSlower,
         Some(_) => ComparisonVerdict::Inconclusive,
     };
+    let tensor_stats = compare_tensor_stats(baseline, candidate);
 
     ReplicatedComparison {
         schema: SCHEMA.into(),
@@ -221,6 +243,101 @@ fn compare_documents(
         median_delta_ns,
         median_delta_percent,
         confidence_interval,
+        tensor_stats,
+    }
+}
+
+fn compare_tensor_stats(
+    baseline: &[TraceDocument],
+    candidate: &[TraceDocument],
+) -> TensorStatsComparison {
+    #[derive(Default)]
+    struct Aggregate {
+        rms: f64,
+        abs_max: f64,
+        non_finite: u64,
+        samples: usize,
+    }
+
+    fn aggregate(documents: &[TraceDocument]) -> BTreeMap<String, Aggregate> {
+        let mut by_label = BTreeMap::<String, Aggregate>::new();
+        for document in documents {
+            let mut seen = BTreeSet::new();
+            for event in &document.tensor_stats {
+                if !seen.insert(event.label.as_str()) {
+                    continue;
+                }
+                let entry = by_label.entry(event.label.clone()).or_default();
+                entry.rms += event.rms;
+                entry.abs_max += event.abs_max;
+                entry.non_finite = entry.non_finite.saturating_add(event.non_finite);
+                entry.samples += 1;
+            }
+        }
+        by_label
+    }
+
+    fn mean(value: f64, samples: usize) -> f64 {
+        if samples == 0 {
+            0.0
+        } else {
+            value / samples as f64
+        }
+    }
+
+    fn ratio(a: f64, b: f64) -> Option<f64> {
+        if a == 0.0 {
+            (b == 0.0).then_some(1.0)
+        } else {
+            Some(b / a)
+        }
+    }
+
+    fn ratio_distance(ratio: Option<f64>) -> f64 {
+        match ratio {
+            Some(value) if value > 0.0 => value.ln().abs(),
+            _ => f64::INFINITY,
+        }
+    }
+
+    let baseline = aggregate(baseline);
+    let candidate = aggregate(candidate);
+    let mut matched = baseline
+        .iter()
+        .filter_map(|(label, a)| {
+            let b = candidate.get(label)?;
+            let rms_a = mean(a.rms, a.samples);
+            let rms_b = mean(b.rms, b.samples);
+            let abs_max_a = mean(a.abs_max, a.samples);
+            let abs_max_b = mean(b.abs_max, b.samples);
+            Some(TensorStatsComparisonRow {
+                label: label.clone(),
+                rms_a,
+                rms_b,
+                rms_ratio: ratio(rms_a, rms_b),
+                abs_max_ratio: ratio(abs_max_a, abs_max_b),
+                non_finite_a: a.non_finite,
+                non_finite_b: b.non_finite,
+            })
+        })
+        .collect::<Vec<_>>();
+    matched.sort_by(|a, b| {
+        ratio_distance(b.rms_ratio)
+            .total_cmp(&ratio_distance(a.rms_ratio))
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    TensorStatsComparison {
+        matched,
+        unmatched_a: baseline
+            .keys()
+            .filter(|label| !candidate.contains_key(*label))
+            .cloned()
+            .collect(),
+        unmatched_b: candidate
+            .keys()
+            .filter(|label| !baseline.contains_key(*label))
+            .cloned()
+            .collect(),
     }
 }
 
@@ -596,8 +713,8 @@ mod tests {
     use super::*;
     use crate::capability::CaptureContract;
     use crate::trace::{
-        RunOutcome, SpanKind, SpanRecord, TerminalEvent, TimingMode, TraceRunMeta,
-        SCHEMA as TRACE_SCHEMA,
+        RunOutcome, SpanKind, SpanRecord, TensorStatsEvent, TerminalEvent, TimingMode,
+        TraceRunMeta, SCHEMA as TRACE_SCHEMA,
     };
 
     fn run(cohort: &str, index: usize, duration_ns: u64, pair_id: Option<String>) -> TraceDocument {
@@ -647,6 +764,7 @@ mod tests {
             }],
             ops: vec![],
             tensors: vec![],
+            tensor_stats: vec![],
             memory: vec![],
             device_memory: vec![],
             device_intervals: vec![],
@@ -691,6 +809,41 @@ mod tests {
         assert_eq!(stats.median_ns, 12.0);
         assert_eq!(stats.p95_ns, 82.6);
         assert_eq!(stats.mad_ns, 1.0);
+    }
+
+    #[test]
+    fn tensor_stats_join_first_labels_and_sort_by_rms_ratio_distance() {
+        let stats = |label: &str, rms: f64, abs_max: f64| TensorStatsEvent {
+            span_id: "s1".into(),
+            label: label.into(),
+            shape: vec![1],
+            dtype: "f32".into(),
+            elements: 1,
+            non_finite: 0,
+            rms,
+            abs_max,
+            mean: rms,
+        };
+        let mut baseline = run("base", 0, 100, None);
+        baseline.tensor_stats = vec![
+            stats("stable", 2.0, 4.0),
+            stats("drift", 1.0, 2.0),
+            stats("drift", 100.0, 200.0),
+            stats("only_a", 3.0, 3.0),
+        ];
+        let mut candidate = run("next", 0, 90, None);
+        candidate.tensor_stats = vec![
+            stats("stable", 2.2, 4.4),
+            stats("drift", 4.0, 8.0),
+            stats("only_b", 5.0, 5.0),
+        ];
+
+        let comparison = compare_unverified_traces(&[baseline], &[candidate]);
+        assert_eq!(comparison.tensor_stats.matched[0].label, "drift");
+        assert_eq!(comparison.tensor_stats.matched[0].rms_ratio, Some(4.0));
+        assert_eq!(comparison.tensor_stats.matched[0].abs_max_ratio, Some(4.0));
+        assert_eq!(comparison.tensor_stats.unmatched_a, vec!["only_a"]);
+        assert_eq!(comparison.tensor_stats.unmatched_b, vec!["only_b"]);
     }
 
     #[test]

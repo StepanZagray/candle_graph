@@ -217,7 +217,7 @@ label as GPU-expected. Projected CPU-only labels are reported as correlation fai
 
 | Schema | Role |
 | --- | --- |
-| `candle-graph/trace/9` | Execution JSONL with exact gradient contracts, timing/memory planes, and terminal outcome |
+| `candle-graph/trace/10` | Execution JSONL with exact gradient contracts, tensor statistics, timing/memory planes, and terminal outcome |
 | `candle-graph/graph/5` | Validated call/data graph with mandatory measured-scope and overlap timing fields |
 | `candle-graph/evidence/4` | Capability-qualified packet with report-specific Nsight availability and graph/5 semantics |
 | `candle-graph/summary/4` | CLI summary envelope with report-qualified GPU counts |
