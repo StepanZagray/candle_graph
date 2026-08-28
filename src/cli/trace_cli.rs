@@ -1,4 +1,4 @@
-//! Evidence CLI engine for trace/10, evidence/4, comparison/5, and atomic bundles.
+//! Evidence CLI engine for trace/10, evidence/4, comparison/6, and atomic bundles.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -10,17 +10,69 @@ use serde::Serialize;
 use crate::artifact::{
     publish_bundle, verify_bundle, verify_consumed_bundle_files, BundleVerificationReceipt,
 };
-use crate::comparison::{compare_unverified_traces, compare_verified_bundles};
+use crate::campaign::CaptureState;
+use crate::comparison::{compare_unverified_traces, compare_verified_bundles, ComparisonVerdict};
 use crate::evidence::{build_evidence, EvidencePacket};
 use crate::graph::{ExecutionGraph, GraphNode, GraphNodeKind};
 use crate::nsight::{GpuEvidenceStatus, ProvenanceBindingState};
-use crate::trace::parse_trace;
+use crate::publication::{PublicationReceipt, PublicationStatus, PUBLICATION_SCHEMA};
+use crate::trace::{parse_trace, HealthSeverity};
 
 const QUERY_ROW_LIMIT: usize = 50;
 const QUERY_LABEL_LIMIT: usize = 100;
 const QUERY_DIAGNOSTIC_LIMIT: usize = 50;
-const SUMMARY_SCHEMA: &str = "candle-graph/summary/4";
-const QUERY_SCHEMA: &str = "candle-graph/trace-query/4";
+const OVERVIEW_LIST_LIMIT: usize = 20;
+const OVERVIEW_TIMING_SPAN_LIMIT: usize = 5;
+const SUMMARY_SCHEMA: &str = "candle-graph/summary/5";
+const QUERY_SCHEMA: &str = "candle-graph/trace-query/5";
+const OVERVIEW_SCHEMA: &str = "candle-graph/overview/1";
+const VERIFY_SCHEMA: &str = "candle-graph/verify/1";
+const PROTOCOL_SCHEMA: &str = "candle-graph/protocol/1";
+
+/// Emitting-tool identity attached to every CLI envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ToolIdentity {
+    pub package: &'static str,
+    pub version: &'static str,
+}
+
+impl ToolIdentity {
+    pub fn current() -> Self {
+        Self {
+            package: "candle-graph",
+            version: env!("CARGO_PKG_VERSION"),
+        }
+    }
+}
+
+/// Label filter for query kinds that carry semantic labels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryLabelFilter {
+    Exact(String),
+    Prefix(String),
+}
+
+impl QueryLabelFilter {
+    fn matches(&self, value: &str) -> bool {
+        match self {
+            Self::Exact(label) => value == label,
+            Self::Prefix(prefix) => value.starts_with(prefix.as_str()),
+        }
+    }
+
+    fn envelope(filter: Option<&Self>) -> serde_json::Value {
+        serde_json::json!({
+            "label": match filter {
+                Some(Self::Exact(label)) => Some(label.as_str()),
+                _ => None,
+            },
+            "label_prefix": match filter {
+                Some(Self::Prefix(prefix)) => Some(prefix.as_str()),
+                _ => None,
+            },
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct QueryAvailability {
@@ -299,12 +351,13 @@ pub fn run_import(trace_path: &Path, output: Option<&Path>) -> Result<()> {
     )
 }
 
-pub fn run_summary(input_path: &Path, output: Option<&Path>) -> Result<()> {
+pub fn run_summary(input_path: &Path, output: Option<&Path>, require_valid: bool) -> Result<()> {
     let loaded = load_evidence_input(input_path)?;
     reject_output_inside_verified_bundle(&loaded.input, output)?;
     let evidence = &loaded.packet;
     let rendered = serde_json::to_string_pretty(&serde_json::json!({
         "schema": SUMMARY_SCHEMA,
+        "tool": ToolIdentity::current(),
         "input": &loaded.input,
         "provenance": &evidence.provenance,
         "health": &evidence.health,
@@ -320,23 +373,65 @@ pub fn run_summary(input_path: &Path, output: Option<&Path>) -> Result<()> {
         "memory": &evidence.memory,
         "gpu": gpu_summary(evidence),
     }))? + "\n";
-    super::write_output(output, rendered.as_bytes())
+    super::write_output(output, rendered.as_bytes())?;
+    if require_valid {
+        let mut failures = Vec::new();
+        if !evidence.health.structurally_valid {
+            failures.push("structurally_valid is false");
+        }
+        if !evidence.health.capture_complete {
+            failures.push("capture_complete is false");
+        }
+        if !failures.is_empty() {
+            bail!("summary --require-valid: {}", failures.join(", "));
+        }
+    }
+    Ok(())
 }
 
-pub fn run_query(input_path: &Path, kind: TraceQueryKind, output: Option<&Path>) -> Result<()> {
+pub fn run_query(
+    input_path: &Path,
+    kind: TraceQueryKind,
+    filter: Option<&QueryLabelFilter>,
+    output: Option<&Path>,
+) -> Result<()> {
     let loaded = load_evidence_input(input_path)?;
     reject_output_inside_verified_bundle(&loaded.input, output)?;
     let evidence = &loaded.packet;
-    let result = match kind {
-        TraceQueryKind::Memory => serde_json::to_value(&evidence.memory)?,
-        TraceQueryKind::TensorStats => serde_json::to_value(&evidence.tensor_stats)?,
-        TraceQueryKind::Capabilities => serde_json::to_value(&evidence.capabilities)?,
-        TraceQueryKind::GpuStatus => query_gpu_status(evidence),
-        TraceQueryKind::GpuCorrelation => query_gpu_correlation(evidence),
-        TraceQueryKind::GpuPhases => query_gpu_phases(evidence),
-        TraceQueryKind::GpuKernels => query_gpu_kernels(evidence),
-        TraceQueryKind::GpuAttributionGaps => query_gpu_attribution_gaps(evidence),
-        other => {
+    let result = match (kind, filter) {
+        (TraceQueryKind::TensorStats, Some(filter)) => {
+            let matched = evidence
+                .tensor_stats
+                .iter()
+                .filter(|event| filter.matches(&event.label))
+                .collect::<Vec<_>>();
+            filtered_rows(evidence.tensor_stats.len(), matched)
+        }
+        (
+            TraceQueryKind::Spans | TraceQueryKind::Tensors | TraceQueryKind::Gradients,
+            Some(filter),
+        ) => {
+            let graph = evidence
+                .graph
+                .as_ref()
+                .context("query requires a complete, structurally valid capture")?;
+            query_graph_filtered(graph, kind, filter)
+        }
+        (other, Some(_)) => {
+            bail!(
+                "query kind {} does not support label filtering",
+                other.as_str()
+            );
+        }
+        (TraceQueryKind::Memory, None) => serde_json::to_value(&evidence.memory)?,
+        (TraceQueryKind::TensorStats, None) => serde_json::to_value(&evidence.tensor_stats)?,
+        (TraceQueryKind::Capabilities, None) => serde_json::to_value(&evidence.capabilities)?,
+        (TraceQueryKind::GpuStatus, None) => query_gpu_status(evidence),
+        (TraceQueryKind::GpuCorrelation, None) => query_gpu_correlation(evidence),
+        (TraceQueryKind::GpuPhases, None) => query_gpu_phases(evidence),
+        (TraceQueryKind::GpuKernels, None) => query_gpu_kernels(evidence),
+        (TraceQueryKind::GpuAttributionGaps, None) => query_gpu_attribution_gaps(evidence),
+        (other, None) => {
             let graph = evidence
                 .graph
                 .as_ref()
@@ -346,7 +441,9 @@ pub fn run_query(input_path: &Path, kind: TraceQueryKind, output: Option<&Path>)
     };
     let rendered = serde_json::to_string_pretty(&serde_json::json!({
         "schema": QUERY_SCHEMA,
+        "tool": ToolIdentity::current(),
         "kind": kind.as_str(),
+        "filter": QueryLabelFilter::envelope(filter),
         "input": &loaded.input,
         "capabilities": &evidence.capabilities,
         "result": result,
@@ -354,10 +451,73 @@ pub fn run_query(input_path: &Path, kind: TraceQueryKind, output: Option<&Path>)
     super::write_output(output, rendered.as_bytes())
 }
 
+/// Complete (untruncated) label-filtered rows, so exact export stays possible.
+fn filtered_rows<T: Serialize>(total: usize, matched: Vec<T>) -> serde_json::Value {
+    serde_json::json!({
+        "total": total,
+        "matched": matched.len(),
+        "rows": matched,
+    })
+}
+
+fn query_graph_filtered(
+    graph: &ExecutionGraph,
+    kind: TraceQueryKind,
+    filter: &QueryLabelFilter,
+) -> serde_json::Value {
+    match kind {
+        TraceQueryKind::Spans => {
+            let matched = graph
+                .spans
+                .iter()
+                .filter(|node| filter.matches(&node.name))
+                .collect::<Vec<_>>();
+            let mut result = filtered_rows(graph.spans.len(), matched);
+            result["edges"] = serde_json::Value::Null;
+            result["edges_reason"] = serde_json::Value::String(
+                "edges are omitted for filtered span queries; run without a filter for the full span graph".into(),
+            );
+            result
+        }
+        TraceQueryKind::Tensors => {
+            let matched = graph
+                .tensors
+                .iter()
+                .filter(|tensor| {
+                    filter.matches(tensor.label.as_deref().unwrap_or(&tensor.tensor_id))
+                })
+                .collect::<Vec<_>>();
+            filtered_rows(graph.tensors.len(), matched)
+        }
+        TraceQueryKind::Gradients => {
+            let matched = graph
+                .gradients
+                .iter()
+                .filter(|gradient| {
+                    filter.matches(&gradient.key)
+                        || filter.matches(&format!("{}/{}", gradient.root, gradient.key))
+                })
+                .collect::<Vec<_>>();
+            filtered_rows(graph.gradients.len(), matched)
+        }
+        _ => unreachable!("label filtering is dispatched only for spans, tensors, and gradients"),
+    }
+}
+
 #[cfg(feature = "visualizer")]
 pub fn run_view(trace_path: &Path, output: &Path, nsight_dir: Option<&Path>) -> Result<()> {
     if let Some(root) = containing_bundle_root(trace_path) {
         reject_output_inside_bundle_root(root, output)?;
+        ensure!(
+            nsight_dir.is_none(),
+            "bundle inputs already bind their Nsight evidence; drop --nsight-dir for {}",
+            trace_path.display()
+        );
+        let loaded = load_evidence_input(trace_path)?;
+        return super::write_output(
+            Some(output),
+            crate::viewer::render_evidence_html(&loaded.packet).as_bytes(),
+        );
     }
     let evidence = build_evidence(trace_path, nsight_dir)?;
     super::write_output(
@@ -370,6 +530,7 @@ pub fn run_compare(
     baseline: &[PathBuf],
     candidate: &[PathBuf],
     unverified_traces: bool,
+    require_eligible: bool,
     output: Option<&Path>,
 ) -> Result<()> {
     let comparison = if unverified_traces {
@@ -397,10 +558,32 @@ pub fn run_compare(
     super::write_output(
         output,
         (serde_json::to_string_pretty(&comparison)? + "\n").as_bytes(),
-    )
+    )?;
+    if require_eligible && comparison.verdict == ComparisonVerdict::Ineligible {
+        let codes = comparison
+            .reasons
+            .iter()
+            .map(|reason| {
+                serde_json::to_value(reason.code)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .expect("comparison reason codes serialize to snake_case strings")
+            })
+            .collect::<BTreeSet<_>>();
+        bail!(
+            "comparison ineligible: {}",
+            codes.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(())
 }
 
-pub fn run_report(trace: &Path, nsight_dir: Option<&Path>, bundle: &Path) -> Result<()> {
+pub fn run_report(
+    trace: &Path,
+    nsight_dir: Option<&Path>,
+    bundle: &Path,
+    output: Option<&Path>,
+) -> Result<()> {
     for ancestor in bundle.ancestors().skip(1) {
         ensure!(
             !ancestor.join("bundle.json").is_file(),
@@ -410,18 +593,250 @@ pub fn run_report(trace: &Path, nsight_dir: Option<&Path>, bundle: &Path) -> Res
         );
     }
     publish_bundle(bundle, trace, nsight_dir)?;
-    Ok(())
-}
-
-pub fn run_verify(bundle: &Path, output: Option<&Path>) -> Result<()> {
-    let receipt = verify_bundle(bundle)?;
+    let verification = verify_bundle(bundle)
+        .with_context(|| format!("deep-verify published bundle {}", bundle.display()))?;
     if let Some(output) = output {
         reject_output_inside_bundle_root(bundle, output)?;
     }
+    let receipt = PublicationReceipt {
+        schema: PUBLICATION_SCHEMA.into(),
+        status: PublicationStatus::Published,
+        bundle_path: bundle.to_path_buf(),
+        run_id: verification.run_id.clone(),
+        verification,
+    };
     super::write_output(
         output,
         (serde_json::to_string_pretty(&receipt)? + "\n").as_bytes(),
     )
+}
+
+pub fn run_verify(bundle: &Path, semantic: bool, output: Option<&Path>) -> Result<()> {
+    let receipt = verify_bundle(bundle)?;
+    if let Some(output) = output {
+        reject_output_inside_bundle_root(bundle, output)?;
+    }
+    let semantic_result = if semantic {
+        Some(verify_semantic(bundle)?)
+    } else {
+        None
+    };
+    let rendered = serde_json::to_string_pretty(&serde_json::json!({
+        "schema": VERIFY_SCHEMA,
+        "tool": ToolIdentity::current(),
+        "receipt": receipt,
+        "semantic": semantic_result,
+    }))? + "\n";
+    super::write_output(output, rendered.as_bytes())
+}
+
+/// Rederive the evidence packet from the bundle's retained inputs and require
+/// an exact match against the published `evidence.json`.
+///
+/// No path normalization is needed: the only path fields inside an evidence
+/// packet (`gpu.raw_report.path` and `gpu.source_csv[].path`) are recorded
+/// relative to the Nsight directory root, and publication itself derives
+/// `evidence.json` from the staged in-bundle `trace.jsonl` and `nsight/`
+/// directory — the same paths this rederivation consumes.
+fn verify_semantic(bundle: &Path) -> Result<serde_json::Value> {
+    let nsight = bundle.join("nsight");
+    let nsight_dir = nsight.is_dir().then_some(nsight.as_path());
+    let rederived = build_evidence(&bundle.join("trace.jsonl"), nsight_dir)
+        .with_context(|| format!("rederive evidence for bundle {}", bundle.display()))?;
+    let rederived = serde_json::to_value(&rederived)?;
+    let evidence_path = bundle.join("evidence.json");
+    let published: serde_json::Value = serde_json::from_slice(
+        &fs::read(&evidence_path)
+            .with_context(|| format!("read published evidence {}", evidence_path.display()))?,
+    )
+    .with_context(|| format!("parse published evidence {}", evidence_path.display()))?;
+    if rederived != published {
+        bail!(
+            "semantic verification failed: rederived evidence differs from published evidence.json for {}",
+            bundle.display()
+        );
+    }
+    Ok(serde_json::json!({ "status": "rederived_match" }))
+}
+
+/// Bounded first look at a raw trace or verified bundle for agents: health and
+/// evidence counts, truncated finding/gap lists, and headline scalars only —
+/// never an unbounded collection.
+pub fn run_overview(input_path: &Path, output: Option<&Path>) -> Result<()> {
+    let loaded = load_evidence_input(input_path)?;
+    reject_output_inside_verified_bundle(&loaded.input, output)?;
+    let evidence = &loaded.packet;
+    let health = &evidence.health;
+
+    let graph_summary = evidence.graph.as_ref().map(|graph| &graph.summary);
+    let timing = graph_summary.map(|summary| {
+        serde_json::json!({
+            "outer_wall_time_ns": summary.outer_wall_time_ns,
+            "entrypoint": &summary.entrypoint,
+            "slowest_host_spans": bounded_values(&summary.slowest_host_spans, OVERVIEW_TIMING_SPAN_LIMIT),
+        })
+    });
+    let timing_unavailable_reason = graph_summary.is_none().then_some(
+        "no derived execution graph: the capture is incomplete or structurally invalid, so no timing headline exists",
+    );
+
+    // Only scalar aggregates from the memory profiles; never per-storage lists.
+    let logical = evidence.memory.logical.as_ref();
+    let memory = serde_json::json!({
+        "logical": logical.is_some(),
+        "physical": evidence.memory.physical.is_some(),
+        "logical_totals": logical.map(|profile| serde_json::json!({
+            "storage_allocation_count": profile.storage_allocation_count,
+            "matched_storage_free_count": profile.matched_storage_free_count,
+            "total_allocated_bytes": profile.total_allocated_bytes,
+            "peak_live_bytes": profile.peak.as_ref().map(|peak| peak.live_bytes),
+            "peak_timestamp_ns": profile.peak.as_ref().map(|peak| peak.timestamp_ns),
+        })),
+    });
+
+    let rendered = serde_json::to_string_pretty(&serde_json::json!({
+        "schema": OVERVIEW_SCHEMA,
+        "tool": ToolIdentity::current(),
+        "input": &loaded.input,
+        "provenance": &evidence.provenance,
+        "health": {
+            "structurally_valid": health.structurally_valid,
+            "capture_complete": health.capture_complete,
+            "error_count": health.issues.iter().filter(|issue| issue.severity == HealthSeverity::Error).count(),
+            "warning_count": health.issues.iter().filter(|issue| issue.severity == HealthSeverity::Warning).count(),
+        },
+        "capabilities": &evidence.capabilities,
+        "findings": bounded_values(&evidence.findings, OVERVIEW_LIST_LIMIT),
+        "gaps": bounded_values(&evidence.gaps, OVERVIEW_LIST_LIMIT),
+        "counts": {
+            "tensor_stat_events": evidence.tensor_stats.len(),
+            "tensor_stat_non_finite_events": evidence.tensor_stats.iter().filter(|event| event.non_finite > 0).count(),
+            "graph_spans": evidence.graph.as_ref().map(|graph| graph.spans.len()),
+        },
+        "timing": timing,
+        "timing_unavailable_reason": timing_unavailable_reason,
+        "memory": memory,
+        "gpu": gpu_summary(evidence),
+    }))? + "\n";
+    super::write_output(output, rendered.as_bytes())
+}
+
+/// Emit the tool's complete versioned protocol: every schema it writes or
+/// reads, plus the subcommand catalog, sourced from the crate's exported
+/// constants.
+pub fn run_protocol(output: Option<&Path>) -> Result<()> {
+    let rendered = serde_json::to_string_pretty(&serde_json::json!({
+        "schema": PROTOCOL_SCHEMA,
+        "tool": ToolIdentity::current(),
+        "schemas": {
+            "trace_write": crate::trace::SCHEMA,
+            "trace_read": [crate::trace::schema::PREVIOUS_SCHEMA, crate::trace::SCHEMA],
+            "graph": crate::graph::SCHEMA,
+            "evidence": crate::evidence::SCHEMA,
+            "comparison": crate::comparison::SCHEMA,
+            "bundle": crate::artifact::SCHEMA,
+            "bundle_verification": crate::artifact::VERIFICATION_SCHEMA,
+            "publication": PUBLICATION_SCHEMA,
+            "campaign": crate::campaign::CAMPAIGN_SCHEMA,
+            "campaign_status": crate::campaign::CAMPAIGN_STATUS_SCHEMA,
+            "series": crate::campaign::SERIES_SCHEMA,
+            "summary": SUMMARY_SCHEMA,
+            "query": QUERY_SCHEMA,
+            "overview": OVERVIEW_SCHEMA,
+            "verify": VERIFY_SCHEMA,
+            "gradient_manifest": crate::capability::GRADIENT_MANIFEST_SCHEMA,
+            "nsight_capture": crate::nsight::CAPTURE_MANIFEST_SCHEMA,
+            "viewer": viewer_schema(),
+        },
+        "commands": crate::cli::args::command_catalog(),
+    }))? + "\n";
+    super::write_output(output, rendered.as_bytes())
+}
+
+fn viewer_schema() -> serde_json::Value {
+    #[cfg(feature = "visualizer")]
+    {
+        serde_json::Value::String(crate::viewer::trace_view::SCHEMA.into())
+    }
+    #[cfg(not(feature = "visualizer"))]
+    {
+        serde_json::Value::Null
+    }
+}
+
+/// Reconcile a campaign manifest against the bundles on disk.
+pub fn run_campaign_status(manifest: &Path, output: Option<&Path>) -> Result<()> {
+    let status = crate::campaign::campaign_status(manifest)?;
+    super::write_output(
+        output,
+        (serde_json::to_string_pretty(&status)? + "\n").as_bytes(),
+    )
+}
+
+/// Build a cross-run series report from a fully published campaign manifest or
+/// an explicit ordered list of verified bundle directories.
+pub fn run_series(
+    manifest: Option<&Path>,
+    bundles: &[PathBuf],
+    label_prefix: Option<&str>,
+    output: Option<&Path>,
+) -> Result<()> {
+    let roots = match manifest {
+        Some(manifest_path) => {
+            ensure!(
+                bundles.is_empty(),
+                "series accepts exactly one of --manifest or --bundle"
+            );
+            let status = crate::campaign::campaign_status(manifest_path)?;
+            let unpublished = status
+                .captures
+                .iter()
+                .filter(|capture| !matches!(capture.state, CaptureState::Published { .. }))
+                .map(|capture| {
+                    format!(
+                        "step {} ({}): {}",
+                        capture.capture_step,
+                        capture.bundle,
+                        capture_state_name(&capture.state)
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !unpublished.is_empty() {
+                bail!(
+                    "series requires every planned capture to be published; not published: {}; run `campaign-status` for the full reconciliation",
+                    unpublished.join(", ")
+                );
+            }
+            let base = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+            status
+                .captures
+                .iter()
+                .map(|capture| base.join(&capture.bundle))
+                .collect::<Vec<_>>()
+        }
+        None => {
+            ensure!(
+                !bundles.is_empty(),
+                "series requires exactly one of --manifest or --bundle"
+            );
+            bundles.to_vec()
+        }
+    };
+    let report = crate::campaign::build_series(&roots, label_prefix)?;
+    super::write_output(
+        output,
+        (serde_json::to_string_pretty(&report)? + "\n").as_bytes(),
+    )
+}
+
+fn capture_state_name(state: &CaptureState) -> &'static str {
+    match state {
+        CaptureState::Missing => "missing",
+        CaptureState::Published { .. } => "published",
+        CaptureState::FailedRun { .. } => "failed_run",
+        CaptureState::VerificationFailed { .. } => "verification_failed",
+        CaptureState::IdentityMismatch { .. } => "identity_mismatch",
+    }
 }
 
 fn query_graph(graph: &ExecutionGraph, kind: TraceQueryKind) -> serde_json::Value {

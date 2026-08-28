@@ -136,8 +136,11 @@ With the `candle` feature, `CandleCapture::from_tensor` extracts:
 - the dense tensor footprint.
 
 Use `with_label` for a caller-owned observation label. The label never replaces backend tensor
-identity. `candle::record_tensor` and `candle::record_op` translate the owned capture values into
-session events.
+identity, and the captured identities are read-only: `CandleCapture::storage_id()` and
+`CandleCapture::tensor_id()` are accessors, so identity can no longer be overwritten after
+capture. `candle::record_tensor` and `candle::record_op` translate the owned capture values into
+session events; `candle::record_tensor_with_label(session, span_id, label, tensor, step)` records
+a semantically labeled tensor in one call.
 
 Dense footprint is `element_count × dtype_size`. It is useful shape metadata, but it is not the
 size of shared or padded backing storage. Record actual allocation bytes separately.
@@ -149,12 +152,11 @@ count, non-finite count, RMS, absolute maximum, and mean. Labels are the join ke
 comparisons, so make them stable and unique within a run. If a label repeats within a run, every
 event is still averaged into the comparison and the per-row sample counts expose the repetition.
 
-The current API accepts the wire span ID as a string:
+The API takes the opaque `SpanId` from the owning guard; callers never format span IDs:
 
 ```rust
 let forward = session.begin_step_span(label, ExecutionStep::Forward, SpanKind::Function);
-let span_id = format!("s{}", forward.id().raw());
-session.record_tensor_stats(&span_id, "model/block-0/output", &output)?;
+session.record_tensor_stats(forward.id(), "model/block-0/output", &output)?;
 ```
 
 These are real Candle reductions. On an accelerator they can add kernels, transfers, and scalar
@@ -162,6 +164,21 @@ synchronization to the selected invocation. Record the same checkpoints in both 
 cohorts and interpret performance results as the instrumented workload. If any element is NaN or
 infinite, `non_finite` is authoritative; non-finite aggregate values are serialized as zero so the
 event remains valid JSON.
+
+### Host-side scalar observations
+
+`TraceSession::record_scalar` (no feature required) records one application-computed scalar the
+host already holds — a loss term, gate value, clip fraction, or cosine:
+
+```rust
+session.record_scalar(measured.id(), "loss/total", loss_value)?;
+```
+
+It triggers no device reductions or readbacks. The value is stored as a single-element labeled
+statistic on the tensor-stats plane, so series and comparison tooling treat it like any other
+labeled mechanism observation. A non-finite value sets `non_finite` and serializes the numeric
+fields as zero. Scalar observations are observational mechanism evidence only; they never claim
+causal attribution.
 
 ## 6. Record memory as two independent planes
 
@@ -185,71 +202,57 @@ logical lifetime evidence.
 ## 7. Qualify exact gradient coverage
 
 Complete gradient coverage requires a `GradientContract` created from the final parameter set
-before opening the session. The expected vector is caller-ordered; sort `VarMap` keys because map
-iteration order is not a stable protocol.
+before opening the session. With the `candle` feature, `GradientCapturePlan` is the preferred
+path: one validated manifest drives both the declared exact contract and the recorded event
+population, so they cannot diverge. Family policy stays application-owned through the
+`assign_family` closure and the family contracts.
 
 ```rust
-use std::collections::BTreeMap;
+use candle_graph::candle::GradientCapturePlan;
+use candle_graph::{CaptureContract, CoverageLevel, GradientFamilyContract, MeasurementScope};
 
-use candle_graph::{
-    CaptureContract, CoverageLevel, ExpectedGradient, GradientContract, GradientFamilyContract,
-    GradientFamilyExpectation, MeasurementScope,
-};
-use candle_nn::VarMap;
+let vars = varmap
+    .data()
+    .lock()
+    .expect("VarMap lock poisoned")
+    .iter()
+    .map(|(key, var)| (key.clone(), var.clone()))
+    .collect::<Vec<_>>();
 
-fn contract_from_varmap(varmap: &VarMap) -> anyhow::Result<GradientContract> {
-    let mut keys = varmap
-        .data()
-        .lock()
-        .expect("VarMap lock poisoned")
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    keys.sort();
+let plan = GradientCapturePlan::from_named_vars(
+    "parameters",
+    vars,
+    // Replace this prefix rule with the application's parameter-family policy.
+    |key| {
+        if key.starts_with("frozen.") { "frozen" } else { "trainable" }.to_owned()
+    },
+    vec![
+        GradientFamilyContract::active("trainable", 1),
+        GradientFamilyContract::inactive("frozen"),
+    ],
+)?;
 
-    let mut policies = BTreeMap::new();
-    let expected = keys
-        .into_iter()
-        .map(|key| {
-            // Replace these prefixes with the application's parameter-family policy.
-            let (family, expectation, min_present) = if key.starts_with("frozen.") {
-                ("frozen", GradientFamilyExpectation::Inactive, 0)
-            } else if key.starts_with("conditional.") {
-                ("conditional", GradientFamilyExpectation::DataConditional, 1)
-            } else {
-                ("trainable", GradientFamilyExpectation::Active, 1)
-            };
-            policies.insert(family.to_owned(), (expectation, min_present));
-            ExpectedGradient::new("parameters", key, family)
-        })
-        .collect();
-
-    let families = policies
-        .into_iter()
-        .map(|(family, (expectation, min_present))| match expectation {
-            GradientFamilyExpectation::Active => {
-                GradientFamilyContract::active(family, min_present)
-            }
-            GradientFamilyExpectation::Inactive => GradientFamilyContract::inactive(family),
-            GradientFamilyExpectation::DataConditional => {
-                GradientFamilyContract::data_conditional(family, min_present)
-            }
-        })
-        .collect();
-
-    GradientContract::new(expected, families)
-}
-
-let gradient_contract = contract_from_varmap(&varmap)?;
 let contract = CaptureContract {
     measurement_scope: MeasurementScope::ProductionEquivalent,
     gradients: CoverageLevel::Complete,
-    gradient_contract: Some(gradient_contract),
+    gradient_contract: Some(plan.contract().clone()),
     ..CaptureContract::default()
 };
 ```
 
-Record every declared `(root, key)` exactly once with `TraceSession::record_gradient`:
+`from_named_vars` sorts keys ascending, validates the manifest (non-empty, unique keys, family
+membership), and binds the SHA-256 digest at construction. After the backward pass, record the
+whole population in one call — exactly one event per manifest entry, in manifest order:
+
+```rust
+let grads = loss.backward()?;
+plan.record(&session, &grads)?;
+```
+
+Manual wiring remains possible: build `GradientContract::new(expected, families)` from
+caller-ordered `ExpectedGradient` entries (sort `VarMap` keys yourself; map iteration order is not
+a stable protocol) and record every declared `(root, key)` exactly once with
+`TraceSession::record_gradient`:
 
 - `Present` requires a finite norm greater than zero;
 - `Zero` requires positive `0.0`, never `-0.0`;
@@ -299,6 +302,47 @@ A panic, abort, process kill, or I/O failure cannot be converted automatically i
 trace. Such a file may lack its required terminal event and fail parsing. Arrange application-level
 error handling when diagnosable failure artifacts are required.
 
+## 10. Publish through `CaptureRun`
+
+`CaptureRun` is the canonical path from one planned capture to a deeply verified, atomically
+published evidence bundle. It owns staging-trace placement, the session lifetime, evidence and
+viewer derivation, manifest hashing, fsync, and the atomic rename. Applications must not write
+evidence files or rename profile directories themselves.
+
+```rust
+use candle_graph::{CaptureBegin, CaptureRun, ProfileRun};
+
+let run = ProfileRun::training("trainer::update", update, "cpu").capture_contract(contract);
+let capture = match CaptureRun::begin("profiles/update-000010", run)? {
+    // Crash retry of an already-published planned capture: reuse the receipt.
+    CaptureBegin::AlreadyPublished(receipt) => return Ok(*receipt),
+    CaptureBegin::Active(capture) => capture,
+};
+
+{
+    let session = capture.session();
+    let measured = session.begin_measurement("trainer/update-000010");
+    // spans, ops, tensor stats, scalars, gradients …
+    session.record_scalar(measured.id(), "loss/total", loss_value)?;
+}
+
+let receipt = capture.publish()?;
+```
+
+`capture.session()` exposes the live `TraceSession` for spans, ops, statistics, scalars, and
+gradients. `.with_nsight_dir(dir)` retains a flat directory of official Nsight artifacts inside
+the bundle. `.publish()` finishes the session as complete; `.publish_failed(reason)` finishes it
+as an explicit failed capture and still publishes a diagnosable bundle, so crashed campaign steps
+stay queryable. Both return a `candle-graph/publication/1` receipt: `status`
+(`published` or `already_published`), `bundle_path`, `run_id`, and the deep-verification receipt.
+
+Publication is idempotent across crashes. Retrying the same planned capture — same entrypoint,
+correlation ID, phase, capture step, and device — against an already-published destination
+returns `AlreadyPublished` with a fresh verification receipt instead of recapturing. Any other
+pre-existing destination fails closed as a conflict; a non-bundle destination is never reused or
+overwritten. On publication failure the staged trace is retained next to the destination for
+diagnosis.
+
 ## Capture checklist
 
 - The selector runs before `TraceSession::open`.
@@ -310,6 +354,9 @@ error handling when diagnosable failure artifacts are required.
 - Logical and physical memory observations remain separate.
 - Complete gradients have an exact ordered manifest and one event per key.
 - Comparison identity fields describe the real workload and environment.
-- Success calls `finish`; caught failure calls `finish_failed`.
+- Success calls `finish`; caught failure calls `finish_failed`. Under `CaptureRun`, success calls
+  `publish` and caught failure calls `publish_failed`.
+- Bundles are published by `CaptureRun` or the `report` command, never by hand-written evidence
+  files or directory renames.
 
-After capture, publish and inspect evidence with the [CLI reference](cli-reference.md).
+After capture, inspect published evidence with the [CLI reference](cli-reference.md).

@@ -1,5 +1,6 @@
 //! Trace-file CLI helpers.
 
+pub mod args;
 pub mod trace_cli;
 
 use anyhow::{Context, Result};

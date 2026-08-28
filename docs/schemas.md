@@ -11,18 +11,26 @@ format from the crate package version.
 | `candle-graph/trace/10` | `TraceSession`, `write_jsonl` | Ordered execution-evidence JSONL; adds caller-labelled tensor statistics to trace/9 |
 | `candle-graph/graph/5` | `build_from_trace` | Validated call/data graph with measured-scope and concurrent-overlap host timing |
 | `candle-graph/evidence/4` | `build_evidence`, `import`, `report` | Provenance, health, capabilities, facts, gaps, optional graph, timing, memory, and GPU evidence |
-| `candle-graph/summary/4` | `summary` | CLI overview envelope |
-| `candle-graph/trace-query/4` | `query` | Typed CLI query envelope |
-| `candle-graph/comparison/5` | `compare` | Repeated-run comparison with input verification receipts |
+| `candle-graph/protocol/1` | `protocol` | Tool identity, schema-version map, and command list |
+| `candle-graph/overview/1` | `overview` | Hard-bounded first-look envelope; truncated lists carry total/displayed/truncated |
+| `candle-graph/summary/5` | `summary` | CLI overview envelope; adds `tool` to summary/4 |
+| `candle-graph/trace-query/5` | `query` | Typed CLI query envelope; adds `tool` and `filter` to trace-query/4 |
+| `candle-graph/comparison/6` | `compare` | Repeated-run comparison; replaces free-text reasons with typed `{code, message}` objects (breaking) |
 | `candle-graph/viewer/5` | `render_evidence_html` | JSON payload embedded in the offline viewer |
 | `candle-graph/gradient-manifest/1` | `GradientContract` | Digest domain for ordered `(root, key, family)` entries |
 | `candle-graph/nsight-capture/1` | application/tooling | Nsight artifact hashes, tool/hardware facts, IDs, and semantic-label contract |
 | `candle-graph/bundle/1` | `report`, `publish_bundle` | Content manifest for one evidence directory |
-| `candle-graph/bundle-verification/1` | `verify`, `verify_bundle` | Point-in-time deep-verification receipt |
+| `candle-graph/bundle-verification/1` | `verify_bundle` | Point-in-time deep-verification receipt |
+| `candle-graph/verify/1` | `verify` | CLI verification envelope: `{schema, tool, receipt, semantic}` |
+| `candle-graph/publication/1` | `report`, `CaptureRun` | Typed publication receipt: status, bundle path, run ID, verification receipt |
+| `candle-graph/campaign/1` | application/tooling | Producer-declared campaign plan of capture steps and bundle paths |
+| `candle-graph/campaign-status/1` | `campaign-status` | Deterministic reconciliation of a campaign plan against published bundles |
+| `candle-graph/series/1` | `series`, `build_series` | Metric trajectories across verified bundles, keyed by capture step |
 
-The root library exports `TRACE_SCHEMA`, `GRAPH_SCHEMA`, `EVIDENCE_SCHEMA`,
-`COMPARISON_SCHEMA`, `BUNDLE_SCHEMA`, and `GRADIENT_MANIFEST_SCHEMA`. The viewer constant is
-available as `candle_graph::viewer::trace_view::SCHEMA`; the bundle verification constant is
+The root library exports `TRACE_SCHEMA`, `GRAPH_SCHEMA`, `EVIDENCE_SCHEMA`, `COMPARISON_SCHEMA`,
+`BUNDLE_SCHEMA`, `GRADIENT_MANIFEST_SCHEMA`, `PUBLICATION_SCHEMA`, `CAMPAIGN_SCHEMA`,
+`CAMPAIGN_STATUS_SCHEMA`, and `SERIES_SCHEMA`. The viewer constant is available as
+`candle_graph::viewer::trace_view::SCHEMA`; the bundle verification constant is
 `candle_graph::artifact::VERIFICATION_SCHEMA`.
 
 ## Trace stream shape

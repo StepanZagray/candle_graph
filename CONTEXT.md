@@ -31,6 +31,10 @@ parameters, plus an active, inactive, or data-conditional expectation for every 
 gradient coverage means the observed events match the manifest and all state, norm, and family
 rules.
 
+**Scalar observation**: one application-computed host-side value (loss term, gate value, clip
+fraction, cosine) recorded as a single-element labeled statistic on the tensor-stats plane. It
+triggers no device reductions and is observational mechanism evidence, never causal attribution.
+
 **Evidence capability**: a machine-checkable statement that one class of conclusion is complete,
 partial, unavailable, or invalid for an evidence packet.
 
@@ -53,6 +57,20 @@ NVTX facts. Its absence never invalidates application evidence.
 
 **Evidence bundle**: one atomically published directory whose manifest binds every input and
 derived file to the profile run.
+
+**Publication receipt**: typed proof that one planned capture is durably published and verified:
+status (`published` or `already_published`), bundle path, run ID, and a deep-verification receipt.
+Retrying the same planned capture reconciles to the existing bundle; any other pre-existing
+destination is a conflict.
+
+**Campaign**: a producer-declared plan of capture steps for one training entrypoint, each planned
+step naming the bundle path expected to hold its published evidence. Campaign status is a
+stateless, deterministic reconciliation of that plan against published bundles; nothing supervises
+training.
+
+**Series**: long-form metric trajectories — outer wall time, labeled tensor statistics and
+scalars, per-parameter gradient norms — across verified bundles of one entrypoint and phase,
+keyed by capture step.
 
 **Replicated comparison**: a comparison of at least five compatible independent baseline bundles
 and five compatible independent candidate bundles. It retains every timing sample and binds every
@@ -81,8 +99,9 @@ representative update or inference call
                                     ▼
                             evidence/4 packet
                               ├─ CLI JSON / Markdown
-                              ├─ atomic bundle/1 + verification receipt
-                              ├─ comparison/5 across repeated bundles
+                              ├─ atomic bundle/1 + publication/1 receipt
+                              ├─ comparison/6 across repeated bundles
+                              ├─ campaign-status/1 + series/1 across a campaign
                               └─ viewer/5 HTML
 ```
 
@@ -119,12 +138,16 @@ silent empty-success values. Tensor footprint and observed memory lifetime are d
 | `candle-graph/trace/10` | Execution JSONL with tensor statistics and exact gradient contracts |
 | `candle-graph/graph/5` | Validated call/data graph and measured host scopes |
 | `candle-graph/evidence/4` | Capability-qualified application and GPU evidence packet |
-| `candle-graph/comparison/5` | Replicated timing and tensor-stat comparison |
+| `candle-graph/comparison/6` | Replicated timing and tensor-stat comparison with typed reason codes |
 | `candle-graph/viewer/5` | Embedded offline UI payload |
 | `candle-graph/gradient-manifest/1` | Ordered gradient-manifest digest domain |
 | `candle-graph/nsight-capture/1` | Nsight artifact and run-identity manifest |
 | `candle-graph/bundle/1` | Content-addressed evidence bundle |
 | `candle-graph/bundle-verification/1` | Point-in-time deep-verification receipt |
+| `candle-graph/publication/1` | Typed capture-publication receipt |
+| `candle-graph/campaign/1` | Producer-declared campaign plan |
+| `candle-graph/campaign-status/1` | Deterministic plan-vs-bundles reconciliation |
+| `candle-graph/series/1` | Metric trajectories across verified bundles |
 
 The parser reads trace/10 and trace/9; new sessions emit trace/10. Derived packet consumers require
 their current schema. See [schemas and compatibility](docs/schemas.md) for the complete list.

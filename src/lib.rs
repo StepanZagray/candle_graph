@@ -19,6 +19,7 @@
 //! [`comparison`].
 
 pub mod artifact;
+pub mod campaign;
 pub mod capability;
 pub mod cli;
 pub mod comparison;
@@ -27,6 +28,7 @@ pub mod graph;
 pub mod instrument;
 pub mod nsight;
 pub mod phase;
+pub mod publication;
 pub mod timing;
 pub mod trace;
 #[cfg(feature = "visualizer")]
@@ -36,14 +38,19 @@ pub use artifact::{
     publish_bundle, verify_bundle, BundleManifest, BundleVerificationReceipt,
     SCHEMA as BUNDLE_SCHEMA,
 };
+pub use campaign::{
+    build_series, campaign_status, CampaignManifest, CampaignStatus, CaptureState, CaptureStatus,
+    PlannedCapture, SeriesReport, CAMPAIGN_SCHEMA, CAMPAIGN_STATUS_SCHEMA, SERIES_SCHEMA,
+};
 pub use capability::{
     CaptureContract, CoverageLevel, ExpectedGradient, GradientContract, GradientFamilyContract,
     GradientFamilyExpectation, MeasurementScope, GRADIENT_MANIFEST_SCHEMA,
 };
 pub use comparison::{
     compare_unverified_traces, compare_verified_bundles, ComparisonInputVerification,
-    ComparisonInputs, ComparisonVerdict, ReplicatedComparison, TensorStatsComparison,
-    TensorStatsComparisonRow, VerifiedBundleInput, SCHEMA as COMPARISON_SCHEMA,
+    ComparisonInputs, ComparisonReason, ComparisonReasonCode, ComparisonVerdict,
+    ReplicatedComparison, TensorStatsComparison, TensorStatsComparisonRow, VerifiedBundleInput,
+    SCHEMA as COMPARISON_SCHEMA,
 };
 pub use evidence::{build_evidence, EvidencePacket, SCHEMA as EVIDENCE_SCHEMA};
 pub use graph::{build_from_trace, ExecutionGraph, SCHEMA as GRAPH_SCHEMA};
@@ -55,5 +62,9 @@ pub use instrument::{
 };
 pub use nsight::{GpuEvidenceStatus, NsightEvidence};
 pub use phase::{ExecutionPhase, ExecutionStep};
+pub use publication::{
+    reconcile_published_bundle, CaptureBegin, CaptureRun, PublicationReceipt, PublicationStatus,
+    PUBLICATION_SCHEMA,
+};
 pub use trace::{parse_trace, write_jsonl, TraceDocument, TraceEvent, SCHEMA as TRACE_SCHEMA};
 pub use trace::{ComparisonIdentity, TimingMode};

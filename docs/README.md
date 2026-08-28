@@ -23,12 +23,13 @@ selected update or inference call
              │
              ▼
        evidence/4 packet
-        ├─ summary/query JSON
+        ├─ overview/summary/query JSON
         ├─ report.md
         ├─ viewer/5 HTML
-        └─ bundle/1 manifest + verification receipt
+        └─ bundle/1 manifest + publication/1 receipt
                          │
-                         └─ comparison/5 across repeated verified bundles
+                         ├─ comparison/6 across repeated verified bundles
+                         └─ campaign-status/1 + series/1 across a campaign
 ```
 
 The execution graph is a derived view, not the source of truth. Structural validation and

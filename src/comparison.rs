@@ -10,7 +10,7 @@ use crate::artifact::{verify_bundle, verify_consumed_bundle_files};
 use crate::capability::MeasurementScope;
 use crate::trace::{analyze_health, parse_trace, ComparisonIdentity, TraceDocument};
 
-pub const SCHEMA: &str = "candle-graph/comparison/5";
+pub const SCHEMA: &str = "candle-graph/comparison/6";
 pub const MINIMUM_RUNS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +20,47 @@ pub enum ComparisonVerdict {
     Inconclusive,
     CandidateFaster,
     CandidateSlower,
+}
+
+/// Stable, machine-readable cause of comparison ineligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonReasonCode {
+    UnverifiedInputs,
+    ReceiptCountMismatch,
+    ReceiptRunIdMismatch,
+    ReceiptDigestInvalid,
+    InsufficientRuns,
+    DuplicateRunIds,
+    NoRuns,
+    CaptureSemanticsMismatch,
+    IncompleteCapture,
+    NotProductionEquivalent,
+    UnsynchronizedDeviceRegion,
+    MeasuredRegionCountInvalid,
+    IdentityMissing,
+    IdentityInvalid,
+    IdentityConditionsDiffer,
+    ImplementationIdMissing,
+    ImplementationIdEmpty,
+    ImplementationIdInconsistent,
+    PairingIncomplete,
+    PairIdsDuplicated,
+    PairSetsMismatch,
+}
+
+/// One ineligibility cause: a stable code plus its human-readable message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonReason {
+    pub code: ComparisonReasonCode,
+    pub message: String,
+}
+
+fn reason(code: ComparisonReasonCode, message: impl Into<String>) -> ComparisonReason {
+    ComparisonReason {
+        code,
+        message: message.into(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -95,7 +136,7 @@ pub struct ReplicatedComparison {
     pub comparable: bool,
     pub paired: bool,
     pub verdict: ComparisonVerdict,
-    pub reasons: Vec<String>,
+    pub reasons: Vec<ComparisonReason>,
     pub baseline_implementation_id: Option<String>,
     pub candidate_implementation_id: Option<String>,
     pub identity: Option<ComparisonIdentity>,
@@ -194,8 +235,9 @@ fn compare_documents(
     let baseline_samples = measured_samples(baseline, "baseline", &mut reasons);
     let candidate_samples = measured_samples(candidate, "candidate", &mut reasons);
     if baseline.len() < MINIMUM_RUNS || candidate.len() < MINIMUM_RUNS {
-        reasons.push(format!(
-            "at least {MINIMUM_RUNS} independent baseline and candidate runs are required"
+        reasons.push(reason(
+            ComparisonReasonCode::InsufficientRuns,
+            format!("at least {MINIMUM_RUNS} independent baseline and candidate runs are required"),
         ));
     }
     require_independent_run_ids(baseline, candidate, &mut reasons);
@@ -370,13 +412,13 @@ fn validate_input_provenance(
     inputs: &ComparisonInputs,
     baseline: &[TraceDocument],
     candidate: &[TraceDocument],
-    reasons: &mut Vec<String>,
+    reasons: &mut Vec<ComparisonReason>,
 ) {
     match inputs.verification {
-        ComparisonInputVerification::UnverifiedTraces => reasons.push(
-            "unverified raw trace inputs are diagnostic only; finalized verified bundles are required for an eligible comparison"
-                .into(),
-        ),
+        ComparisonInputVerification::UnverifiedTraces => reasons.push(reason(
+            ComparisonReasonCode::UnverifiedInputs,
+            "unverified raw trace inputs are diagnostic only; finalized verified bundles are required for an eligible comparison",
+        )),
         ComparisonInputVerification::VerifiedBundles => {
             validate_verified_cohort(&inputs.baseline, baseline, "baseline", reasons);
             validate_verified_cohort(&inputs.candidate, candidate, "candidate", reasons);
@@ -388,19 +430,23 @@ fn validate_verified_cohort(
     inputs: &[VerifiedBundleInput],
     documents: &[TraceDocument],
     cohort: &str,
-    reasons: &mut Vec<String>,
+    reasons: &mut Vec<ComparisonReason>,
 ) {
     if inputs.len() != documents.len() {
-        reasons.push(format!(
-            "{cohort} bundle receipts must correspond one-to-one with trace documents"
+        reasons.push(reason(
+            ComparisonReasonCode::ReceiptCountMismatch,
+            format!("{cohort} bundle receipts must correspond one-to-one with trace documents"),
         ));
         return;
     }
     for (index, (input, document)) in inputs.iter().zip(documents).enumerate() {
         if input.run_id != document.run.run_id {
-            reasons.push(format!(
-                "{cohort} bundle {} receipt run ID does not match its trace",
-                index + 1
+            reasons.push(reason(
+                ComparisonReasonCode::ReceiptRunIdMismatch,
+                format!(
+                    "{cohort} bundle {} receipt run ID does not match its trace",
+                    index + 1
+                ),
             ));
         }
         if input.manifest_sha256.len() != 64
@@ -409,9 +455,12 @@ fn validate_verified_cohort(
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit())
         {
-            reasons.push(format!(
-                "{cohort} bundle {} receipt has an invalid manifest SHA-256",
-                index + 1
+            reasons.push(reason(
+                ComparisonReasonCode::ReceiptDigestInvalid,
+                format!(
+                    "{cohort} bundle {} receipt has an invalid manifest SHA-256",
+                    index + 1
+                ),
             ));
         }
     }
@@ -420,7 +469,7 @@ fn validate_verified_cohort(
 fn require_independent_run_ids(
     baseline: &[TraceDocument],
     candidate: &[TraceDocument],
-    reasons: &mut Vec<String>,
+    reasons: &mut Vec<ComparisonReason>,
 ) {
     let ids = baseline
         .iter()
@@ -428,17 +477,23 @@ fn require_independent_run_ids(
         .map(|document| document.run.run_id.as_str())
         .collect::<Vec<_>>();
     if ids.iter().copied().collect::<BTreeSet<_>>().len() != ids.len() {
-        reasons.push("run IDs must be unique across all replicates".into());
+        reasons.push(reason(
+            ComparisonReasonCode::DuplicateRunIds,
+            "run IDs must be unique across all replicates",
+        ));
     }
 }
 
 fn require_consistent_capture_semantics(
     baseline: &[TraceDocument],
     candidate: &[TraceDocument],
-    reasons: &mut Vec<String>,
+    reasons: &mut Vec<ComparisonReason>,
 ) {
     let Some(first) = baseline.first().or_else(|| candidate.first()) else {
-        reasons.push("comparison contains no runs".into());
+        reasons.push(reason(
+            ComparisonReasonCode::NoRuns,
+            "comparison contains no runs",
+        ));
         return;
     };
     if baseline.iter().chain(candidate).any(|document| {
@@ -452,35 +507,48 @@ fn require_consistent_capture_semantics(
             || document.run.measured_region_device_synchronized
                 != first.run.measured_region_device_synchronized
     }) {
-        reasons.push(
-            "entrypoint, phase, device, timing mode, synchronization, warmup, capture step, and capture contract must match"
-                .into(),
-        );
+        reasons.push(reason(
+            ComparisonReasonCode::CaptureSemanticsMismatch,
+            "entrypoint, phase, device, timing mode, synchronization, warmup, capture step, and capture contract must match",
+        ));
     }
 }
 
-fn measured_samples(docs: &[TraceDocument], cohort: &str, reasons: &mut Vec<String>) -> Vec<u64> {
+fn measured_samples(
+    docs: &[TraceDocument],
+    cohort: &str,
+    reasons: &mut Vec<ComparisonReason>,
+) -> Vec<u64> {
     docs.iter()
         .enumerate()
         .map(|(index, doc)| {
             let health = analyze_health(doc);
             if !health.structurally_valid || !health.capture_complete {
-                reasons.push(format!(
-                    "{cohort} run {} is not a complete, structurally valid capture",
-                    index + 1
+                reasons.push(reason(
+                    ComparisonReasonCode::IncompleteCapture,
+                    format!(
+                        "{cohort} run {} is not a complete, structurally valid capture",
+                        index + 1
+                    ),
                 ));
             }
             if doc.run.capture_contract.measurement_scope != MeasurementScope::ProductionEquivalent
             {
-                reasons.push(format!(
-                    "{cohort} run {} is not declared production-equivalent",
-                    index + 1
+                reasons.push(reason(
+                    ComparisonReasonCode::NotProductionEquivalent,
+                    format!(
+                        "{cohort} run {} is not declared production-equivalent",
+                        index + 1
+                    ),
                 ));
             }
             if !doc.run.device.starts_with("cpu") && !doc.run.measured_region_device_synchronized {
-                reasons.push(format!(
-                    "{cohort} run {} does not synchronize its measured device region",
-                    index + 1
+                reasons.push(reason(
+                    ComparisonReasonCode::UnsynchronizedDeviceRegion,
+                    format!(
+                        "{cohort} run {} does not synchronize its measured device region",
+                        index + 1
+                    ),
                 ));
             }
             let values = doc
@@ -490,9 +558,12 @@ fn measured_samples(docs: &[TraceDocument], cohort: &str, reasons: &mut Vec<Stri
                 .map(|span| span.duration_ns)
                 .collect::<Vec<_>>();
             if values.len() != 1 {
-                reasons.push(format!(
-                    "{cohort} run {} does not contain exactly one closed measured region",
-                    index + 1
+                reasons.push(reason(
+                    ComparisonReasonCode::MeasuredRegionCountInvalid,
+                    format!(
+                        "{cohort} run {} does not contain exactly one closed measured region",
+                        index + 1
+                    ),
                 ));
             }
             values.into_iter().next().unwrap_or(0)
@@ -503,7 +574,7 @@ fn measured_samples(docs: &[TraceDocument], cohort: &str, reasons: &mut Vec<Stri
 fn common_identity(
     baseline: &[TraceDocument],
     candidate: &[TraceDocument],
-    reasons: &mut Vec<String>,
+    reasons: &mut Vec<ComparisonReason>,
 ) -> Option<ComparisonIdentity> {
     let identities = baseline
         .iter()
@@ -511,15 +582,24 @@ fn common_identity(
         .map(|doc| doc.run.comparison_identity.as_ref())
         .collect::<Vec<_>>();
     let Some(first) = identities.first().copied().flatten() else {
-        reasons.push("comparison identity is missing".into());
+        reasons.push(reason(
+            ComparisonReasonCode::IdentityMissing,
+            "comparison identity is missing",
+        ));
         return None;
     };
     if identities.iter().any(|identity| identity.is_none()) {
-        reasons.push("comparison identity is missing from one or more runs".into());
+        reasons.push(reason(
+            ComparisonReasonCode::IdentityMissing,
+            "comparison identity is missing from one or more runs",
+        ));
         return None;
     }
     if let Err(error) = first.validate() {
-        reasons.push(format!("comparison identity is invalid: {error}"));
+        reasons.push(reason(
+            ComparisonReasonCode::IdentityInvalid,
+            format!("comparison identity is invalid: {error}"),
+        ));
         return None;
     }
     if identities
@@ -527,10 +607,10 @@ fn common_identity(
         .flatten()
         .any(|identity| !same_conditions(first, identity))
     {
-        reasons.push(
-            "workload, model, configuration, data, seed, batch, precision, or device state differs"
-                .into(),
-        );
+        reasons.push(reason(
+            ComparisonReasonCode::IdentityConditionsDiffer,
+            "workload, model, configuration, data, seed, batch, precision, or device state differs",
+        ));
         return None;
     }
     let mut result = first.clone();
@@ -542,7 +622,7 @@ fn common_identity(
 fn cohort_implementation_id(
     documents: &[TraceDocument],
     cohort: &str,
-    reasons: &mut Vec<String>,
+    reasons: &mut Vec<ComparisonReason>,
 ) -> Option<String> {
     let implementation_ids = documents
         .iter()
@@ -555,12 +635,16 @@ fn cohort_implementation_id(
         })
         .collect::<Vec<_>>();
     let Some(first) = implementation_ids.first().copied().flatten() else {
-        reasons.push(format!("{cohort} implementation ID is missing"));
+        reasons.push(reason(
+            ComparisonReasonCode::ImplementationIdMissing,
+            format!("{cohort} implementation ID is missing"),
+        ));
         return None;
     };
     if implementation_ids.iter().any(|identity| identity.is_none()) {
-        reasons.push(format!(
-            "{cohort} implementation ID is missing from one or more runs"
+        reasons.push(reason(
+            ComparisonReasonCode::ImplementationIdMissing,
+            format!("{cohort} implementation ID is missing from one or more runs"),
         ));
         return None;
     }
@@ -569,7 +653,10 @@ fn cohort_implementation_id(
         .flatten()
         .any(|identity| identity.trim().is_empty())
     {
-        reasons.push(format!("{cohort} implementation ID must not be empty"));
+        reasons.push(reason(
+            ComparisonReasonCode::ImplementationIdEmpty,
+            format!("{cohort} implementation ID must not be empty"),
+        ));
         return None;
     }
     if implementation_ids
@@ -577,8 +664,9 @@ fn cohort_implementation_id(
         .flatten()
         .any(|identity| *identity != first)
     {
-        reasons.push(format!(
-            "{cohort} implementation ID differs within the cohort"
+        reasons.push(reason(
+            ComparisonReasonCode::ImplementationIdInconsistent,
+            format!("{cohort} implementation ID differs within the cohort"),
         ));
         return None;
     }
@@ -600,7 +688,7 @@ fn same_conditions(left: &ComparisonIdentity, right: &ComparisonIdentity) -> boo
 fn pair_samples(
     baseline: &[TraceDocument],
     candidate: &[TraceDocument],
-    reasons: &mut Vec<String>,
+    reasons: &mut Vec<ComparisonReason>,
 ) -> Option<Vec<(u64, u64)>> {
     let any_pair_id = baseline.iter().chain(candidate).any(|doc| {
         doc.run
@@ -612,7 +700,7 @@ fn pair_samples(
     if !any_pair_id {
         return None;
     }
-    let collect = |docs: &[TraceDocument]| -> Result<BTreeMap<String, u64>, &'static str> {
+    let collect = |docs: &[TraceDocument]| -> Result<BTreeMap<String, u64>, ComparisonReason> {
         let mut values = BTreeMap::new();
         for doc in docs {
             let pair = doc
@@ -620,35 +708,51 @@ fn pair_samples(
                 .comparison_identity
                 .as_ref()
                 .and_then(|identity| identity.pair_id.clone())
-                .ok_or("pair IDs must be present on every run when pairing is requested")?;
+                .ok_or_else(|| {
+                    reason(
+                        ComparisonReasonCode::PairingIncomplete,
+                        "pair IDs must be present on every run when pairing is requested",
+                    )
+                })?;
             let value = doc
                 .spans
                 .iter()
                 .find(|span| span.measured && span.closed)
-                .ok_or("paired runs require one closed measured region")?
+                .ok_or_else(|| {
+                    reason(
+                        ComparisonReasonCode::PairingIncomplete,
+                        "paired runs require one closed measured region",
+                    )
+                })?
                 .duration_ns;
             if values.insert(pair, value).is_some() {
-                return Err("pair IDs must be unique within each cohort");
+                return Err(reason(
+                    ComparisonReasonCode::PairIdsDuplicated,
+                    "pair IDs must be unique within each cohort",
+                ));
             }
         }
         Ok(values)
     };
     let left = match collect(baseline) {
         Ok(values) => values,
-        Err(reason) => {
-            reasons.push(reason.into());
+        Err(cause) => {
+            reasons.push(cause);
             return None;
         }
     };
     let right = match collect(candidate) {
         Ok(values) => values,
-        Err(reason) => {
-            reasons.push(reason.into());
+        Err(cause) => {
+            reasons.push(cause);
             return None;
         }
     };
     if left.keys().collect::<BTreeSet<_>>() != right.keys().collect::<BTreeSet<_>>() {
-        reasons.push("baseline and candidate pair-ID sets must match exactly".into());
+        reasons.push(reason(
+            ComparisonReasonCode::PairSetsMismatch,
+            "baseline and candidate pair-ID sets must match exactly",
+        ));
         return None;
     }
     Some(
@@ -901,10 +1005,12 @@ mod tests {
         let result = compare_test_replicates(&baseline, &candidate);
         assert!(!result.comparable);
         assert_eq!(result.verdict, ComparisonVerdict::Ineligible);
-        assert!(result
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("not a complete, structurally valid capture")));
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == ComparisonReasonCode::IncompleteCapture
+                && reason
+                    .message
+                    .contains("not a complete, structurally valid capture")
+        }));
 
         let mut zero_batch = baseline.clone();
         for document in &mut zero_batch {
@@ -957,14 +1063,14 @@ mod tests {
         let result = compare_test_replicates(&baseline, &candidate);
         assert!(!result.comparable);
         assert_eq!(result.verdict, ComparisonVerdict::Ineligible);
-        assert!(result
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("at least 5")));
-        assert!(result
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("unique")));
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == ComparisonReasonCode::InsufficientRuns
+                && reason.message.contains("at least 5")
+        }));
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == ComparisonReasonCode::DuplicateRunIds
+                && reason.message.contains("unique")
+        }));
     }
 
     #[test]
@@ -984,10 +1090,10 @@ mod tests {
         let result = compare_test_replicates(&baseline, &candidate);
         assert!(!result.comparable);
         assert!(!result.paired);
-        assert!(result
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("every run")));
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == ComparisonReasonCode::PairingIncomplete
+                && reason.message.contains("every run")
+        }));
     }
 
     #[test]
@@ -1004,9 +1110,17 @@ mod tests {
             .map(|i| run("next", i, 90 + i as u64, None))
             .collect::<Vec<_>>();
 
-        for (implementation_id, expected_reason) in [
-            (None, "missing"),
-            (Some("   ".to_string()), "must not be empty"),
+        for (implementation_id, expected_code, expected_reason) in [
+            (
+                None,
+                ComparisonReasonCode::ImplementationIdMissing,
+                "missing",
+            ),
+            (
+                Some("   ".to_string()),
+                ComparisonReasonCode::ImplementationIdEmpty,
+                "must not be empty",
+            ),
         ] {
             let mut invalid = baseline.clone();
             invalid[0]
@@ -1018,10 +1132,9 @@ mod tests {
             let result = compare_test_replicates(&invalid, &candidate);
             assert!(!result.comparable);
             assert_eq!(result.verdict, ComparisonVerdict::Ineligible);
-            assert!(result
-                .reasons
-                .iter()
-                .any(|reason| reason.contains(expected_reason)));
+            assert!(result.reasons.iter().any(|reason| {
+                reason.code == expected_code && reason.message.contains(expected_reason)
+            }));
         }
 
         let mut inconsistent = candidate.clone();
@@ -1033,9 +1146,9 @@ mod tests {
             .implementation_id = Some("another-build".into());
         let result = compare_test_replicates(&baseline, &inconsistent);
         assert!(!result.comparable);
-        assert!(result
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("differs within")));
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == ComparisonReasonCode::ImplementationIdInconsistent
+                && reason.message.contains("differs within")
+        }));
     }
 }

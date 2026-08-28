@@ -3,7 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use candle_graph::cli::trace_cli::{load_evidence, run_query, run_summary, TraceQueryKind};
+use candle_graph::cli::trace_cli::{
+    load_evidence, run_query, run_summary, QueryLabelFilter, TraceQueryKind,
+};
 use candle_graph::nsight::{
     CaptureCorrelation, CaptureHardware, CaptureManifest, CaptureRun, CaptureTool,
     GpuEvidenceStatus, ManifestArtifact, ProvenanceBindingState, CAPTURE_MANIFEST_SCHEMA,
@@ -279,7 +281,7 @@ fn raw_trace_gpu_status_is_explicitly_unavailable() {
     let (trace, _) = publish_augmented_bundle(&root.0);
     let output = root.0.join("raw-status.json");
 
-    run_query(&trace, TraceQueryKind::GpuStatus, Some(&output)).unwrap();
+    run_query(&trace, TraceQueryKind::GpuStatus, None, Some(&output)).unwrap();
     let query = read_json(&output);
     assert_eq!(query["input"]["kind"], "raw_trace");
     assert_eq!(query["result"]["status"], "unavailable");
@@ -299,9 +301,9 @@ fn gpu_summary_and_queries_use_verified_bounded_bundle_evidence() {
     let root = TempRoot::new("gpu-queries");
     let (_, bundle) = publish_augmented_bundle(&root.0);
     let summary_path = root.0.join("summary.json");
-    run_summary(&bundle, Some(&summary_path)).unwrap();
+    run_summary(&bundle, Some(&summary_path), false).unwrap();
     let summary = read_json(&summary_path);
-    assert_eq!(summary["schema"], "candle-graph/summary/4");
+    assert_eq!(summary["schema"], "candle-graph/summary/5");
     assert_eq!(summary["input"]["kind"], "verified_bundle");
     assert!(summary["input"]["gpu_identity_bound"].as_bool().unwrap());
     assert_eq!(summary["gpu"]["status"], "available");
@@ -316,9 +318,9 @@ fn gpu_summary_and_queries_use_verified_bounded_bundle_evidence() {
     ];
     for (kind, name) in cases {
         let output = root.0.join(format!("{name}.json"));
-        run_query(&bundle, kind, Some(&output)).unwrap();
+        run_query(&bundle, kind, None, Some(&output)).unwrap();
         let query = read_json(&output);
-        assert_eq!(query["schema"], "candle-graph/trace-query/4");
+        assert_eq!(query["schema"], "candle-graph/trace-query/5");
         assert_eq!(query["kind"], name);
         assert_eq!(query["input"]["kind"], "verified_bundle");
         assert_eq!(query["result"]["status"], "available");
@@ -356,6 +358,7 @@ fn partial_gpu_reports_remain_unknown_in_report_specific_queries() {
     run_query(
         &kernel_bundle,
         TraceQueryKind::GpuStatus,
+        None,
         Some(&status_path),
     )
     .unwrap();
@@ -377,7 +380,7 @@ fn partial_gpu_reports_remain_unknown_in_report_specific_queries() {
         (TraceQueryKind::GpuAttributionGaps, "gaps"),
     ] {
         let output = kernel_root.0.join(format!("{name}.json"));
-        run_query(&kernel_bundle, kind, Some(&output)).unwrap();
+        run_query(&kernel_bundle, kind, None, Some(&output)).unwrap();
         let query = read_json(&output);
         assert_eq!(query["result"]["status"], "unavailable");
         assert!(query["result"]["reason"]
@@ -398,6 +401,7 @@ fn partial_gpu_reports_remain_unknown_in_report_specific_queries() {
     run_query(
         &projection_bundle,
         TraceQueryKind::GpuCorrelation,
+        None,
         Some(&correlation_path),
     )
     .unwrap();
@@ -409,6 +413,7 @@ fn partial_gpu_reports_remain_unknown_in_report_specific_queries() {
     run_query(
         &projection_bundle,
         TraceQueryKind::GpuPhases,
+        None,
         Some(&phases_path),
     )
     .unwrap();
@@ -426,6 +431,7 @@ fn partial_gpu_reports_remain_unknown_in_report_specific_queries() {
     run_query(
         &projection_bundle,
         TraceQueryKind::GpuKernels,
+        None,
         Some(&kernels_path),
     )
     .unwrap();
@@ -441,6 +447,7 @@ fn partial_gpu_reports_remain_unknown_in_report_specific_queries() {
     run_query(
         &broken_bundle,
         TraceQueryKind::GpuKernels,
+        None,
         Some(&broken_path),
     )
     .unwrap();
@@ -461,30 +468,30 @@ fn summary_and_query_outputs_cannot_modify_a_verified_bundle() {
     let initial_evidence = fs::read(bundle.join("evidence.json")).unwrap();
 
     let direct_overwrite = bundle.join("evidence.json");
-    let direct_error = run_summary(&bundle, Some(&direct_overwrite)).unwrap_err();
+    let direct_error = run_summary(&bundle, Some(&direct_overwrite), false).unwrap_err();
     assert!(direct_error.to_string().contains("inside verified bundle"));
 
     let injected = bundle.join("injected.json");
     let injection_error =
-        run_query(&bundle, TraceQueryKind::GpuStatus, Some(&injected)).unwrap_err();
+        run_query(&bundle, TraceQueryKind::GpuStatus, None, Some(&injected)).unwrap_err();
     assert!(injection_error
         .to_string()
         .contains("inside verified bundle"));
     assert!(!injected.exists());
 
     let dotdot = bundle.join("nsight/../dotdot.json");
-    let dotdot_error = run_summary(&bundle, Some(&dotdot)).unwrap_err();
+    let dotdot_error = run_summary(&bundle, Some(&dotdot), false).unwrap_err();
     assert!(dotdot_error.to_string().contains("inside verified bundle"));
     assert!(!bundle.join("dotdot.json").exists());
 
     let traversing = bundle.join("new-directory/../../outside.json");
-    let traversing_error = run_summary(&bundle, Some(&traversing)).unwrap_err();
+    let traversing_error = run_summary(&bundle, Some(&traversing), false).unwrap_err();
     assert!(traversing_error
         .to_string()
         .contains("inside verified bundle"));
     assert!(!bundle.join("new-directory").exists());
 
-    let root_error = run_summary(&bundle, Some(&bundle)).unwrap_err();
+    let root_error = run_summary(&bundle, Some(&bundle), false).unwrap_err();
     assert!(root_error.to_string().contains("inside verified bundle"));
     assert_eq!(verify_bundle(&bundle).unwrap(), initial_receipt);
     assert_eq!(
@@ -505,13 +512,14 @@ fn import_view_compare_verify_and_report_cannot_modify_a_verified_bundle() {
     assert!(import_error.to_string().contains("inside verified bundle"));
     assert!(!bundle.join("import.json").exists());
 
-    let verify_error = run_verify(&bundle, Some(&bundle.join("receipt.json"))).unwrap_err();
+    let verify_error = run_verify(&bundle, false, Some(&bundle.join("receipt.json"))).unwrap_err();
     assert!(verify_error.to_string().contains("inside verified bundle"));
     assert!(!bundle.join("receipt.json").exists());
 
     let compare_error = run_compare(
         std::slice::from_ref(&bundle),
         std::slice::from_ref(&bundle),
+        false,
         false,
         Some(&bundle.join("comparison.json")),
     )
@@ -528,7 +536,7 @@ fn import_view_compare_verify_and_report_cannot_modify_a_verified_bundle() {
         assert!(!bundle.join("view.html").exists());
     }
 
-    let report_error = run_report(&trace, None, &bundle.join("nested-bundle")).unwrap_err();
+    let report_error = run_report(&trace, None, &bundle.join("nested-bundle"), None).unwrap_err();
     assert!(report_error.to_string().contains("inside existing bundle"));
     assert!(!bundle.join("nested-bundle").exists());
 
@@ -545,7 +553,7 @@ fn output_symlink_alias_into_verified_bundle_is_rejected() {
     std::os::unix::fs::symlink(&bundle, &alias).unwrap();
     let output = alias.join("injected.json");
 
-    let error = run_query(&bundle, TraceQueryKind::GpuStatus, Some(&output)).unwrap_err();
+    let error = run_query(&bundle, TraceQueryKind::GpuStatus, None, Some(&output)).unwrap_err();
     assert!(error.to_string().contains("inside verified bundle"));
     assert!(!bundle.join("injected.json").exists());
     assert_eq!(verify_bundle(&bundle).unwrap(), initial_receipt);
@@ -577,7 +585,7 @@ fn slowest_host_query_only_reports_measured_scope_headlines() {
     let root = TempRoot::new("slowest-host-scope");
     let (trace, _) = publish_augmented_bundle(&root.0);
     let output = root.0.join("slowest-host.json");
-    run_query(&trace, TraceQueryKind::SlowestHost, Some(&output)).unwrap();
+    run_query(&trace, TraceQueryKind::SlowestHost, None, Some(&output)).unwrap();
     let query = read_json(&output);
 
     assert!(query["result"].get("slowest_host_spans").is_some());
@@ -616,13 +624,13 @@ fn summary_and_query_surface_ordered_tensor_stats() {
     write_jsonl(&trace, &document.to_events()).unwrap();
 
     let summary_path = root.0.join("summary.json");
-    run_summary(&trace, Some(&summary_path)).unwrap();
+    run_summary(&trace, Some(&summary_path), false).unwrap();
     let summary = read_json(&summary_path);
     assert_eq!(summary["tensor_stats"]["events"], 2);
     assert_eq!(summary["tensor_stats"]["non_finite_events"], 1);
 
     let query_path = root.0.join("query.json");
-    run_query(&trace, TraceQueryKind::TensorStats, Some(&query_path)).unwrap();
+    run_query(&trace, TraceQueryKind::TensorStats, None, Some(&query_path)).unwrap();
     let query = read_json(&query_path);
     assert_eq!(query["result"][0]["label"], "seam/out_y");
     assert_eq!(query["result"][1]["label"], "seam/gate_logits");
@@ -649,6 +657,254 @@ fn augmented_inputs_fail_closed_instead_of_falling_back_to_trace_only() {
     fs::write(unverified.join("evidence.json"), b"{}").unwrap();
     let error = load_evidence(&unverified.join("trace.jsonl")).unwrap_err();
     assert!(error.to_string().contains("refusing to discard"));
+}
+
+#[test]
+fn overview_is_bounded_and_identifies_the_tool() {
+    use candle_graph::cli::trace_cli::run_overview;
+
+    let root = TempRoot::new("overview");
+    let (_, bundle) = publish_augmented_bundle(&root.0);
+    let output = root.0.join("overview.json");
+    run_overview(&bundle, Some(&output)).unwrap();
+    let overview = read_json(&output);
+
+    assert_eq!(overview["schema"], "candle-graph/overview/1");
+    assert_eq!(overview["tool"]["package"], "candle-graph");
+    assert_eq!(overview["tool"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(overview["input"]["kind"], "verified_bundle");
+    assert!(overview["health"]["structurally_valid"].as_bool().unwrap());
+    assert!(overview["health"]["capture_complete"].as_bool().unwrap());
+    assert!(overview["health"]["error_count"].is_u64());
+    assert!(overview["health"]["warning_count"].is_u64());
+    for section in ["findings", "gaps"] {
+        for field in ["total", "displayed", "truncated"] {
+            assert!(
+                overview[section].get(field).is_some(),
+                "overview.{section}.{field} must exist"
+            );
+        }
+    }
+    assert_eq!(overview["counts"]["graph_spans"], 2);
+    assert_eq!(overview["timing"]["entrypoint"], "demo::update");
+    assert!(
+        overview["timing"]["slowest_host_spans"]["rows"]
+            .as_array()
+            .unwrap()
+            .len()
+            <= 5
+    );
+    assert_eq!(overview["gpu"]["status"], "available");
+
+    // The overview must never embed the full spans array: every graph span row
+    // serializes a `parent_id` field, which no bounded headline row carries.
+    let rendered = serde_json::to_string(&overview).unwrap();
+    assert!(!rendered.contains("parent_id"));
+}
+
+#[test]
+fn query_label_prefix_filters_tensor_stats_completely() {
+    let root = TempRoot::new("label-prefix");
+    let trace = root.0.join("trace.jsonl");
+    let mut document = trace_document();
+    document.tensor_stats = vec![
+        TensorStatsEvent {
+            span_id: "gpu".into(),
+            label: "seam/out_y".into(),
+            shape: vec![2, 3],
+            dtype: "f32".into(),
+            elements: 6,
+            non_finite: 0,
+            rms: 1.0,
+            abs_max: 2.0,
+            mean: 0.25,
+        },
+        TensorStatsEvent {
+            span_id: "gpu".into(),
+            label: "seam/gate_logits".into(),
+            shape: vec![2],
+            dtype: "f32".into(),
+            elements: 2,
+            non_finite: 1,
+            rms: 0.0,
+            abs_max: 0.0,
+            mean: 0.0,
+        },
+    ];
+    write_jsonl(&trace, &document.to_events()).unwrap();
+
+    let output = root.0.join("query.json");
+    run_query(
+        &trace,
+        TraceQueryKind::TensorStats,
+        Some(&QueryLabelFilter::Prefix("seam/gate".into())),
+        Some(&output),
+    )
+    .unwrap();
+    let query = read_json(&output);
+    assert_eq!(query["schema"], "candle-graph/trace-query/5");
+    assert_eq!(query["tool"]["package"], "candle-graph");
+    assert_eq!(query["filter"]["label_prefix"], "seam/gate");
+    assert!(query["filter"]["label"].is_null());
+    assert_eq!(query["result"]["total"], 2);
+    assert_eq!(query["result"]["matched"], 1);
+    let rows = query["result"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["label"], "seam/gate_logits");
+}
+
+#[test]
+fn query_label_filter_on_unsupported_kind_errors() {
+    let root = TempRoot::new("label-unsupported");
+    let (trace, _) = publish_augmented_bundle(&root.0);
+    let error = run_query(
+        &trace,
+        TraceQueryKind::Memory,
+        Some(&QueryLabelFilter::Exact("seam/out_y".into())),
+        Some(&root.0.join("query.json")),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "query kind memory does not support label filtering"
+    );
+    assert!(!root.0.join("query.json").exists());
+}
+
+#[test]
+fn verify_envelope_reports_receipt_and_semantic_rederivation() {
+    use candle_graph::cli::trace_cli::run_verify;
+
+    let root = TempRoot::new("verify-envelope");
+    let (_, bundle) = publish_augmented_bundle(&root.0);
+
+    let plain = root.0.join("verify.json");
+    run_verify(&bundle, false, Some(&plain)).unwrap();
+    let envelope = read_json(&plain);
+    assert_eq!(envelope["schema"], "candle-graph/verify/1");
+    assert_eq!(envelope["tool"]["package"], "candle-graph");
+    assert_eq!(envelope["tool"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(envelope["receipt"]["run_id"], "cli-bundle-run");
+    assert_eq!(
+        envelope["receipt"]["schema"],
+        "candle-graph/bundle-verification/1"
+    );
+    assert!(envelope["semantic"].is_null());
+
+    let semantic = root.0.join("verify-semantic.json");
+    run_verify(&bundle, true, Some(&semantic)).unwrap();
+    let envelope = read_json(&semantic);
+    assert_eq!(envelope["semantic"]["status"], "rederived_match");
+}
+
+#[cfg(feature = "visualizer")]
+#[test]
+fn view_rejects_external_nsight_dir_for_bundle_inputs() {
+    use candle_graph::cli::trace_cli::run_view;
+
+    let root = TempRoot::new("view-bundle-nsight");
+    let (_, bundle) = publish_augmented_bundle(&root.0);
+    let output = root.0.join("view.html");
+    let error = run_view(&bundle, &output, Some(&root.0.join("nsight-input"))).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("already bind their Nsight evidence"));
+    assert!(!output.exists());
+
+    // Without --nsight-dir the bundle renders from its verified packet.
+    run_view(&bundle, &output, None).unwrap();
+    assert!(output.exists());
+}
+
+#[test]
+fn report_emits_a_publication_receipt() {
+    use candle_graph::cli::trace_cli::run_report;
+
+    let root = TempRoot::new("report-receipt");
+    let trace = root.0.join("raw.jsonl");
+    write_jsonl(&trace, &trace_document().to_events()).unwrap();
+    let bundle = root.0.join("published");
+    let receipt_path = root.0.join("receipt.json");
+    run_report(&trace, None, &bundle, Some(&receipt_path)).unwrap();
+    let receipt = read_json(&receipt_path);
+    assert_eq!(receipt["schema"], "candle-graph/publication/1");
+    assert_eq!(receipt["status"], "published");
+    assert_eq!(receipt["run_id"], "cli-bundle-run");
+    assert_eq!(
+        receipt["verification"]["schema"],
+        "candle-graph/bundle-verification/1"
+    );
+    assert!(bundle.join("bundle.json").is_file());
+
+    // Receipts cannot be written into the just-published bundle.
+    let error = run_report(
+        &trace,
+        None,
+        &root.0.join("second"),
+        Some(&root.0.join("second/receipt.json")),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("inside verified bundle"));
+}
+
+#[test]
+fn campaign_status_and_series_reconcile_published_bundles() {
+    use candle_graph::cli::trace_cli::{run_campaign_status, run_series};
+
+    let root = TempRoot::new("campaign");
+    for step in [1_u64, 2] {
+        let mut document = trace_document();
+        document.run.capture_step = step;
+        document.run.run_id = format!("cli-bundle-run-{step}");
+        let trace = root.0.join(format!("raw-{step}.jsonl"));
+        write_jsonl(&trace, &document.to_events()).unwrap();
+        publish_bundle(&root.0.join(format!("bundles/step-{step}")), &trace, None).unwrap();
+    }
+    let manifest = serde_json::json!({
+        "schema": "candle-graph/campaign/1",
+        "campaign_id": "demo-campaign",
+        "entrypoint": "demo::update",
+        "planned": [
+            {"capture_step": 1, "bundle": "bundles/step-1"},
+            {"capture_step": 2, "bundle": "bundles/step-2"},
+            {"capture_step": 3, "bundle": "bundles/step-3"},
+        ],
+    });
+    let manifest_path = root.0.join("campaign.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let status_path = root.0.join("status.json");
+    run_campaign_status(&manifest_path, Some(&status_path)).unwrap();
+    let status = read_json(&status_path);
+    assert_eq!(status["schema"], "candle-graph/campaign-status/1");
+    assert_eq!(status["published"], 2);
+    assert_eq!(status["missing"], 1);
+
+    // A partially published campaign cannot become a series; the error names
+    // the offending steps and suggests the reconciliation command.
+    let error = run_series(Some(&manifest_path), &[], None, None).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("step 3"));
+    assert!(message.contains("missing"));
+    assert!(message.contains("campaign-status"));
+
+    // Explicit bundle mode bypasses the manifest.
+    let series_path = root.0.join("series.json");
+    run_series(
+        None,
+        &[root.0.join("bundles/step-1"), root.0.join("bundles/step-2")],
+        Some("seam/"),
+        Some(&series_path),
+    )
+    .unwrap();
+    let series = read_json(&series_path);
+    assert_eq!(series["schema"], "candle-graph/series/1");
+    assert_eq!(series["inputs"].as_array().unwrap().len(), 2);
+    assert_eq!(series["label_prefix"], "seam/");
 }
 
 #[test]

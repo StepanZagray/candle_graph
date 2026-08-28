@@ -105,27 +105,32 @@ failed captures.
 ## Inspect the trace
 
 ```bash
-# Human-readable overview on stdout.
+# Bounded first look (recommended for agents; truncated lists say so explicitly).
+cargo candle-graph overview application.jsonl
+
+# Semantic summary on stdout.
 cargo candle-graph summary application.jsonl
 
 # Focused JSON queries.
 cargo candle-graph query application.jsonl --kind slowest-host
-cargo candle-graph query application.jsonl --kind tensor-stats
+cargo candle-graph query application.jsonl --kind tensor-stats --label-prefix loss/
 cargo candle-graph query application.jsonl --kind memory --output memory.json
 
 # One offline HTML file (default feature).
 cargo candle-graph view application.jsonl --output viewer.html
 
-# Atomic bundle containing trace, evidence, report, hashes, and viewer.
+# Atomic bundle containing trace, evidence, report, hashes, and viewer;
+# emits a publication receipt.
 cargo candle-graph report application.jsonl --bundle evidence-bundle
 cargo candle-graph verify evidence-bundle --output verification.json
 ```
 
-`summary`, `import`, and `query` accept either a raw trace or a finalized bundle. Prefer a bundle
-when one exists: it is deeply verified and preserves its bound Nsight evidence. Some focused
-queries have fixed row caps, but collection queries such as `memory`, `spans`, `tensors`,
-`tensor-stats`, and `gradients` can grow with the trace. The
-[CLI reference](docs/cli-reference.md) lists every command, input type, query, and size property.
+`overview`, `summary`, `import`, and `query` accept either a raw trace or a finalized bundle.
+Prefer a bundle when one exists: it is deeply verified and preserves its bound Nsight evidence.
+`overview` is hard-bounded; some focused queries have fixed row caps, and unfiltered collection
+queries such as `memory`, `spans`, `tensors`, `tensor-stats`, and `gradients` can grow with the
+trace. The [CLI reference](docs/cli-reference.md) lists every command, input type, query, and
+size property.
 
 ## Add Nsight Systems evidence
 

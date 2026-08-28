@@ -38,9 +38,12 @@ Single-context layout: `CONTEXT.md` at the repo root and ADRs under `docs/adr/`.
 | `all` | `visualizer` plus `candle` |
 
 Details: [`docs/features.md`](docs/features.md), [`docs/runtime-analysis-guide.md`](docs/runtime-analysis-guide.md).
-Prefer focused CLI queries over loading a full evidence packet. Check [`docs/cli-reference.md`](docs/cli-reference.md):
-GPU and ranking queries are capped, while memory, spans, tensors, tensor statistics, and gradients
-return complete collections.
+Prefer focused CLI queries over loading a full evidence packet. Start with `overview` — a
+hard-bounded first look that never emits unbounded collections — then narrow with `query`, whose
+`--label` / `--label-prefix` flags filter spans, tensors, tensor statistics, and gradients. Check
+[`docs/cli-reference.md`](docs/cli-reference.md): GPU and ranking queries are capped, while
+unfiltered memory, spans, tensors, tensor statistics, and gradients queries return complete
+collections.
 
 ### UI / UX (HTML visualizer)
 
@@ -65,8 +68,10 @@ Prefer improving the existing visualizer over introducing a frontend framework.
 | `evidence.rs` | Unified capability-qualified evidence packets |
 | `comparison.rs` | Replicated verified-bundle comparisons |
 | `artifact.rs` | Atomic bundle publication and deep verification receipts |
+| `publication.rs` | `CaptureRun` capture-to-bundle publication with idempotent crash reconciliation |
+| `campaign.rs` | Campaign manifest/status reconciliation and cross-bundle series |
 | `nsight.rs` | Normalize supported official Nsight CSV reports |
-| `cli/trace_cli.rs` | `import`, `view`, `summary`, `query`, `compare`, `report`, `verify` |
+| `cli/trace_cli.rs` | `protocol`, `overview`, `import`, `view`, `summary`, `query`, `compare`, `report`, `verify`, `campaign-status`, `series` |
 | `viewer/` | `render_evidence_html` (`candle-graph/viewer/5`) |
 
 There is no static Rust analysis layer in this crate.

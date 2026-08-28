@@ -6,7 +6,7 @@ optional.
 | Feature | Default | Adds |
 | --- | --- | --- |
 | `visualizer` | yes | `viewer` module, `view` CLI command, and `viewer.html` in published bundles |
-| `candle` | no | `candle-core` plus tensor/op capture helpers and `TraceSession::record_tensor_stats` |
+| `candle` | no | `candle-core` plus tensor/op capture helpers, `TraceSession::record_tensor_stats`, and `GradientCapturePlan` |
 | `all` | no | Alias for `visualizer` and `candle` |
 
 The exact manifest definition is:
@@ -27,7 +27,8 @@ With `--no-default-features`, the crate still provides:
 - health, timing, and memory analysis;
 - graph and evidence construction;
 - replicated comparison;
-- atomic bundle publication and verification; and
+- atomic bundle publication (`CaptureRun`) and verification;
+- campaign status and series assembly; and
 - official Nsight CSV normalization.
 
 The binaries still compile, but the `view` subcommand is absent and `report` omits `viewer.html`.

@@ -12,11 +12,9 @@ use serde::Serialize;
 
 use crate::capability::CaptureContract;
 use crate::phase::ExecutionPhase;
-#[cfg(feature = "candle")]
-use crate::trace::events::TensorStatsEvent;
 use crate::trace::events::{
     DeviceIntervalEvent, DeviceMemoryEvent, EdgeEvent, GradientEvent, MemoryEvent, OpEvent,
-    SpanEndEvent, SpanStartEvent, TensorEvent, TerminalEvent, TraceEvent,
+    SpanEndEvent, SpanStartEvent, TensorEvent, TensorStatsEvent, TerminalEvent, TraceEvent,
 };
 use crate::trace::memory::{resolve_dense_tensor_bytes, MemoryAction};
 use crate::trace::schema::{
@@ -418,11 +416,38 @@ impl TraceSession {
         Ok(())
     }
 
+    /// Record one application-computed scalar observation (loss term, gate value,
+    /// clip fraction, cosine, …) already available on the host.
+    ///
+    /// No device reductions or readbacks are triggered; the value is stored as a
+    /// single-element labeled statistic on the tensor-stats plane, so series and
+    /// comparison tooling treat it like any other labeled mechanism observation.
+    /// The evidence is observational; it never claims causal attribution.
+    pub fn record_scalar(&self, span_id: SpanId, label: &str, value: f64) -> Result<()> {
+        anyhow::ensure!(!label.trim().is_empty(), "scalar labels must not be empty");
+        let finite = value.is_finite();
+        // JSON has no NaN/inf representation; the non_finite count is
+        // authoritative and the numeric fields stay serializable.
+        let event = TensorStatsEvent {
+            span_id: span_id_string(span_id.0),
+            label: label.to_string(),
+            shape: Vec::new(),
+            dtype: "f64".into(),
+            elements: 1,
+            non_finite: u64::from(!finite),
+            rms: if finite { value.abs() } else { 0.0 },
+            abs_max: if finite { value.abs() } else { 0.0 },
+            mean: if finite { value } else { 0.0 },
+        };
+        let mut inner = self.inner.borrow_mut();
+        inner.write(&TraceEvent::TensorStats(event))
+    }
+
     /// Record device-reduced numerical statistics for a caller-labeled Candle tensor.
     #[cfg(feature = "candle")]
     pub fn record_tensor_stats(
         &self,
-        span_id: &str,
+        span_id: SpanId,
         label: &str,
         tensor: &candle_core::Tensor,
     ) -> Result<()> {
@@ -465,7 +490,7 @@ impl TraceSession {
             )
         };
         let event = TensorStatsEvent {
-            span_id: span_id.to_string(),
+            span_id: span_id_string(span_id.0),
             label: label.to_string(),
             shape: tensor.dims().to_vec(),
             dtype: format!("{:?}", tensor.dtype()).to_ascii_lowercase(),
@@ -881,19 +906,19 @@ mod tests {
         let session =
             TraceSession::open(&path, ProfileRun::training("train::loss", 1, "cpu")).unwrap();
         let span = session.begin_span("forward", SpanKind::Function);
-        let span_id = format!("s{}", span.id().raw());
+        let span_id = span.id();
         let finite = Tensor::from_vec(vec![1.0f32, -2.0, 3.0, -4.0], (4,), &Device::Cpu).unwrap();
         session
-            .record_tensor_stats(&span_id, "finite", &finite)
+            .record_tensor_stats(span_id, "finite", &finite)
             .unwrap();
         let corrupt =
             Tensor::from_vec(vec![1.0f32, f32::NAN, f32::INFINITY], (3,), &Device::Cpu).unwrap();
         session
-            .record_tensor_stats(&span_id, "corrupt", &corrupt)
+            .record_tensor_stats(span_id, "corrupt", &corrupt)
             .unwrap();
         let empty = Tensor::zeros((0,), candle_core::DType::F32, &Device::Cpu).unwrap();
         session
-            .record_tensor_stats(&span_id, "empty", &empty)
+            .record_tensor_stats(span_id, "empty", &empty)
             .unwrap();
         drop(span);
         session.finish().unwrap();
@@ -910,6 +935,35 @@ mod tests {
         assert_eq!(doc.tensor_stats[2].elements, 0);
         assert_eq!(doc.tensor_stats[2].non_finite, 0);
         assert_eq!(doc.tensor_stats[2].rms, 0.0);
+    }
+
+    #[test]
+    fn scalar_observations_round_trip_as_single_element_stats() {
+        let path = temp_trace("scalar");
+        let session =
+            TraceSession::open(&path, ProfileRun::training("train::update", 1, "cpu")).unwrap();
+        let span = session.begin_span("loss", SpanKind::Function);
+        let span_id = span.id();
+        session.record_scalar(span_id, "loss/total", 1.25).unwrap();
+        session
+            .record_scalar(span_id, "loss/aux", f64::NAN)
+            .unwrap();
+        assert!(session.record_scalar(span_id, "  ", 1.0).is_err());
+        drop(span);
+        session.finish().unwrap();
+
+        let doc = parse_trace(&path).unwrap();
+        assert_eq!(doc.tensor_stats.len(), 2);
+        let total = &doc.tensor_stats[0];
+        assert_eq!(total.label, "loss/total");
+        assert_eq!(total.elements, 1);
+        assert_eq!(total.non_finite, 0);
+        assert_eq!(total.mean, 1.25);
+        assert_eq!(total.rms, 1.25);
+        assert!(total.shape.is_empty());
+        let aux = &doc.tensor_stats[1];
+        assert_eq!(aux.non_finite, 1);
+        assert_eq!(aux.mean, 0.0);
     }
 
     #[test]

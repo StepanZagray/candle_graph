@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use candle_graph::comparison::ComparisonReasonCode;
 use candle_graph::trace::{
     write_jsonl, RunOutcome, SpanRecord, TerminalEvent, TraceRunMeta, SCHEMA as TRACE_SCHEMA,
 };
@@ -150,10 +151,10 @@ fn verified_bundle_cohorts_are_the_only_eligible_public_comparison_path() {
         ComparisonInputVerification::UnverifiedTraces
     );
     assert!(unverified.confidence_interval.is_none());
-    assert!(unverified
-        .reasons
-        .iter()
-        .any(|reason| reason.contains("unverified raw trace")));
+    assert!(unverified.reasons.iter().any(|reason| {
+        reason.code == ComparisonReasonCode::UnverifiedInputs
+            && reason.message.contains("unverified raw trace")
+    }));
 }
 
 #[test]
