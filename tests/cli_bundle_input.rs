@@ -493,6 +493,48 @@ fn summary_and_query_outputs_cannot_modify_a_verified_bundle() {
     );
 }
 
+#[test]
+fn import_view_compare_verify_and_report_cannot_modify_a_verified_bundle() {
+    use candle_graph::cli::trace_cli::{run_compare, run_import, run_report, run_verify};
+
+    let root = TempRoot::new("protected-output-all-commands");
+    let (trace, bundle) = publish_augmented_bundle(&root.0);
+    let initial_receipt = verify_bundle(&bundle).unwrap();
+
+    let import_error = run_import(&bundle, Some(&bundle.join("import.json"))).unwrap_err();
+    assert!(import_error.to_string().contains("inside verified bundle"));
+    assert!(!bundle.join("import.json").exists());
+
+    let verify_error = run_verify(&bundle, Some(&bundle.join("receipt.json"))).unwrap_err();
+    assert!(verify_error.to_string().contains("inside verified bundle"));
+    assert!(!bundle.join("receipt.json").exists());
+
+    let compare_error = run_compare(
+        std::slice::from_ref(&bundle),
+        std::slice::from_ref(&bundle),
+        false,
+        Some(&bundle.join("comparison.json")),
+    )
+    .unwrap_err();
+    assert!(compare_error.to_string().contains("inside verified bundle"));
+    assert!(!bundle.join("comparison.json").exists());
+
+    #[cfg(feature = "visualizer")]
+    {
+        use candle_graph::cli::trace_cli::run_view;
+        let view_error =
+            run_view(&bundle.join("trace.jsonl"), &bundle.join("view.html"), None).unwrap_err();
+        assert!(view_error.to_string().contains("inside verified bundle"));
+        assert!(!bundle.join("view.html").exists());
+    }
+
+    let report_error = run_report(&trace, None, &bundle.join("nested-bundle")).unwrap_err();
+    assert!(report_error.to_string().contains("inside existing bundle"));
+    assert!(!bundle.join("nested-bundle").exists());
+
+    assert_eq!(verify_bundle(&bundle).unwrap(), initial_receipt);
+}
+
 #[cfg(unix)]
 #[test]
 fn output_symlink_alias_into_verified_bundle_is_rejected() {

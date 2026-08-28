@@ -1,7 +1,7 @@
 //! Cargo subcommand entrypoint: `cargo candle-graph …`.
 //!
 //! Installed as `cargo-candle-graph` so Cargo discovers it as `cargo candle-graph`.
-//! Trace and bundle commands: import, summarize, query, compare, report, verify, and view evidence.
+//! Trace and bundle commands: import, summary, query, compare, report, verify, and view evidence.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -23,14 +23,14 @@ struct CargoArgs {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Import a trace JSONL file and emit a capability-qualified evidence packet.
+    /// Emit a complete capability-qualified evidence packet.
     Import(ImportArgs),
     /// Render a standalone HTML visualizer from a trace (requires `visualizer` feature).
     #[cfg(feature = "visualizer")]
     View(ViewArgs),
     /// Emit a profiler summary for a raw trace or verified bundle/profile.
     Summary(SummaryArgs),
-    /// Run a bounded query against raw-trace or verified bundle evidence.
+    /// Run a typed query against raw-trace or verified bundle evidence.
     Query(QueryArgs),
     /// Compare a candidate profile run with an explicit baseline.
     Compare(CompareArgs),
@@ -42,7 +42,8 @@ enum Command {
 
 #[derive(Parser, Debug)]
 struct ImportArgs {
-    /// Trace JSONL file (`candle-graph/trace/10`).
+    /// Raw trace, finalized bundle/profile directory, or its `trace.jsonl`.
+    #[arg(value_name = "INPUT")]
     trace: PathBuf,
 
     #[arg(long, short, value_name = "FILE")]
@@ -52,7 +53,7 @@ struct ImportArgs {
 #[derive(Parser, Debug)]
 #[cfg(feature = "visualizer")]
 struct ViewArgs {
-    /// Trace JSONL file (`candle-graph/trace/10`).
+    /// Trace JSONL file (`candle-graph/trace/10` or readable trace/9).
     trace: PathBuf,
 
     #[arg(long, value_name = "FILE")]
@@ -79,6 +80,8 @@ struct CompareArgs {
 
 #[derive(Parser, Debug)]
 struct ReportArgs {
+    /// Raw trace JSONL file (`candle-graph/trace/10` or readable trace/9).
+    #[arg(value_name = "TRACE")]
     trace: PathBuf,
     #[arg(long, value_name = "DIR")]
     nsight_dir: Option<PathBuf>,
@@ -88,6 +91,7 @@ struct ReportArgs {
 
 #[derive(Parser, Debug)]
 struct VerifyArgs {
+    /// Finalized evidence bundle directory.
     #[arg(value_name = "BUNDLE")]
     bundle: PathBuf,
     #[arg(long, short, value_name = "FILE")]

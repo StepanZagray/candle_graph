@@ -1,240 +1,192 @@
 # candle-graph
 
-> Independent tool — not affiliated with candle-rs or Hugging Face.
+> Independent project; not affiliated with candle-rs or Hugging Face.
 
-candle-graph captures one representative Candle execution and turns it into trustworthy evidence
-for humans and building agents: capability-qualified host/device timing, tensor and gradient facts,
-logical and physical memory evidence, repeated comparisons, and provenance-bound NVIDIA Nsight
-evidence in one standalone HTML viewer.
+`candle-graph` records one selected Candle training update or inference invocation and turns that
+runtime trace into inspectable evidence. It can produce JSON for tools, a Markdown report, a
+content-addressed bundle, and one offline HTML viewer.
 
-There is no static Rust analysis. Every claim comes from one concrete run.
+The crate does **not** inspect Rust source or reconstruct execution statically. It can only report
+events that ran and that the application chose to record.
 
-## What agents get
+## What it records
 
-- `summary`: bounded provenance, structural outcome, capability matrix, GPU status, findings, gaps, and totals.
-- `query`: host/device costs, storage lifetimes, physical memory, spans, tensors, gradients, or bounded GPU evidence.
-- `compare`: at least five compatible baseline and candidate runs with raw samples and a 95% bootstrap interval.
-- `report`: an atomically published, content-addressed evidence bundle.
-- `verify`: deep bundle verification with a durable manifest-digest receipt.
-- `view`: Evidence, Trace, Span costs, Memory, and GPU views in one offline HTML file.
+| Evidence | Meaning |
+| --- | --- |
+| Host spans | A semantic call hierarchy and one caller-owned measured region |
+| Operations and tensors | Executed op metadata, backend tensor identities, shapes, dtypes, and dense footprints |
+| Tensor statistics | Caller-labelled RMS, absolute maximum, mean, and non-finite counts |
+| Gradients | Per-parameter state and norm, optionally checked against an exact manifest |
+| Logical memory | Explicit storage allocation/free lifetimes keyed by device and storage identity |
+| Physical memory | Independent device or allocator checkpoints such as used, free, and reserved bytes |
+| Device timing | Explicit intervals that remain separate from host time |
+| GPU evidence | Optional normalized NVIDIA Nsight Systems CSV reports bound to the trace by a manifest |
 
-Invalid hierarchy, incomplete spans, cycles, and inconsistent timings fail before graph analysis.
-Failed captures remain diagnosable. Missing evidence is unknown, never a silent zero.
+Absent evidence stays absent. Tensor size metadata does not become an allocation, host duration
+does not become GPU duration, and an observed event does not silently upgrade partial coverage to
+complete coverage.
 
-## Capture one update
+## Install
 
-```rust
-use candle_graph::{
-    CaptureContract, CaptureSelector, ComparisonIdentity, CoverageLevel, ExecutionStep,
-    MeasurementScope, ProfileRun, SpanKind, TraceSession,
-};
-
-let update_number = 1;
-let selector = CaptureSelector::new(1)?;
-if !selector.is_selected(update_number) {
-    return Ok(());
-}
-let run = ProfileRun::training("my_crate::train::update", 1, "cuda:0")
-    .measured_region_device_synchronized()
-    .capture_contract(CaptureContract {
-        measurement_scope: MeasurementScope::ProductionEquivalent,
-        operations: CoverageLevel::Partial,
-        tensors: CoverageLevel::Partial,
-        gradients: CoverageLevel::Partial,
-        required_semantic_labels: vec!["my_crate/update-000000000001/forward".into()],
-        ..CaptureContract::default()
-    })
-    .comparison_identity(ComparisonIdentity {
-        implementation_id: Some("build-v1".into()),
-        workload_id: "train".into(), model_id: "model-v1".into(), config_id: "default".into(),
-        data_id: "batch-set-a".into(), seed_policy: "fixed-42".into(), physical_batch: 128,
-        accumulation_steps: 1, precision: "f32".into(), device_state: "exclusive".into(),
-        pair_id: None,
-    });
-let session = TraceSession::open("application.jsonl", run)?;
-
-{
-    let _update = session.begin_measurement("my_crate/update-000000000001");
-    {
-        let _forward = session.begin_step_span(
-            "my_crate/update-000000000001/forward",
-            ExecutionStep::Forward,
-            SpanKind::Function,
-        );
-        // representative forward pass
-    }
-    // backward and optimizer use the corresponding ExecutionStep values.
-}
-
-session.finish()?;
-```
-
-`TraceSession` owns an outer envelope; `begin_measurement` marks the caller-controlled region used
-for comparisons, excluding trace finalization overhead. Capture exactly one selected update, not
-every hot-loop iteration.
-
-## Declare exact gradient coverage from a VarMap
-
-Build the manifest after model construction, sort the `VarMap` keys because its map iteration is
-not stable, and supply an application-owned family policy. Only add family contracts that have
-members:
-
-```rust
-use std::collections::BTreeMap;
-use candle_graph::{
-    CaptureContract, CoverageLevel, ExpectedGradient, GradientContract,
-    GradientFamilyContract, GradientFamilyExpectation, MeasurementScope,
-};
-use candle_nn::VarMap;
-
-fn contract_from_varmap(varmap: &VarMap) -> anyhow::Result<GradientContract> {
-    let mut keys = varmap
-        .data()
-        .lock()
-        .expect("VarMap lock poisoned")
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    keys.sort();
-
-    let mut policies = BTreeMap::new();
-    let expected = keys
-        .into_iter()
-        .map(|key| {
-            // Replace these prefixes with the application's actual parameter-family policy.
-            let (family, expectation, min_present) = if key.starts_with("frozen.") {
-                ("frozen", GradientFamilyExpectation::Inactive, 0)
-            } else if key.starts_with("conditional.") {
-                ("conditional", GradientFamilyExpectation::DataConditional, 1)
-            } else {
-                ("trainable", GradientFamilyExpectation::Active, 1)
-            };
-            policies.insert(family.to_owned(), (expectation, min_present));
-            ExpectedGradient::new("parameters", key, family)
-        })
-        .collect();
-    let families = policies
-        .into_iter()
-        .map(|(family, (expectation, min_present))| match expectation {
-            GradientFamilyExpectation::Active => {
-                GradientFamilyContract::active(family, min_present)
-            }
-            GradientFamilyExpectation::Inactive => GradientFamilyContract::inactive(family),
-            GradientFamilyExpectation::DataConditional => {
-                GradientFamilyContract::data_conditional(family, min_present)
-            }
-        })
-        .collect();
-    GradientContract::new(expected, families)
-}
-
-let gradient_contract = contract_from_varmap(&varmap)?;
-let capture_contract = CaptureContract {
-    measurement_scope: MeasurementScope::ProductionEquivalent,
-    gradients: CoverageLevel::Complete,
-    gradient_contract: Some(gradient_contract),
-    ..CaptureContract::default()
-};
-```
-
-Record every declared `(root, key)` exactly once. `Present` requires a finite positive norm,
-`Zero` requires positive `0.0`, and `Missing`/`NonFinite` carry no numeric norm. Complete coverage
-is granted only after exact key, digest, state, and family validation. The public schema constants
-are `TRACE_SCHEMA`, `EVIDENCE_SCHEMA`, `GRAPH_SCHEMA`, `COMPARISON_SCHEMA`, `BUNDLE_SCHEMA`, and
-`GRADIENT_MANIFEST_SCHEMA`.
-
-## Analyze
+From a checkout:
 
 ```bash
-cargo candle-graph summary evidence-bundle
+cargo install --path . --locked
+```
+
+The default `visualizer` feature includes the `view` command and adds `viewer.html` to published
+bundles. Add `--features all` to install the optional Candle tensor helpers as well. See
+[Cargo features](docs/features.md) for the exact feature boundaries.
+
+The package installs both `candle-graph` and the Cargo subcommand form used below:
+
+```bash
+cargo candle-graph --help
+```
+
+## Capture one invocation
+
+Open a session only for the selected one-based invocation. Put exactly one measured region inside
+the session; that region supplies the outer-wall duration used by comparisons.
+
+```rust
+use anyhow::Result;
+use candle_graph::{
+    CaptureContract, CaptureSelector, CoverageLevel, ExecutionStep, MeasurementScope, ProfileRun,
+    SpanKind, TraceSession,
+};
+
+fn maybe_capture_update(update: u64) -> Result<()> {
+    let selector = CaptureSelector::new(10)?;
+    if !selector.is_selected(update) {
+        return Ok(());
+    }
+
+    let prefix = format!("trainer/update-{update:012}");
+    let forward_label = format!("{prefix}/forward");
+    let contract = CaptureContract {
+        measurement_scope: MeasurementScope::ProfiledWork,
+        operations: CoverageLevel::Partial,
+        tensors: CoverageLevel::Partial,
+        required_semantic_labels: vec![forward_label.clone()],
+        ..CaptureContract::default()
+    };
+    let run = ProfileRun::training("trainer::update", update, "cpu")
+        .capture_contract(contract);
+    let session = TraceSession::open("application.jsonl", run)?;
+
+    {
+        let _measured = session.begin_measurement(&prefix);
+        {
+            let _forward = session.begin_step_span(
+                &forward_label,
+                ExecutionStep::Forward,
+                SpanKind::Function,
+            );
+            // Run and record the representative forward pass here.
+        }
+        // Add backward and optimizer spans for a training capture.
+    }
+
+    session.finish()?;
+    Ok(())
+}
+```
+
+For a CUDA comparison, synchronize immediately before and after the measured region and mark the
+run with `measured_region_device_synchronized()`. Use `device_synchronized()` only if every nested
+semantic span is individually synchronized; otherwise its duration is host launch time, not
+completed GPU work.
+
+The [runtime evidence guide](docs/runtime-analysis-guide.md) covers comparison identity, semantic
+labels, Candle helpers, tensor statistics, gradient contracts, memory, concurrent host spans, and
+failed captures.
+
+## Inspect the trace
+
+```bash
+# Human-readable overview on stdout.
+cargo candle-graph summary application.jsonl
+
+# Focused JSON queries.
 cargo candle-graph query application.jsonl --kind slowest-host
+cargo candle-graph query application.jsonl --kind tensor-stats
+cargo candle-graph query application.jsonl --kind memory --output memory.json
+
+# One offline HTML file (default feature).
+cargo candle-graph view application.jsonl --output viewer.html
+
+# Atomic bundle containing trace, evidence, report, hashes, and viewer.
+cargo candle-graph report application.jsonl --bundle evidence-bundle
+cargo candle-graph verify evidence-bundle --output verification.json
+```
+
+`summary`, `import`, and `query` accept either a raw trace or a finalized bundle. Prefer a bundle
+when one exists: it is deeply verified and preserves its bound Nsight evidence. Some focused
+queries have fixed row caps, but collection queries such as `memory`, `spans`, `tensors`,
+`tensor-stats`, and `gradients` can grow with the trace. The
+[CLI reference](docs/cli-reference.md) lists every command, input type, query, and size property.
+
+## Add Nsight Systems evidence
+
+Export supported reports with `nsys stats --format csv`; do not depend on Nsight's internal SQLite
+schema. Put the retained `.nsys-rep`, CSV files, and `capture-manifest.json` in one flat directory:
+
+```bash
+cargo candle-graph report application.jsonl \
+  --nsight-dir nsight \
+  --bundle evidence-bundle
+
 cargo candle-graph query evidence-bundle --kind gpu-status
 cargo candle-graph query evidence-bundle --kind gpu-correlation
 cargo candle-graph query evidence-bundle --kind gpu-phases
-cargo candle-graph query evidence-bundle --kind gpu-kernels
-cargo candle-graph query evidence-bundle --kind gpu-attribution-gaps
-cargo candle-graph query application.jsonl --kind gradients
-cargo candle-graph query application.jsonl --kind tensors
-cargo candle-graph report base-1.jsonl --bundle base-1.bundle
-# Publish the other baseline/candidate runs the same way, then compare finalized bundles.
+```
+
+Supported reports are `cuda_gpu_trace`, `cuda_gpu_kern_sum`, `cuda_api_sum`,
+`cuda_gpu_mem_time_sum`, and `nvtx_gpu_proj_trace`. The manifest binds artifact hashes, the trace
+run ID, the correlation ID, and the semantic-label contract. Missing reports remain individually
+unavailable; their row counts are not inferred as zero.
+
+## Compare implementations
+
+Timing verdicts require at least five independent, complete, production-equivalent bundles in each
+cohort. Every bundle is verified, every run keeps its raw sample, and compatible runs receive a
+deterministic 95% bootstrap interval.
+
+```bash
 cargo candle-graph compare \
   --baseline base-1.bundle base-2.bundle base-3.bundle base-4.bundle base-5.bundle \
   --candidate next-1.bundle next-2.bundle next-3.bundle next-4.bundle next-5.bundle \
   --output comparison.json
-cargo candle-graph report application.jsonl --bundle evidence-bundle
-cargo candle-graph verify evidence-bundle --output verification.json
-cargo candle-graph view application.jsonl --output viewer.html
 ```
 
-`summary` and `query` accept a raw trace, a finalized bundle/profile directory, or that bundle's
-`trace.jsonl`. Bundle inputs are deeply verified and read from their verified `evidence.json`, so
-identity-bound normalized Nsight evidence is retained. After reading, the CLI rechecks the exact
-manifest plus the consumed trace and packet instead of hashing unrelated bundle files a second
-time. These point-in-time checks narrow the verification/read race but do not provide a filesystem
-snapshot or make mutable storage atomic. Summary/query output paths that resolve to or traverse the
-bundle root or anywhere below it are rejected, including existing symbolic-link aliases. A parent containing
-`evidence.json` or `nsight/` without `bundle.json` is rejected, regardless of the input filename,
-instead of being silently treated as trace-only. Raw trace inputs from unaugmented directories
-remain supported; their GPU status is explicitly `unavailable` because no Nsight source was
-supplied.
+The capture contract, timing semantics, workload identity, model/config/data identity, batch and
+precision settings, and device state must match. Each cohort has one stable implementation ID;
+the baseline and candidate IDs may differ. Raw traces can be inspected with
+`--unverified-traces`, but that result is always diagnostic and ineligible for a timing verdict.
 
-GPU queries are bounded and qualify each required Nsight report independently; an absent report is
-`unavailable` with an unknown population, never `available` with an inferred zero. `gpu-phases`
-separates projected Nsight ranges from exact joined GPU-busy attribution. Projected-range duration
-ordering is explicitly limited to the retained earliest-original-start sample, not presented as a
-global ranking. `gpu-attribution-gaps` reports missing, unexpected, CPU-only, duplicate, and
-matched-but-unattributed semantic labels only when both projection and GPU-timeline reports exist.
-Candle host, device-event, and Nsight clocks remain separate in every result. `slowest-host` emits
-only measured-scope span headlines; it does not append unscoped operation rankings.
+## Trust model
 
-`compare` deeply verifies every bundle immediately before reading its bound trace. Raw trace
-comparison remains available through `--unverified-traces`, but its result is always marked
-diagnostic and ineligible for a performance verdict.
+- A complete trace must have one root, one measured region, closed spans, a valid hierarchy, and a
+  successful terminal event.
+- Failed captures remain parseable only when the caller explicitly finishes them with
+  `finish_failed(reason)`; they do not produce a derived execution graph or normal findings.
+- Coverage levels are producer declarations qualified by observed evidence. Exact gradient
+  coverage additionally requires a digest-bound parameter manifest and family validation.
+- Logical storage lifetime, physical memory, host time, device-event time, and Nsight time are
+  separate evidence planes.
+- A bundle manifest binds every published file. `verify` rejects missing, changed, undeclared
+  files, symbolic links, and special files.
 
-The `slowest-host` headline covers both the measured subtree and structurally separate host spans
-that overlap the measured interval. Every entry declares `scope` as `measured_subtree` or
-`concurrent_overlap` and reports full plus overlap-clipped duration/self-time fields. Concurrent
-entries retain their real parent links; overlap-clipped values are attribution, not durations to
-sum with measured wall time.
+## Documentation
 
-Add normalized official `nsys stats --format csv` reports without parsing Nsight's unstable SQLite
-export:
-
-```bash
-cargo candle-graph report application.jsonl --nsight-dir nsight \
-  --bundle evidence-bundle
-cargo candle-graph view application.jsonl --nsight-dir nsight --output viewer.html
-```
-
-The bundle retains the raw `.nsys-rep` and normalized inputs. A `capture-manifest.json` with schema
-`candle-graph/nsight-capture/1` binds their hashes and run/correlation IDs to the trace. Supported reports are `cuda_gpu_trace`,
-`cuda_gpu_kern_sum`, `cuda_api_sum`, `cuda_gpu_mem_time_sum`, and `nvtx_gpu_proj_trace`.
-Required application labels can be partitioned into `gpu_expected_semantic_labels` and
-`cpu_only_semantic_labels`; legacy contracts with neither field continue to classify every required
-label as GPU-expected. Projected CPU-only labels are reported as correlation failures.
-
-## Schemas
-
-| Schema | Role |
-| --- | --- |
-| `candle-graph/trace/10` | Execution JSONL with exact gradient contracts, tensor statistics, timing/memory planes, and terminal outcome |
-| `candle-graph/graph/5` | Validated call/data graph with mandatory measured-scope and overlap timing fields |
-| `candle-graph/evidence/4` | Capability-qualified packet with report-specific Nsight availability and graph/5 semantics |
-| `candle-graph/summary/4` | CLI summary envelope with report-qualified GPU counts |
-| `candle-graph/trace-query/4` | Bounded CLI query envelope with explicit unknowns and sample semantics |
-| `candle-graph/comparison/4` | Bundle-verified replicated outer-wall comparison with input receipts |
-| `candle-graph/viewer/5` | Offline unified viewer payload |
-| `candle-graph/gradient-manifest/1` | Ordered `(root, key, family)` digest domain |
-| `candle-graph/nsight-capture/1` | Raw-report and CSV provenance binding |
-| `candle-graph/bundle/1` | Content-addressed atomic evidence bundle |
-| `candle-graph/bundle-verification/1` | Deep bundle verification receipt |
-
-Version 0.9 rejects trace/8, evidence/3, and graph/4. Producers declaring complete gradient coverage must supply a
-`GradientContract`; otherwise use partial or none. Comparison/4 takes finalized bundle directories
-by default. Evidence/4 and comparison/4 consumers must accept their new contract/provenance fields.
-
-See [CONTEXT.md](CONTEXT.md), [runtime guide](docs/runtime-analysis-guide.md),
-[features](docs/features.md), and [visualizer](docs/visualizer.md).
+- [Documentation map](docs/README.md)
+- [Runtime evidence guide](docs/runtime-analysis-guide.md)
+- [CLI reference](docs/cli-reference.md)
+- [Schema and compatibility reference](docs/schemas.md)
+- [Cargo features](docs/features.md)
+- [HTML visualizer](docs/visualizer.md)
+- [Product context and glossary](CONTEXT.md)
 
 ## Development
 

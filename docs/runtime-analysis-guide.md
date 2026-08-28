@@ -1,157 +1,315 @@
 # Runtime evidence guide
 
-## Select one representative invocation
+This guide describes how to produce evidence that `candle-graph` can qualify. The central rule is
+simple: instrument one representative runtime invocation and describe honestly what the probe did
+and did not cover.
 
-Use `CaptureSelector::new(n)?.is_selected(invocation)` to gate a configurable one-based update or
-inference invocation before opening a session. Record a typed
-`ComparisonIdentity` and `CaptureContract`; set `implementation_id` to a stable generic build or
-implementation identity. Free-form tags are descriptive and never establish comparison
-compatibility. Instrumentation is inactive outside the selected invocation.
+## 1. Select before opening a session
 
-On CUDA, use `device_synchronized` only when every reported semantic span is bounded by device
-synchronization. If only the single measured region is synchronized, use
-`measured_region_device_synchronized`; `timing_mode` then remains `host`, so nested host spans are
-not presented as completed GPU work. Nsight or another device profiler is still required for
-kernel-level attribution.
-
-## Required shape
-
-Every trace contains one session envelope and exactly one measured region. Training captures tag
-forward, backward, and optimizer spans with `ExecutionStep`. Use the same stable semantic labels in
-NVTX, for example `trainer/update-000000000001/forward`.
-Required semantic labels form an exact cardinality contract: declarations must be non-empty and
-unique, and every declared label must occur exactly once in a successfully completed trace. A
-missing or repeated required label makes a complete capture structurally invalid; failed captures
-retain the same finding as a diagnostic warning.
+`CaptureSelector` uses one-based invocation numbers. Put the gate outside the hot-path session so
+unselected invocations do not open files or serialize events:
 
 ```rust
-let session = TraceSession::open(path, ProfileRun::training("train::update", 1, "cpu"))?;
-{
-    let _update = session.begin_measurement("workload/update-000000000001");
-    let _forward = session.begin_step_span(
-        "workload/update-000000000001/forward",
-        ExecutionStep::Forward,
-        SpanKind::Function,
-    );
-    // forward
+let selector = CaptureSelector::new(selected_invocation)?;
+if !selector.is_selected(current_invocation) {
+    return run_without_capture();
 }
+```
+
+`ProfileRun::training` and `ProfileRun::inference` record the entrypoint, selected invocation,
+warmup count, phase, device, and correlation ID. Use `tag` only for descriptive provenance; tags do
+not establish comparison compatibility.
+
+## 2. Declare the capture contract
+
+`CaptureContract` is a producer assertion. Each coverage field describes the **whole measured
+region**, not merely whether the trace happens to contain one event.
+
+| Field | Declare `complete` only when… |
+| --- | --- |
+| `operations` | every operation in scope is represented |
+| `tensors` | every tensor checkpoint required by the application policy is represented |
+| `gradients` | every exact manifest entry and family rule is represented and validated |
+| `logical_memory` | all storage allocations/frees in scope are represented |
+| `physical_memory` | the application's complete checkpoint policy ran |
+| `device_timing` | all device intervals required by the adapter policy are represented |
+
+Use `partial` for a deliberate sample and `none` when the producer did not attempt that evidence.
+Observed events can raise `none` to partial during analysis, but they never prove complete coverage.
+
+`measurement_scope` has three meanings:
+
+- `unknown`: representativeness was not established;
+- `profiled_work`: valid diagnostic work, but not claimed equivalent to production; and
+- `production_equivalent`: same relevant workload conditions as a normal run. This is required for
+  an eligible timing comparison.
+
+## 3. Record one measured region
+
+Every successful trace has one session envelope and exactly one measured region. Session setup and
+evidence publication are outside that region.
+
+```rust
+let session = TraceSession::open(
+    path,
+    ProfileRun::training("trainer::update", update, "cpu")
+        .capture_contract(contract),
+)?;
+
+{
+    let _measured = session.begin_measurement("trainer/update-000000000010");
+    {
+        let _forward = session.begin_step_span(
+            "trainer/update-000000000010/forward",
+            ExecutionStep::Forward,
+            SpanKind::Function,
+        );
+        // forward pass
+    }
+    // backward and optimizer spans
+}
+
 session.finish()?;
 ```
 
-`SpanGuard::id()` attaches op, tensor, and device-interval evidence. Tensor metadata does not imply
-an allocation lifetime. Only explicit paired `record_memory_alloc`/`record_memory_free` events,
-keyed by `(device, storage_id)`, drive logical live and peak memory. `record_device_memory` accepts
-a `DeviceMemoryRecord` whose used/free/reserved/capacity values are independently optional. It
-never derives capacity from used plus free. Neither plane fills gaps in the other.
+`SpanGuard` is RAII: dropping it emits `span_end`. Drop nested guards before finishing the session.
+`SpanGuard::id()` is the opaque identity used by op, tensor, memory, and device-interval recording
+methods.
 
-For already-completed host work that ran concurrently with the live call stack, retain its
-`std::time::Instant`, convert it with `TraceSession::host_timestamp_ns`, and later call
-`record_completed_host_span`. The explicit positive duration must end no later than the recording
-call. This emits a closed span attached to the session root without pushing or popping live span
-guards, so overlapping intervals remain siblings rather than asserting a synchronous call
-relationship.
+### Semantic labels
 
-`summary` and `query --kind slowest-host` treat host timing as a measured **scope**, not as a
-synthetic call tree. `measured_subtree` entries are the measured span and its descendants;
-`concurrent_overlap` entries are structurally separate spans whose intervals intersect the
-measured interval. Each headline entry reports full and measured-overlap-clipped inclusive
-durations, plus full and clipped host self time. Rankings use clipped self time. Keep the original
-parent links when interpreting the result, and do not add concurrent durations to measured wall
-time: overlapping sibling intervals are independent attribution views, not additive totals.
+`required_semantic_labels` is an exact cardinality contract. Every label must be non-empty and
+unique, and every declared label must name exactly one span in a successful trace. Reuse the same
+labels for NVTX ranges.
 
-With feature `candle`, `CandleCapture::from_tensor` records process-local backend tensor and
-storage identities plus a dense tensor footprint. `with_label` may attach a semantic observation
-label without replacing backend tensor identity. The footprint is shape metadata, not
-backing-allocation size; callers must pass the backend's actual allocation bytes to explicit memory
-events. Aliases with the same `(device, storage_id)` then share one logical lifetime.
+For GPU correlation, either leave both classification lists empty (legacy behavior: every required
+label is GPU-expected) or partition every required label exactly once between:
 
-## Qualify complete gradient coverage
+- `gpu_expected_semantic_labels`; and
+- `cpu_only_semantic_labels`.
 
-Construct a `GradientContract` from the final model `VarMap` before opening `TraceSession`. Read
-the named keys through `varmap.data()`, sort them, map every key to a caller-owned family, then pass
-the resulting contract in `CaptureContract { gradients: CoverageLevel::Complete,
-gradient_contract: Some(contract), .. }`. A complete capture records every declared `(root, key)`
-exactly once. The README contains a complete generic VarMap example.
+A missing, repeated, or incorrectly partitioned required label invalidates a successful capture.
+The same condition remains a diagnostic warning when the terminal outcome is failed.
 
-Family policies have precise meanings:
+## 4. Keep timing planes separate
 
-- `active(family, min_present)` requires at least that many finite, positive-norm gradients and
-  therefore rejects an all-zero active family.
-- `inactive(family)` requires every member to be explicitly `Missing`.
-- `data_conditional(family, min_present)` permits every member to be `Missing`; once any gradient
-  attaches, at least `min_present` members must be finite and positive.
+### Host timing
 
-Encode `Present` with a finite norm greater than zero, `Zero` with positive zero (`0.0`, never
-`-0.0`), and `Missing` or `NonFinite` with no norm. The ordered manifest digest hashes the
-`GRADIENT_MANIFEST_SCHEMA` bytes, one NUL byte, then every root/key/family byte string prefixed by
-its little-endian `u64` length. Current public protocol constants are `TRACE_SCHEMA` (trace/10),
-`EVIDENCE_SCHEMA` (evidence/4), `GRAPH_SCHEMA` (graph/5), and `COMPARISON_SCHEMA` (comparison/4).
+Span guards measure host wall intervals. On an asynchronous backend, this is often launch latency,
+not completed device work.
 
-## Publish evidence
+For CPU execution, host outer-wall time is comparison-eligible without a device synchronization
+flag. For CUDA or another non-CPU device, synchronize immediately before and after the measured
+region, then call `measured_region_device_synchronized()` on `ProfileRun`.
 
-```bash
-cargo candle-graph summary evidence-bundle
-cargo candle-graph query application.jsonl --kind slowest-host
-cargo candle-graph query application.jsonl --kind slowest-device
-cargo candle-graph query evidence-bundle --kind gpu-status
-cargo candle-graph query evidence-bundle --kind gpu-correlation
-cargo candle-graph query evidence-bundle --kind gpu-phases
-cargo candle-graph query evidence-bundle --kind gpu-kernels
-cargo candle-graph query evidence-bundle --kind gpu-attribution-gaps
-cargo candle-graph report application.jsonl --nsight-dir nsight --bundle evidence-bundle
-cargo candle-graph verify evidence-bundle --output verification.json
-cargo candle-graph view application.jsonl --nsight-dir nsight --output viewer.html
-cargo candle-graph compare \
-  --baseline base-1.bundle base-2.bundle base-3.bundle base-4.bundle base-5.bundle \
-  --candidate next-1.bundle next-2.bundle next-3.bundle next-4.bundle next-5.bundle
+`device_synchronized()` is stronger: it sets `timing_mode` to `device_synchronized` and asserts
+that every reported semantic span is bounded by device synchronization. Do not use it when only the
+outer measured region is synchronized.
+
+### Device intervals
+
+`record_device_interval` accepts intervals from a device timing adapter. They are grouped by
+`(device, clock_id)` and unioned across overlapping streams so simultaneous work is counted once.
+They are never aligned or added to host time unless the producer has an explicit clock mapping;
+`candle-graph` does not invent one.
+
+### Concurrent host work
+
+For already-completed work that ran concurrently with the live call stack:
+
+1. retain its `std::time::Instant` start;
+2. convert it with `TraceSession::host_timestamp_ns`; and
+3. call `record_completed_host_span` after the interval ends.
+
+The positive interval is attached to the session root without modifying the span stack. Host
+headlines report it as `concurrent_overlap`, clipped to the measured interval. It keeps its real
+parent and must not be added to measured wall time. Normal descendants of the measured span are
+reported as `measured_subtree`.
+
+## 5. Record tensor and operation metadata
+
+With the `candle` feature, `CandleCapture::from_tensor` extracts:
+
+- process-local backend tensor and storage identities;
+- shape, dtype, device, and variable state;
+- a semantic memory category; and
+- the dense tensor footprint.
+
+Use `with_label` for a caller-owned observation label. The label never replaces backend tensor
+identity. `candle::record_tensor` and `candle::record_op` translate the owned capture values into
+session events.
+
+Dense footprint is `element_count × dtype_size`. It is useful shape metadata, but it is not the
+size of shared or padded backing storage. Record actual allocation bytes separately.
+
+### Numerical tensor statistics
+
+`TraceSession::record_tensor_stats` (feature `candle`) reduces a caller-labelled tensor to element
+count, non-finite count, RMS, absolute maximum, and mean. Labels are the join keys used by repeated
+comparisons, so make them stable and unique within a run. If a label repeats within a run, every
+event is still averaged into the comparison and the per-row sample counts expose the repetition.
+
+The current API accepts the wire span ID as a string:
+
+```rust
+let forward = session.begin_step_span(label, ExecutionStep::Forward, SpanKind::Function);
+let span_id = format!("s{}", forward.id().raw());
+session.record_tensor_stats(&span_id, "model/block-0/output", &output)?;
 ```
 
-For `summary` and `query`, pass a finalized bundle/profile directory or its `trace.jsonl` whenever
-one exists. The CLI deeply verifies the bundle and consumes its bound `evidence.json`, preserving
-normalized Nsight facts. After the read, it rechecks the manifest and the consumed trace/evidence
-files only. These point-in-time checks narrow the race but do not provide a filesystem snapshot or
-make mutable storage transactionally atomic. Output paths that resolve to or traverse the verified
-bundle root or a descendant are rejected, including existing symbolic-link aliases. The CLI fails closed if
-the input's parent has `evidence.json` or `nsight/` but no `bundle.json`,
-regardless of the trace filename. An ordinary raw JSONL in an unaugmented directory remains a valid
-trace-only input and reports GPU evidence as explicitly unavailable. Every GPU query names its
-required report status and reason; missing reports yield unknown totals rather than zero. GPU phase
-and kernel rows are bounded. Projected-range duration sorting is only within the retained
-earliest-original-start sample, whose population/sample/display truncation fields remain explicit.
+These are real Candle reductions. On an accelerator they can add kernels, transfers, and scalar
+synchronization to the selected invocation. Record the same checkpoints in both comparison
+cohorts and interpret performance results as the instrumented workload. If any element is NaN or
+infinite, `non_finite` is authoritative; non-finite aggregate values are serialized as zero so the
+event remains valid JSON.
 
-The packet reports structural validity separately from capability states. A failed terminal event
-remains inspectable but has no derived graph. Comparison deeply verifies every supplied finalized
-bundle, then requires at least five unique complete baseline runs and five unique complete
-candidate runs with identical typed identities and timing semantics. Each cohort must have one
-non-empty implementation ID, but the baseline and candidate IDs may intentionally differ and are
-reported separately. It retains raw samples, median, p95,
-MAD, and a deterministic 95% bootstrap interval; direction is confirmed only when the interval
-excludes zero. `compare --unverified-traces` accepts raw JSONL paths for diagnostics, records that
-trust state in comparison/4, and always withholds eligibility and confidence intervals.
+## 6. Record memory as two independent planes
 
-`report --bundle DIR` writes the trace, packet, Markdown, viewer (when enabled), Nsight inputs, and
-content hashes under a sibling temporary directory, then atomically renames it into place. An
-existing destination is rejected.
-Nsight input directories are flat: every entry must be a regular file. Directory entries,
-symbolic links, special files, and directory enumeration errors reject publication.
-`verify` recursively rejects missing, modified, injected, symbolic-link, or special-file entries
-and emits a receipt containing the exact `bundle.json` SHA-256.
+### Logical storage lifetime
 
-## Nsight normalization
+Pair `record_memory_alloc` and `record_memory_free` by `(device, storage_id)`. Aliased tensor IDs
+may share one live storage; repeating an allocation for the same tensor/storage pair is invalid.
+Pass the backend's actual allocation bytes rather than the tensor's dense footprint.
 
-Retain `.nsys-rep`, export supported reports with NVIDIA's `nsys stats --format csv`, and include a
-`capture-manifest.json` using schema `candle-graph/nsight-capture/1`, containing the trace
-run/correlation IDs, required application labels, their GPU-expected/CPU-only partition,
-tool/hardware metadata, and hashes for every retained artifact. Older manifests without an explicit
-partition retain the legacy meaning that every required label is GPU-expected. Official
-`nvtx_gpu_proj_trace` rows use `Projected Start`, `Projected Duration`, `Orig Start`, and
-`Orig Duration`; they establish GPU projection without correlation/device/context/stream columns.
-When optional join identifiers and a CUDA GPU timeline are both available, declared operation
-counts must match the joined rows. A CPU-only label appearing in the projection report makes
-correlation incomplete. Correlation is checked in both directions before display truncation. Candle,
-device-event, and Nsight clocks are never overlaid as one clock.
+Logical analysis produces simultaneous live bytes, peak composition, per-device totals, and
+residual storage. A storage with no observed free remains a retained allocation and creates a
+warning rather than a fabricated end time.
 
-Run `cargo bench --bench instrumentation_overhead --all-features` to measure the disabled capture
-gate and active event serialization on the current machine.
+### Physical memory
 
-Do not parse exported SQLite: its schema is not the candle-graph interface.
+`record_device_memory` accepts a `DeviceMemoryRecord` whose `used_bytes`, `free_bytes`,
+`reserved_bytes`, and `capacity_bytes` fields are independently optional. At least one must be
+present. Capacity is never derived from used plus free, and physical checkpoints never fill gaps in
+logical lifetime evidence.
+
+## 7. Qualify exact gradient coverage
+
+Complete gradient coverage requires a `GradientContract` created from the final parameter set
+before opening the session. The expected vector is caller-ordered; sort `VarMap` keys because map
+iteration order is not a stable protocol.
+
+```rust
+use std::collections::BTreeMap;
+
+use candle_graph::{
+    CaptureContract, CoverageLevel, ExpectedGradient, GradientContract, GradientFamilyContract,
+    GradientFamilyExpectation, MeasurementScope,
+};
+use candle_nn::VarMap;
+
+fn contract_from_varmap(varmap: &VarMap) -> anyhow::Result<GradientContract> {
+    let mut keys = varmap
+        .data()
+        .lock()
+        .expect("VarMap lock poisoned")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+
+    let mut policies = BTreeMap::new();
+    let expected = keys
+        .into_iter()
+        .map(|key| {
+            // Replace these prefixes with the application's parameter-family policy.
+            let (family, expectation, min_present) = if key.starts_with("frozen.") {
+                ("frozen", GradientFamilyExpectation::Inactive, 0)
+            } else if key.starts_with("conditional.") {
+                ("conditional", GradientFamilyExpectation::DataConditional, 1)
+            } else {
+                ("trainable", GradientFamilyExpectation::Active, 1)
+            };
+            policies.insert(family.to_owned(), (expectation, min_present));
+            ExpectedGradient::new("parameters", key, family)
+        })
+        .collect();
+
+    let families = policies
+        .into_iter()
+        .map(|(family, (expectation, min_present))| match expectation {
+            GradientFamilyExpectation::Active => {
+                GradientFamilyContract::active(family, min_present)
+            }
+            GradientFamilyExpectation::Inactive => GradientFamilyContract::inactive(family),
+            GradientFamilyExpectation::DataConditional => {
+                GradientFamilyContract::data_conditional(family, min_present)
+            }
+        })
+        .collect();
+
+    GradientContract::new(expected, families)
+}
+
+let gradient_contract = contract_from_varmap(&varmap)?;
+let contract = CaptureContract {
+    measurement_scope: MeasurementScope::ProductionEquivalent,
+    gradients: CoverageLevel::Complete,
+    gradient_contract: Some(gradient_contract),
+    ..CaptureContract::default()
+};
+```
+
+Record every declared `(root, key)` exactly once with `TraceSession::record_gradient`:
+
+- `Present` requires a finite norm greater than zero;
+- `Zero` requires positive `0.0`, never `-0.0`;
+- `Missing` and `NonFinite` require no numeric norm;
+- `active(family, min_present)` requires enough positive finite gradients;
+- `inactive(family)` requires every member to be explicitly missing; and
+- `data_conditional(family, min_present)` allows all members to be missing, but requires enough
+  positive finite gradients once any are present.
+
+The digest algorithm and schema constant locations are in the
+[schema reference](schemas.md#gradient-manifest-digest).
+
+## 8. Add comparison identity
+
+Timing comparison needs a typed identity on every run:
+
+```rust
+use candle_graph::ComparisonIdentity;
+
+let identity = ComparisonIdentity {
+    implementation_id: Some("git:abc123".into()),
+    workload_id: "training-step".into(),
+    model_id: "transformer-small".into(),
+    config_id: "default".into(),
+    data_id: "batch-set-a".into(),
+    seed_policy: "fixed-42".into(),
+    physical_batch: 128,
+    accumulation_steps: 1,
+    precision: "f32".into(),
+    device_state: "exclusive".into(),
+    pair_id: None,
+};
+
+let run = run.comparison_identity(identity);
+```
+
+Use a stable implementation/build identity within a cohort. `pair_id` is optional; if it appears
+on any run, it must appear exactly once in each cohort with matching sets.
+
+## 9. Finish failures explicitly
+
+Call `finish()` only after successful work. When the profiled invocation returns an error that the
+application can catch, call `finish_failed(reason)` to retain a terminal failure reason and partial
+structural evidence.
+
+A panic, abort, process kill, or I/O failure cannot be converted automatically into a valid failed
+trace. Such a file may lack its required terminal event and fail parsing. Arrange application-level
+error handling when diagnosable failure artifacts are required.
+
+## Capture checklist
+
+- The selector runs before `TraceSession::open`.
+- The capture contains exactly one measured region.
+- Coverage levels describe the entire measured region honestly.
+- Required semantic labels are stable, unique, and matched in the trace and NVTX.
+- A non-CPU comparison synchronizes the boundaries of the measured region.
+- Tensor footprint is not reported as allocation size.
+- Logical and physical memory observations remain separate.
+- Complete gradients have an exact ordered manifest and one event per key.
+- Comparison identity fields describe the real workload and environment.
+- Success calls `finish`; caught failure calls `finish_failed`.
+
+After capture, publish and inspect evidence with the [CLI reference](cli-reference.md).

@@ -138,14 +138,46 @@ struct SessionInner {
     sticky_error: Option<String>,
 }
 
+impl SessionInner {
+    /// Write one event, failing closed on any prior failure.
+    ///
+    /// Invariant: any write failure poisons the session via `sticky_error`, so
+    /// a trace whose stream may be corrupt or incomplete can never be finished
+    /// as `Complete`.
+    fn write(&mut self, event: &TraceEvent) -> Result<()> {
+        if let Some(error) = &self.sticky_error {
+            anyhow::bail!("trace session previously failed: {error}");
+        }
+        if let Err(error) = write_event(&mut self.writer, event) {
+            self.sticky_error.get_or_insert_with(|| error.to_string());
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
 impl TraceSession {
     /// Open a trace and own its single root span until [`Self::finish`].
     pub fn open(path: impl AsRef<Path>, run: ProfileRun) -> Result<Self> {
-        anyhow::ensure!(
-            run.capture_step > 0,
-            "capture_step must be one-based and greater than zero"
-        );
-        run.capture_contract
+        let entrypoint = run.entrypoint.clone();
+        let meta = TraceRunMeta {
+            run_id: new_run_id(),
+            correlation_id: run.correlation_id,
+            entrypoint: run.entrypoint,
+            phase: run.phase,
+            timestamp: utc_iso8601_now(),
+            capture_step: run.capture_step,
+            warmup_steps: run.warmup_steps,
+            device: run.device,
+            measured_region_device_synchronized: run.measured_region_device_synchronized,
+            timing_mode: run.timing_mode,
+            capture_contract: run.capture_contract,
+            comparison_identity: run.comparison_identity,
+            tags: run.tags,
+            candle_version: None,
+        };
+        meta.validate().context("validate run provenance")?;
+        meta.capture_contract
             .validate()
             .context("validate capture contract")?;
         let path = path.as_ref().to_path_buf();
@@ -160,30 +192,13 @@ impl TraceSession {
             .open(&path)
             .with_context(|| format!("open trace {}", path.display()))?;
         let mut writer = io::BufWriter::new(file);
-        let run_id = new_run_id();
-        let meta = TraceRunMeta {
-            run_id: run_id.clone(),
-            correlation_id: run.correlation_id,
-            entrypoint: run.entrypoint.clone(),
-            phase: run.phase,
-            timestamp: utc_iso8601_now(),
-            capture_step: run.capture_step,
-            warmup_steps: run.warmup_steps,
-            device: run.device,
-            measured_region_device_synchronized: run.measured_region_device_synchronized,
-            timing_mode: run.timing_mode,
-            capture_contract: run.capture_contract,
-            comparison_identity: run.comparison_identity,
-            tags: run.tags,
-            candle_version: None,
-        };
         write_event(&mut writer, &TraceEvent::meta(meta))?;
         write_event(
             &mut writer,
             &TraceEvent::SpanStart(SpanStartEvent {
                 id: span_id_string(1),
                 parent_id: None,
-                name: run.entrypoint,
+                name: entrypoint,
                 start_ns: 0,
                 kind: SpanKind::Function,
                 measured: false,
@@ -262,28 +277,16 @@ impl TraceSession {
         let span_id = SpanId(inner.next_span_id);
         let id = span_id_string(span_id.0);
 
-        if let Err(error) = write_event(
-            &mut inner.writer,
-            &TraceEvent::SpanStart(SpanStartEvent {
-                id: id.clone(),
-                parent_id: Some(span_id_string(root_id)),
-                name: name.into(),
-                start_ns,
-                kind,
-                measured: false,
-                step: None,
-            }),
-        ) {
-            inner.sticky_error.get_or_insert_with(|| error.to_string());
-            return Err(error);
-        }
-        if let Err(error) = write_event(
-            &mut inner.writer,
-            &TraceEvent::SpanEnd(SpanEndEvent { id, duration_ns }),
-        ) {
-            inner.sticky_error.get_or_insert_with(|| error.to_string());
-            return Err(error);
-        }
+        inner.write(&TraceEvent::SpanStart(SpanStartEvent {
+            id: id.clone(),
+            parent_id: Some(span_id_string(root_id)),
+            name: name.into(),
+            start_ns,
+            kind,
+            measured: false,
+            step: None,
+        }))?;
+        inner.write(&TraceEvent::SpanEnd(SpanEndEvent { id, duration_ns }))?;
         Ok(span_id)
     }
 
@@ -304,20 +307,17 @@ impl TraceSession {
         format_span_id(&mut inner.id_buf, span_id);
         let id_str = inner.id_buf.clone();
 
-        if let Err(error) = write_event(
-            &mut inner.writer,
-            &TraceEvent::SpanStart(SpanStartEvent {
-                id: id_str,
-                parent_id,
-                name: name.into(),
-                start_ns,
-                kind,
-                measured,
-                step,
-            }),
-        ) {
-            inner.sticky_error.get_or_insert_with(|| error.to_string());
-        }
+        // The guard must still be returned on failure; the helper has already
+        // poisoned the session, so the error is safe to drop here.
+        let _ = inner.write(&TraceEvent::SpanStart(SpanStartEvent {
+            id: id_str,
+            parent_id,
+            name: name.into(),
+            start_ns,
+            kind,
+            measured,
+            step,
+        }));
 
         inner.span_stack.push(span_id);
 
@@ -345,17 +345,10 @@ impl TraceSession {
 
         format_span_id(&mut inner.id_buf, id.0);
         let span_id = inner.id_buf.clone();
-        if let Err(error) = write_event(
-            &mut inner.writer,
-            &TraceEvent::SpanEnd(SpanEndEvent {
-                id: span_id,
-                duration_ns,
-            }),
-        ) {
-            inner.sticky_error.get_or_insert_with(|| error.to_string());
-            return Err(error);
-        }
-        Ok(())
+        inner.write(&TraceEvent::SpanEnd(SpanEndEvent {
+            id: span_id,
+            duration_ns,
+        }))
     }
 
     pub fn elapsed_ns(&self) -> u64 {
@@ -388,22 +381,19 @@ impl TraceSession {
         };
         {
             let mut inner = self.inner.borrow_mut();
-            write_event(
-                &mut inner.writer,
-                &TraceEvent::Op(OpEvent {
-                    span_id: span_id_string(span_id.0),
-                    op_name: op.op_name.into(),
-                    inputs: op.inputs.to_vec(),
-                    output: op.output.map(str::to_string),
-                    shape: op.shape.to_vec(),
-                    dtype: op.dtype.into(),
-                    device: op.device.into(),
-                    duration_ns: op.duration_ns,
-                    timestamp_ns,
-                    output_dense_bytes,
-                    input_dense_bytes: op.input_dense_bytes,
-                }),
-            )?;
+            inner.write(&TraceEvent::Op(OpEvent {
+                span_id: span_id_string(span_id.0),
+                op_name: op.op_name.into(),
+                inputs: op.inputs.to_vec(),
+                output: op.output.map(str::to_string),
+                shape: op.shape.to_vec(),
+                dtype: op.dtype.into(),
+                device: op.device.into(),
+                duration_ns: op.duration_ns,
+                timestamp_ns,
+                output_dense_bytes,
+                input_dense_bytes: op.input_dense_bytes,
+            }))?;
         }
 
         Ok(())
@@ -414,20 +404,17 @@ impl TraceSession {
         let dense_bytes =
             resolve_dense_tensor_bytes(tensor.dense_bytes, tensor.shape, tensor.dtype);
         let mut inner = self.inner.borrow_mut();
-        write_event(
-            &mut inner.writer,
-            &TraceEvent::Tensor(TensorEvent {
-                span_id: span_id_string(span_id.0),
-                tensor_id: tensor.tensor_id.into(),
-                label: tensor.label.map(str::to_string),
-                shape: tensor.shape.to_vec(),
-                dtype: tensor.dtype.into(),
-                device: tensor.device.into(),
-                requires_grad: tensor.requires_grad,
-                dense_bytes,
-                category: tensor.category,
-            }),
-        )?;
+        inner.write(&TraceEvent::Tensor(TensorEvent {
+            span_id: span_id_string(span_id.0),
+            tensor_id: tensor.tensor_id.into(),
+            label: tensor.label.map(str::to_string),
+            shape: tensor.shape.to_vec(),
+            dtype: tensor.dtype.into(),
+            device: tensor.device.into(),
+            requires_grad: tensor.requires_grad,
+            dense_bytes,
+            category: tensor.category,
+        }))?;
         Ok(())
     }
 
@@ -489,51 +476,45 @@ impl TraceSession {
             mean,
         };
         let mut inner = self.inner.borrow_mut();
-        write_event(&mut inner.writer, &TraceEvent::TensorStats(event))
+        inner.write(&TraceEvent::TensorStats(event))
     }
 
     /// Record an explicit tensor allocation (TensorFlow memory timeline).
     pub fn record_memory_alloc(&self, span_id: SpanId, mem: MemoryRecord<'_>) -> Result<()> {
         let timestamp_ns = mem.timestamp_ns.unwrap_or_else(|| self.elapsed_ns());
         let mut inner = self.inner.borrow_mut();
-        write_event(
-            &mut inner.writer,
-            &TraceEvent::Memory(MemoryEvent {
-                timestamp_ns,
-                storage_id: mem.storage_id.into(),
-                tensor_id: mem.tensor_id.into(),
-                span_id: span_id_string(span_id.0),
-                op_name: mem.op_name.map(str::to_string),
-                device: mem.device.into(),
-                bytes: mem.bytes,
-                action: MemoryAction::Alloc,
-                shape: mem.shape.to_vec(),
-                dtype: mem.dtype.into(),
-                category: mem.category,
-            }),
-        )
+        inner.write(&TraceEvent::Memory(MemoryEvent {
+            timestamp_ns,
+            storage_id: mem.storage_id.into(),
+            tensor_id: mem.tensor_id.into(),
+            span_id: span_id_string(span_id.0),
+            op_name: mem.op_name.map(str::to_string),
+            device: mem.device.into(),
+            bytes: mem.bytes,
+            action: MemoryAction::Alloc,
+            shape: mem.shape.to_vec(),
+            dtype: mem.dtype.into(),
+            category: mem.category,
+        }))
     }
 
     /// Record an explicit tensor deallocation.
     pub fn record_memory_free(&self, span_id: SpanId, mem: MemoryRecord<'_>) -> Result<()> {
         let timestamp_ns = mem.timestamp_ns.unwrap_or_else(|| self.elapsed_ns());
         let mut inner = self.inner.borrow_mut();
-        write_event(
-            &mut inner.writer,
-            &TraceEvent::Memory(MemoryEvent {
-                timestamp_ns,
-                storage_id: mem.storage_id.into(),
-                tensor_id: mem.tensor_id.into(),
-                span_id: span_id_string(span_id.0),
-                op_name: mem.op_name.map(str::to_string),
-                device: mem.device.into(),
-                bytes: mem.bytes,
-                action: MemoryAction::Free,
-                shape: mem.shape.to_vec(),
-                dtype: mem.dtype.into(),
-                category: mem.category,
-            }),
-        )
+        inner.write(&TraceEvent::Memory(MemoryEvent {
+            timestamp_ns,
+            storage_id: mem.storage_id.into(),
+            tensor_id: mem.tensor_id.into(),
+            span_id: span_id_string(span_id.0),
+            op_name: mem.op_name.map(str::to_string),
+            device: mem.device.into(),
+            bytes: mem.bytes,
+            action: MemoryAction::Free,
+            shape: mem.shape.to_vec(),
+            dtype: mem.dtype.into(),
+            category: mem.category,
+        }))
     }
 
     /// Record a device-level memory checkpoint (cudaMemGetInfo-style).
@@ -547,17 +528,14 @@ impl TraceSession {
         );
         let timestamp_ns = sample.timestamp_ns.unwrap_or_else(|| self.elapsed_ns());
         let mut inner = self.inner.borrow_mut();
-        write_event(
-            &mut inner.writer,
-            &TraceEvent::DeviceMemory(DeviceMemoryEvent {
-                timestamp_ns,
-                device: sample.device.into(),
-                used_bytes: sample.used_bytes,
-                free_bytes: sample.free_bytes,
-                reserved_bytes: sample.reserved_bytes,
-                capacity_bytes: sample.capacity_bytes,
-            }),
-        )
+        inner.write(&TraceEvent::DeviceMemory(DeviceMemoryEvent {
+            timestamp_ns,
+            device: sample.device.into(),
+            used_bytes: sample.used_bytes,
+            free_bytes: sample.free_bytes,
+            reserved_bytes: sample.reserved_bytes,
+            capacity_bytes: sample.capacity_bytes,
+        }))
     }
 
     pub fn record_device_interval(
@@ -570,30 +548,24 @@ impl TraceSession {
             "device interval duration must be positive"
         );
         let mut inner = self.inner.borrow_mut();
-        write_event(
-            &mut inner.writer,
-            &TraceEvent::DeviceInterval(DeviceIntervalEvent {
-                span_id: span_id_string(span_id.0),
-                device: interval.device.into(),
-                stream_id: interval.stream_id.into(),
-                clock_id: interval.clock_id.into(),
-                backend: interval.backend.into(),
-                start_ns: interval.start_ns,
-                duration_ns: interval.duration_ns,
-            }),
-        )
+        inner.write(&TraceEvent::DeviceInterval(DeviceIntervalEvent {
+            span_id: span_id_string(span_id.0),
+            device: interval.device.into(),
+            stream_id: interval.stream_id.into(),
+            clock_id: interval.clock_id.into(),
+            backend: interval.backend.into(),
+            start_ns: interval.start_ns,
+            duration_ns: interval.duration_ns,
+        }))
     }
 
     pub fn record_call_edge(&self, from: SpanId, to: SpanId, duration_ns: u64) -> Result<()> {
         let mut inner = self.inner.borrow_mut();
-        write_event(
-            &mut inner.writer,
-            &TraceEvent::Edge(EdgeEvent::Call {
-                from_span: span_id_string(from.0),
-                to_span: span_id_string(to.0),
-                host_duration_ns: duration_ns,
-            }),
-        )
+        inner.write(&TraceEvent::Edge(EdgeEvent::Call {
+            from_span: span_id_string(from.0),
+            to_span: span_id_string(to.0),
+            host_duration_ns: duration_ns,
+        }))
     }
 
     pub fn record_data_edge(&self, from_tensor: &str, to_tensor: &str) -> Result<()> {
@@ -602,13 +574,10 @@ impl TraceSession {
             "data-edge tensor IDs cannot be empty"
         );
         let mut inner = self.inner.borrow_mut();
-        write_event(
-            &mut inner.writer,
-            &TraceEvent::Edge(EdgeEvent::Data {
-                from_tensor: from_tensor.into(),
-                to_tensor: to_tensor.into(),
-            }),
-        )
+        inner.write(&TraceEvent::Edge(EdgeEvent::Data {
+            from_tensor: from_tensor.into(),
+            to_tensor: to_tensor.into(),
+        }))
     }
 
     /// Record one parameter gradient fact from a probe run.
@@ -635,16 +604,13 @@ impl TraceSession {
         let mut inner = self.inner.borrow_mut();
         inner.next_event_id += 1;
         let event_id = format!("gradient-{}", inner.next_event_id);
-        write_event(
-            &mut inner.writer,
-            &TraceEvent::Gradient(GradientEvent {
-                event_id,
-                root,
-                key,
-                state,
-                norm,
-            }),
-        )
+        inner.write(&TraceEvent::Gradient(GradientEvent {
+            event_id,
+            root,
+            key,
+            state,
+            norm,
+        }))
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -669,21 +635,15 @@ impl TraceSession {
                 inner.span_stack.len().saturating_sub(1)
             );
             inner.span_stack.pop();
-            write_event(
-                &mut inner.writer,
-                &TraceEvent::SpanEnd(SpanEndEvent {
-                    id: span_id_string(1),
-                    duration_ns,
-                }),
-            )?;
-            write_event(
-                &mut inner.writer,
-                &TraceEvent::Terminal(TerminalEvent {
-                    outcome: RunOutcome::Complete,
-                    timestamp_ns: duration_ns,
-                    reason: None,
-                }),
-            )?;
+            inner.write(&TraceEvent::SpanEnd(SpanEndEvent {
+                id: span_id_string(1),
+                duration_ns,
+            }))?;
+            inner.write(&TraceEvent::Terminal(TerminalEvent {
+                outcome: RunOutcome::Complete,
+                timestamp_ns: duration_ns,
+                reason: None,
+            }))?;
             inner.writer.flush().context("flushing trace JSONL")?;
         }
         Ok(self.path)
@@ -1039,5 +999,35 @@ mod tests {
         let now = Instant::now();
         assert!(session.host_timestamp_ns(now).unwrap() <= session.elapsed_ns());
         session.finish().unwrap();
+    }
+
+    #[test]
+    fn sticky_error_poisons_event_writes_and_finish() {
+        let path = temp_trace("sticky-error");
+        let session =
+            TraceSession::open(&path, ProfileRun::training("train::update", 1, "cpu")).unwrap();
+        session.inner.borrow_mut().sticky_error = Some("boom".into());
+
+        let error = session
+            .record_op(
+                SpanId(1),
+                OpRecord {
+                    op_name: "matmul",
+                    inputs: &[],
+                    output: None,
+                    shape: &[2, 2],
+                    dtype: "f32",
+                    device: "cpu",
+                    duration_ns: 100,
+                    timestamp_ns: 0,
+                    output_dense_bytes: None,
+                    input_dense_bytes: 0,
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("previously failed"));
+
+        let error = session.finish().unwrap_err();
+        assert!(error.to_string().contains("previously failed"));
     }
 }

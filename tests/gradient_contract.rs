@@ -23,7 +23,7 @@ fn public_schema_constants_identify_the_breaking_contract_revision() {
     assert_eq!(candle_graph::TRACE_SCHEMA, "candle-graph/trace/10");
     assert_eq!(candle_graph::EVIDENCE_SCHEMA, "candle-graph/evidence/4");
     assert_eq!(candle_graph::GRAPH_SCHEMA, "candle-graph/graph/5");
-    assert_eq!(candle_graph::COMPARISON_SCHEMA, "candle-graph/comparison/4");
+    assert_eq!(candle_graph::COMPARISON_SCHEMA, "candle-graph/comparison/5");
     assert_eq!(candle_graph::BUNDLE_SCHEMA, "candle-graph/bundle/1");
     assert_eq!(
         candle_graph::GRADIENT_MANIFEST_SCHEMA,

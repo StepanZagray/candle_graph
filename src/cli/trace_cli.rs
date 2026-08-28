@@ -1,4 +1,4 @@
-//! Evidence CLI engine for trace/10, evidence/4, comparison/4, and atomic bundles.
+//! Evidence CLI engine for trace/10, evidence/4, comparison/5, and atomic bundles.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -219,17 +219,32 @@ fn reject_output_inside_verified_bundle(
     let (Some(root), Some(output)) = (input.bundle_root.as_deref(), output) else {
         return Ok(());
     };
+    reject_output_inside_bundle_root(root, output)
+}
+
+fn reject_output_inside_bundle_root(root: &Path, output: &Path) -> Result<()> {
     let resolved_root = fs::canonicalize(root)
         .with_context(|| format!("resolve verified bundle root {}", root.display()))?;
     let (resolved_output, traversed_bundle) = resolve_write_path(output, &resolved_root)?;
     if traversed_bundle || resolved_output.starts_with(&resolved_root) {
         bail!(
-            "refusing to write summary/query output {} inside verified bundle {}",
+            "refusing to write command output {} inside verified bundle {}",
             output.display(),
             root.display()
         );
     }
     Ok(())
+}
+
+/// Bundle root that would be invalidated by writing next to `input`, if `input` is a finalized
+/// bundle directory or a file directly inside one.
+fn containing_bundle_root(input: &Path) -> Option<&Path> {
+    if input.is_dir() && input.join("bundle.json").is_file() {
+        return Some(input);
+    }
+    input
+        .parent()
+        .filter(|parent| parent.join("bundle.json").is_file())
 }
 
 /// Resolve every existing path component (including symbolic links), while retaining a normalized
@@ -276,10 +291,11 @@ fn resolve_write_path(path: &Path, forbidden_root: &Path) -> Result<(PathBuf, bo
 }
 
 pub fn run_import(trace_path: &Path, output: Option<&Path>) -> Result<()> {
-    let evidence = load_evidence(trace_path)?;
+    let loaded = load_evidence_input(trace_path)?;
+    reject_output_inside_verified_bundle(&loaded.input, output)?;
     super::write_output(
         output,
-        (serde_json::to_string_pretty(&evidence)? + "\n").as_bytes(),
+        (serde_json::to_string_pretty(&loaded.packet)? + "\n").as_bytes(),
     )
 }
 
@@ -340,6 +356,9 @@ pub fn run_query(input_path: &Path, kind: TraceQueryKind, output: Option<&Path>)
 
 #[cfg(feature = "visualizer")]
 pub fn run_view(trace_path: &Path, output: &Path, nsight_dir: Option<&Path>) -> Result<()> {
+    if let Some(root) = containing_bundle_root(trace_path) {
+        reject_output_inside_bundle_root(root, output)?;
+    }
     let evidence = build_evidence(trace_path, nsight_dir)?;
     super::write_output(
         Some(output),
@@ -368,6 +387,11 @@ pub fn run_compare(
             &parse_all(candidate, "candidate")?,
         )
     } else {
+        if let Some(output) = output {
+            for root in baseline.iter().chain(candidate) {
+                reject_output_inside_bundle_root(root, output)?;
+            }
+        }
         compare_verified_bundles(baseline, candidate)?
     };
     super::write_output(
@@ -377,12 +401,23 @@ pub fn run_compare(
 }
 
 pub fn run_report(trace: &Path, nsight_dir: Option<&Path>, bundle: &Path) -> Result<()> {
+    for ancestor in bundle.ancestors().skip(1) {
+        ensure!(
+            !ancestor.join("bundle.json").is_file(),
+            "refusing to publish bundle {} inside existing bundle {}",
+            bundle.display(),
+            ancestor.display()
+        );
+    }
     publish_bundle(bundle, trace, nsight_dir)?;
     Ok(())
 }
 
 pub fn run_verify(bundle: &Path, output: Option<&Path>) -> Result<()> {
     let receipt = verify_bundle(bundle)?;
+    if let Some(output) = output {
+        reject_output_inside_bundle_root(bundle, output)?;
+    }
     super::write_output(
         output,
         (serde_json::to_string_pretty(&receipt)? + "\n").as_bytes(),

@@ -549,6 +549,44 @@ pub fn node_memory_metrics(
     let Some(lifetimes) = lifetimes else {
         return metrics;
     };
+    // Under partial or undeclared coverage an unobserved span stays `None`; a zero is only a
+    // known zero when the producer declared complete logical-memory coverage.
+    let complete_coverage =
+        doc.run.capture_contract.logical_memory == crate::capability::CoverageLevel::Complete;
+
+    // Attribute lifetimes to operation nodes when the recorded op name resolves to exactly one
+    // operation in the allocating span; ambiguous names keep span-level attribution only.
+    let mut op_ids_by_name: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+    let mut per_span_op_index: HashMap<&str, usize> = HashMap::new();
+    for op in &doc.ops {
+        let index = per_span_op_index.entry(op.span_id.as_str()).or_insert(0);
+        let op_index = *index;
+        *index += 1;
+        if let Some(id) = op_node_ids.get(&(op.span_id.clone(), op_index)) {
+            op_ids_by_name
+                .entry((op.span_id.as_str(), op.op_name.as_str()))
+                .or_default()
+                .push(id);
+        }
+    }
+    for lifetime in lifetimes {
+        let Some(op_name) = lifetime.op_name.as_deref() else {
+            continue;
+        };
+        let Some([op_id]) = op_ids_by_name
+            .get(&(lifetime.allocation_span_id.as_str(), op_name))
+            .map(Vec::as_slice)
+        else {
+            continue;
+        };
+        let entry = metrics.entry((*op_id).to_string()).or_default();
+        entry.direct_allocated_bytes = Some(
+            entry
+                .direct_allocated_bytes
+                .unwrap_or(0)
+                .saturating_add(lifetime.bytes),
+        );
+    }
 
     let parent_by_id: HashMap<_, _> = doc
         .spans
@@ -556,19 +594,26 @@ pub fn node_memory_metrics(
         .map(|span| (span.id.as_str(), span.parent_id.as_deref()))
         .collect();
     for span in &doc.spans {
-        let direct_allocated_bytes = lifetimes
+        let mut direct_observed = false;
+        let mut direct_allocated_bytes = 0u64;
+        for lifetime in lifetimes
             .iter()
             .filter(|lifetime| lifetime.allocation_span_id == span.id)
-            .fold(0u64, |total, lifetime| total.saturating_add(lifetime.bytes));
+        {
+            direct_observed = true;
+            direct_allocated_bytes = direct_allocated_bytes.saturating_add(lifetime.bytes);
+        }
 
         let subtree_lifetimes: Vec<_> = lifetimes
             .iter()
             .filter(|lifetime| span_contains(&parent_by_id, &span.id, &lifetime.allocation_span_id))
             .collect();
         let entry = metrics.entry(span.id.clone()).or_default();
-        entry.direct_allocated_bytes = Some(direct_allocated_bytes);
+        if complete_coverage || direct_observed {
+            entry.direct_allocated_bytes = Some(direct_allocated_bytes);
+        }
 
-        if span.closed {
+        if span.closed && (complete_coverage || !subtree_lifetimes.is_empty()) {
             let interval_end = span.start_ns.saturating_add(span.duration_ns);
             let (peak, residual) =
                 clipped_lifetime_metrics(&subtree_lifetimes, span.start_ns, interval_end);
@@ -856,5 +901,100 @@ mod tests {
         let root = &metrics["root"];
         assert_eq!(root.subtree_peak_live_bytes, Some(100));
         assert_eq!(root.subtree_residual_bytes, Some(60));
+    }
+
+    #[test]
+    fn partial_coverage_leaves_unobserved_spans_unknown_not_zero() {
+        let span = |id: &str, parent: Option<&str>| SpanRecord {
+            id: id.into(),
+            parent_id: parent.map(str::to_owned),
+            name: id.into(),
+            kind: SpanKind::Function,
+            measured: parent.is_none(),
+            start_ns: 0,
+            closed: true,
+            duration_ns: 100,
+            step: None,
+        };
+        let mut doc = empty_doc();
+        doc.spans = vec![
+            span("root", None),
+            span("busy", Some("root")),
+            span("quiet", Some("root")),
+        ];
+        doc.memory = vec![
+            memory(10, "cpu", "a", "a", "busy", 40, MemoryAction::Alloc),
+            memory(20, "cpu", "a", "a", "busy", 40, MemoryAction::Free),
+        ];
+
+        let metrics = node_memory_metrics(&doc, &HashMap::new());
+        assert_eq!(metrics["busy"].direct_allocated_bytes, Some(40));
+        let quiet = &metrics["quiet"];
+        assert_eq!(quiet.direct_allocated_bytes, None);
+        assert_eq!(quiet.subtree_peak_live_bytes, None);
+        assert_eq!(quiet.subtree_residual_bytes, None);
+
+        doc.run.capture_contract.logical_memory = crate::capability::CoverageLevel::Complete;
+        let complete = node_memory_metrics(&doc, &HashMap::new());
+        assert_eq!(complete["quiet"].direct_allocated_bytes, Some(0));
+        assert_eq!(complete["quiet"].subtree_peak_live_bytes, Some(0));
+    }
+
+    #[test]
+    fn op_allocations_attribute_to_uniquely_named_op_nodes() {
+        let mut doc = empty_doc();
+        doc.spans = vec![SpanRecord {
+            id: "root".into(),
+            parent_id: None,
+            name: "root".into(),
+            kind: SpanKind::Function,
+            measured: true,
+            start_ns: 0,
+            closed: true,
+            duration_ns: 100,
+            step: None,
+        }];
+        let op = |name: &str, timestamp_ns: u64| crate::trace::OpEvent {
+            span_id: "root".into(),
+            op_name: name.into(),
+            inputs: vec![],
+            output: None,
+            shape: vec![1],
+            dtype: "f32".into(),
+            device: "cpu".into(),
+            duration_ns: 1,
+            timestamp_ns,
+            output_dense_bytes: Some(4),
+            input_dense_bytes: 0,
+        };
+        doc.ops = vec![op("matmul", 10), op("add", 20), op("add", 30)];
+        let mut alloc = memory(11, "cpu", "m", "m", "root", 64, MemoryAction::Alloc);
+        alloc.op_name = Some("matmul".into());
+        let mut ambiguous = memory(21, "cpu", "x", "x", "root", 32, MemoryAction::Alloc);
+        ambiguous.op_name = Some("add".into());
+        doc.memory = vec![alloc, ambiguous];
+
+        let op_node_ids = HashMap::from([
+            (("root".to_string(), 0), "root/op/0".to_string()),
+            (("root".to_string(), 1), "root/op/1".to_string()),
+            (("root".to_string(), 2), "root/op/2".to_string()),
+        ]);
+        let metrics = node_memory_metrics(&doc, &op_node_ids);
+        // Unique op name: attributed to the operation node.
+        assert_eq!(metrics["root/op/0"].direct_allocated_bytes, Some(64));
+        // Ambiguous op name within the span: span-level attribution only.
+        assert_eq!(
+            metrics
+                .get("root/op/1")
+                .and_then(|entry| entry.direct_allocated_bytes),
+            None
+        );
+        assert_eq!(
+            metrics
+                .get("root/op/2")
+                .and_then(|entry| entry.direct_allocated_bytes),
+            None
+        );
+        assert_eq!(metrics["root"].direct_allocated_bytes, Some(96));
     }
 }

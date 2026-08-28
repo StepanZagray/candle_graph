@@ -6,11 +6,11 @@ use std::path::Path;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::artifact::verify_bundle;
+use crate::artifact::{verify_bundle, verify_consumed_bundle_files};
 use crate::capability::MeasurementScope;
 use crate::trace::{analyze_health, parse_trace, ComparisonIdentity, TraceDocument};
 
-pub const SCHEMA: &str = "candle-graph/comparison/4";
+pub const SCHEMA: &str = "candle-graph/comparison/5";
 pub const MINIMUM_RUNS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,10 +46,19 @@ pub struct TensorStatsComparisonRow {
     pub abs_max_ratio: Option<f64>,
     pub non_finite_a: u64,
     pub non_finite_b: u64,
+    /// Events averaged into `rms_a`/`abs_max` for this label (duplicates included).
+    pub samples_a: usize,
+    pub samples_b: usize,
+    /// Cohort runs that contained this label; compare against the cohort run totals to see
+    /// whether an average covers the whole cohort or only part of it.
+    pub runs_a: usize,
+    pub runs_b: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TensorStatsComparison {
+    pub baseline_runs: usize,
+    pub candidate_runs: usize,
     pub matched: Vec<TensorStatsComparisonRow>,
     pub unmatched_a: Vec<String>,
     pub unmatched_b: Vec<String>,
@@ -159,6 +168,13 @@ fn load_verified_cohort<P: AsRef<Path>>(
             receipt.run_id,
             document.run.run_id
         );
+        verify_consumed_bundle_files(root, &receipt, &["trace.jsonl"]).with_context(|| {
+            format!(
+                "post-read verify {cohort} bundle {} trace at {}",
+                index + 1,
+                root.display()
+            )
+        })?;
         inputs.push(VerifiedBundleInput {
             run_id: receipt.run_id,
             manifest_sha256: receipt.manifest_sha256,
@@ -257,6 +273,7 @@ fn compare_tensor_stats(
         abs_max: f64,
         non_finite: u64,
         samples: usize,
+        runs: usize,
     }
 
     fn aggregate(documents: &[TraceDocument]) -> BTreeMap<String, Aggregate> {
@@ -264,14 +281,14 @@ fn compare_tensor_stats(
         for document in documents {
             let mut seen = BTreeSet::new();
             for event in &document.tensor_stats {
-                if !seen.insert(event.label.as_str()) {
-                    continue;
-                }
                 let entry = by_label.entry(event.label.clone()).or_default();
                 entry.rms += event.rms;
                 entry.abs_max += event.abs_max;
                 entry.non_finite = entry.non_finite.saturating_add(event.non_finite);
                 entry.samples += 1;
+                if seen.insert(event.label.as_str()) {
+                    entry.runs += 1;
+                }
             }
         }
         by_label
@@ -300,6 +317,8 @@ fn compare_tensor_stats(
         }
     }
 
+    let baseline_runs = baseline.len();
+    let candidate_runs = candidate.len();
     let baseline = aggregate(baseline);
     let candidate = aggregate(candidate);
     let mut matched = baseline
@@ -318,6 +337,10 @@ fn compare_tensor_stats(
                 abs_max_ratio: ratio(abs_max_a, abs_max_b),
                 non_finite_a: a.non_finite,
                 non_finite_b: b.non_finite,
+                samples_a: a.samples,
+                samples_b: b.samples,
+                runs_a: a.runs,
+                runs_b: b.runs,
             })
         })
         .collect::<Vec<_>>();
@@ -327,6 +350,8 @@ fn compare_tensor_stats(
             .then_with(|| a.label.cmp(&b.label))
     });
     TensorStatsComparison {
+        baseline_runs,
+        candidate_runs,
         matched,
         unmatched_a: baseline
             .keys()
@@ -491,6 +516,10 @@ fn common_identity(
     };
     if identities.iter().any(|identity| identity.is_none()) {
         reasons.push("comparison identity is missing from one or more runs".into());
+        return None;
+    }
+    if let Err(error) = first.validate() {
+        reasons.push(format!("comparison identity is invalid: {error}"));
         return None;
     }
     if identities
@@ -726,7 +755,7 @@ mod tests {
                 entrypoint: "demo::infer".into(),
                 phase: crate::ExecutionPhase::Infer,
                 timestamp: "2026-08-19T00:00:00Z".into(),
-                capture_step: 1,
+                capture_step: 6,
                 warmup_steps: 5,
                 device: "cpu".into(),
                 measured_region_device_synchronized: false,
@@ -812,14 +841,14 @@ mod tests {
     }
 
     #[test]
-    fn tensor_stats_join_first_labels_and_sort_by_rms_ratio_distance() {
+    fn tensor_stats_average_every_event_and_expose_sample_and_run_coverage() {
         let stats = |label: &str, rms: f64, abs_max: f64| TensorStatsEvent {
             span_id: "s1".into(),
             label: label.into(),
             shape: vec![1],
             dtype: "f32".into(),
             elements: 1,
-            non_finite: 0,
+            non_finite: if rms == 100.0 { 1 } else { 0 },
             rms,
             abs_max,
             mean: rms,
@@ -839,11 +868,56 @@ mod tests {
         ];
 
         let comparison = compare_unverified_traces(&[baseline], &[candidate]);
-        assert_eq!(comparison.tensor_stats.matched[0].label, "drift");
-        assert_eq!(comparison.tensor_stats.matched[0].rms_ratio, Some(4.0));
-        assert_eq!(comparison.tensor_stats.matched[0].abs_max_ratio, Some(4.0));
+        let drift = &comparison.tensor_stats.matched[0];
+        assert_eq!(drift.label, "drift");
+        // Duplicate baseline events are averaged, not discarded after the first occurrence.
+        assert_eq!(drift.rms_a, 50.5);
+        assert_eq!(drift.rms_ratio, Some(4.0 / 50.5));
+        // A non-finite count in a duplicate event is retained.
+        assert_eq!(drift.non_finite_a, 1);
+        assert_eq!(drift.samples_a, 2);
+        assert_eq!(drift.samples_b, 1);
+        assert_eq!(drift.runs_a, 1);
+        assert_eq!(drift.runs_b, 1);
+        assert_eq!(comparison.tensor_stats.baseline_runs, 1);
+        assert_eq!(comparison.tensor_stats.candidate_runs, 1);
         assert_eq!(comparison.tensor_stats.unmatched_a, vec!["only_a"]);
         assert_eq!(comparison.tensor_stats.unmatched_b, vec!["only_b"]);
+    }
+
+    #[test]
+    fn out_of_domain_provenance_fails_closed() {
+        let baseline = (0..5)
+            .map(|i| run("base", i, 100 + i as u64, None))
+            .collect::<Vec<_>>();
+        let candidate = (0..5)
+            .map(|i| {
+                let mut document = run("next", i, 90 + i as u64, None);
+                document.run.capture_step = 0;
+                document.run.warmup_steps = 0;
+                document
+            })
+            .collect::<Vec<_>>();
+        let result = compare_test_replicates(&baseline, &candidate);
+        assert!(!result.comparable);
+        assert_eq!(result.verdict, ComparisonVerdict::Ineligible);
+        assert!(result
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("not a complete, structurally valid capture")));
+
+        let mut zero_batch = baseline.clone();
+        for document in &mut zero_batch {
+            document
+                .run
+                .comparison_identity
+                .as_mut()
+                .unwrap()
+                .physical_batch = 0;
+        }
+        let result = compare_test_replicates(&zero_batch, &zero_batch.clone());
+        assert!(!result.comparable);
+        assert_eq!(result.verdict, ComparisonVerdict::Ineligible);
     }
 
     #[test]

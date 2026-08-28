@@ -70,6 +70,14 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
         .collect();
     let mut issues = Vec::new();
 
+    if let Err(provenance_error) = doc.run.validate() {
+        error(
+            &mut issues,
+            "run_provenance_invalid",
+            provenance_error.to_string(),
+        );
+    }
+
     match doc.terminal.outcome {
         RunOutcome::Complete if doc.terminal.reason.is_some() => error(
             &mut issues,
@@ -252,6 +260,21 @@ pub fn analyze_health(doc: &TraceDocument) -> TraceHealth {
                     format!(
                         "operation `{}` lies outside span `{}`",
                         op.op_name, op.span_id
+                    ),
+                );
+            }
+        }
+    }
+    for event in &doc.memory {
+        if let Some(span) = by_id.get(event.span_id.as_str()).filter(|span| span.closed) {
+            let span_end = span.start_ns.saturating_add(span.duration_ns);
+            if event.timestamp_ns < span.start_ns || event.timestamp_ns > span_end {
+                error(
+                    &mut issues,
+                    "memory_outside_span",
+                    format!(
+                        "memory event for storage `{}` lies outside span `{}`",
+                        event.storage_id, event.span_id
                     ),
                 );
             }
@@ -967,6 +990,51 @@ mod tests {
         assert!(health.issues.iter().any(|issue| {
             issue.code == "incomplete_semantic_label_partition"
                 && issue.severity == HealthSeverity::Error
+        }));
+    }
+
+    #[test]
+    fn out_of_domain_run_provenance_is_a_structural_error() {
+        let mut document = failed_document();
+        document.run.capture_step = 0;
+        let health = analyze_health(&document);
+        assert!(!health.structurally_valid);
+        assert!(health.issues.iter().any(|issue| {
+            issue.code == "run_provenance_invalid" && issue.severity == HealthSeverity::Error
+        }));
+
+        let mut document = failed_document();
+        document.run.warmup_steps = document.run.capture_step;
+        assert!(!analyze_health(&document).structurally_valid);
+
+        let mut document = failed_document();
+        document.run.entrypoint = "   ".into();
+        assert!(!analyze_health(&document).structurally_valid);
+    }
+
+    #[test]
+    fn memory_events_outside_their_closed_span_are_rejected() {
+        let mut document = failed_document();
+        document.spans[0].closed = true;
+        document.spans[0].start_ns = 10;
+        document.spans[0].duration_ns = 20;
+        document.memory = vec![MemoryEvent {
+            timestamp_ns: 50,
+            storage_id: "late".into(),
+            tensor_id: "late".into(),
+            span_id: "root".into(),
+            op_name: None,
+            device: "cpu".into(),
+            bytes: 8,
+            action: MemoryAction::Alloc,
+            shape: vec![8],
+            dtype: "u8".into(),
+            category: MemoryCategory::Activation,
+        }];
+        let health = analyze_health(&document);
+        assert!(!health.structurally_valid);
+        assert!(health.issues.iter().any(|issue| {
+            issue.code == "memory_outside_span" && issue.severity == HealthSeverity::Error
         }));
     }
 

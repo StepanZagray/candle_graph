@@ -38,7 +38,9 @@ Single-context layout: `CONTEXT.md` at the repo root and ADRs under `docs/adr/`.
 | `all` | `visualizer` plus `candle` |
 
 Details: [`docs/features.md`](docs/features.md), [`docs/runtime-analysis-guide.md`](docs/runtime-analysis-guide.md).
-Prefer bounded CLI queries (`summary`, `query --kind …`) over loading full graph JSON.
+Prefer focused CLI queries over loading a full evidence packet. Check [`docs/cli-reference.md`](docs/cli-reference.md):
+GPU and ranking queries are capped, while memory, spans, tensors, tensor statistics, and gradients
+return complete collections.
 
 ### UI / UX (HTML visualizer)
 
@@ -57,13 +59,14 @@ Prefer improving the existing visualizer over introducing a frontend framework.
 
 | Module | Role |
 | --- | --- |
-| `trace/` | Parse/emit `candle-graph/trace/6` JSONL |
+| `trace/` | Parse/emit `candle-graph/trace/10` JSONL |
 | `instrument/` | `TraceSession`, `SpanGuard`, probe API |
 | `graph/` | `ExecutionGraph` from trace events |
-| `evidence.rs` | Unified evidence and baseline comparison packets |
+| `evidence.rs` | Unified capability-qualified evidence packets |
+| `comparison.rs` | Replicated verified-bundle comparisons |
 | `artifact.rs` | Atomic bundle publication and deep verification receipts |
 | `nsight.rs` | Normalize supported official Nsight CSV reports |
-| `cli/trace_cli.rs` | `import`, `view`, `summary`, `query`, `compare`, `report` |
-| `viewer/` | `render_evidence_html` (`candle-graph/viewer/4`) |
+| `cli/trace_cli.rs` | `import`, `view`, `summary`, `query`, `compare`, `report`, `verify` |
+| `viewer/` | `render_evidence_html` (`candle-graph/viewer/5`) |
 
 There is no static Rust analysis layer in this crate.

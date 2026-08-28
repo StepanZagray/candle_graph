@@ -1,9 +1,22 @@
 //! TensorFlow Profiler-style execution graphs for [Candle](https://github.com/huggingface/candle) runs.
 //!
-//! Record one representative JSONL trace ([`instrument::TraceSession`]), build an [`graph::ExecutionGraph`],
-//! and inspect it via CLI or HTML ([`viewer::render_evidence_html`]).
+//! Record one representative JSONL trace with [`instrument::TraceSession`], qualify its structural
+//! health and evidence capabilities with [`evidence::build_evidence`], and inspect it through the
+//! CLI or, with the `visualizer` feature, [`viewer::render_evidence_html`].
 //!
 //! There is **no static Rust analysis** — the graph comes only from what executed.
+//!
+//! Keep these evidence planes distinct:
+//!
+//! - span duration is host timing unless the producer declares stronger synchronization semantics;
+//! - [`timing`] device intervals retain their own device clock;
+//! - [`trace::memory`] logical storage lifetimes do not imply physical allocator usage; and
+//! - optional [`nsight`] evidence retains the Nsight clock and artifact provenance.
+//!
+//! Failed or structurally invalid captures remain diagnostic but do not produce a derived
+//! [`graph::ExecutionGraph`]. Finalized evidence can be published and deeply verified through
+//! [`artifact`], while eligible repeated timing comparisons require verified bundles through
+//! [`comparison`].
 
 pub mod artifact;
 pub mod capability;

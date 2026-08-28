@@ -19,18 +19,27 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Emit a complete capability-qualified evidence packet.
     Import(ImportArgs),
+    /// Render a standalone HTML visualizer from a trace (requires `visualizer` feature).
     #[cfg(feature = "visualizer")]
     View(ViewArgs),
+    /// Emit a profiler summary for a raw trace or verified bundle/profile.
     Summary(SummaryArgs),
+    /// Run a typed query against raw-trace or verified bundle evidence.
     Query(QueryArgs),
+    /// Compare a candidate profile run with an explicit baseline.
     Compare(CompareArgs),
+    /// Atomically publish a content-addressed evidence bundle.
     Report(ReportArgs),
+    /// Deeply verify a published evidence bundle and emit a durable receipt.
     Verify(VerifyArgs),
 }
 
 #[derive(Parser, Debug)]
 struct ImportArgs {
+    /// Raw trace, finalized bundle/profile directory, or its `trace.jsonl`.
+    #[arg(value_name = "INPUT")]
     trace: PathBuf,
     #[arg(long, short, value_name = "FILE")]
     output: Option<PathBuf>,
@@ -39,6 +48,8 @@ struct ImportArgs {
 #[derive(Parser, Debug)]
 #[cfg(feature = "visualizer")]
 struct ViewArgs {
+    /// Trace JSONL file (`candle-graph/trace/10` or readable trace/9).
+    #[arg(value_name = "TRACE")]
     trace: PathBuf,
     #[arg(long, value_name = "FILE")]
     output: PathBuf,
@@ -48,8 +59,10 @@ struct ViewArgs {
 
 #[derive(Parser, Debug)]
 struct CompareArgs {
+    /// Finalized evidence bundle directories, unless `--unverified-traces` is set.
     #[arg(long, required = true, num_args = 1.., value_name = "BUNDLE")]
     baseline: Vec<PathBuf>,
+    /// Finalized evidence bundle directories, unless `--unverified-traces` is set.
     #[arg(long, required = true, num_args = 1.., value_name = "BUNDLE")]
     candidate: Vec<PathBuf>,
     /// Treat baseline and candidate paths as raw traces; output is always diagnostic/ineligible.
@@ -61,6 +74,8 @@ struct CompareArgs {
 
 #[derive(Parser, Debug)]
 struct ReportArgs {
+    /// Raw trace JSONL file (`candle-graph/trace/10` or readable trace/9).
+    #[arg(value_name = "TRACE")]
     trace: PathBuf,
     #[arg(long, value_name = "DIR")]
     nsight_dir: Option<PathBuf>,
@@ -70,6 +85,7 @@ struct ReportArgs {
 
 #[derive(Parser, Debug)]
 struct VerifyArgs {
+    /// Finalized evidence bundle directory.
     #[arg(value_name = "BUNDLE")]
     bundle: PathBuf,
     #[arg(long, short, value_name = "FILE")]

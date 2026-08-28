@@ -129,6 +129,16 @@ pub fn build_from_trace(doc: &TraceDocument) -> Result<ExecutionGraph> {
         });
     }
 
+    let mut node_ids = HashSet::new();
+    for node in &nodes {
+        ensure!(
+            node_ids.insert(node.id.as_str()),
+            "duplicate graph node ID {:?}: span IDs must not collide with synthesized \
+             `<span>/op/<n>` or `tensor/<id>` node IDs",
+            node.id
+        );
+    }
+
     for (node_id, metrics) in node_memory_metrics(doc, &op_node_ids) {
         if let Some(node) = nodes.iter_mut().find(|node| node.id == node_id) {
             node.allocated_bytes = metrics.direct_allocated_bytes;
@@ -635,6 +645,81 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["backend:1", "backend:2"])
         );
+    }
+
+    #[test]
+    fn span_ids_shadowing_synthesized_node_ids_are_rejected() {
+        let doc = TraceDocument {
+            schema: TRACE_SCHEMA.into(),
+            run: TraceRunMeta {
+                run_id: "node-id-collision".into(),
+                correlation_id: "node/id/collision".into(),
+                entrypoint: "demo".into(),
+                phase: crate::ExecutionPhase::Infer,
+                timestamp: "2026-08-28T00:00:00Z".into(),
+                capture_step: 1,
+                warmup_steps: 0,
+                device: "cpu".into(),
+                measured_region_device_synchronized: false,
+                timing_mode: TimingMode::Host,
+                capture_contract: CaptureContract::default(),
+                comparison_identity: None,
+                tags: Default::default(),
+                candle_version: None,
+            },
+            spans: vec![
+                SpanRecord {
+                    id: "root".into(),
+                    parent_id: None,
+                    name: "demo".into(),
+                    kind: SpanKind::Function,
+                    measured: true,
+                    start_ns: 0,
+                    closed: true,
+                    duration_ns: 10,
+                    step: None,
+                },
+                SpanRecord {
+                    id: "root/op/0".into(),
+                    parent_id: Some("root".into()),
+                    name: "shadowing".into(),
+                    kind: SpanKind::Function,
+                    measured: false,
+                    start_ns: 0,
+                    closed: true,
+                    duration_ns: 1,
+                    step: None,
+                },
+            ],
+            ops: vec![crate::trace::OpEvent {
+                span_id: "root".into(),
+                op_name: "matmul".into(),
+                inputs: vec![],
+                output: None,
+                shape: vec![1],
+                dtype: "f32".into(),
+                device: "cpu".into(),
+                duration_ns: 1,
+                timestamp_ns: 1,
+                output_dense_bytes: Some(4),
+                input_dense_bytes: 0,
+            }],
+            tensors: vec![],
+            tensor_stats: vec![],
+            memory: vec![],
+            device_memory: vec![],
+            device_intervals: vec![],
+            gradients: vec![],
+            edges: vec![],
+            terminal: TerminalEvent {
+                outcome: RunOutcome::Complete,
+                timestamp_ns: 10,
+                reason: None,
+            },
+        };
+
+        let error = build_from_trace(&doc).unwrap_err();
+        assert!(error.to_string().contains("duplicate graph node ID"));
     }
 
     #[test]

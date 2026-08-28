@@ -66,6 +66,80 @@ pub struct TraceRunMeta {
     pub candle_version: Option<String>,
 }
 
+impl TraceRunMeta {
+    /// Validate provenance domain invariants before trusting a parsed or constructed run.
+    /// Producers enforce these at capture time; consumers re-check them because traces can
+    /// come from external tools or hand-edited files.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (label, value) in [
+            ("run_id", &self.run_id),
+            ("correlation_id", &self.correlation_id),
+            ("entrypoint", &self.entrypoint),
+            ("timestamp", &self.timestamp),
+            ("device", &self.device),
+        ] {
+            anyhow::ensure!(
+                !value.trim().is_empty(),
+                "run provenance {label} must not be empty"
+            );
+        }
+        anyhow::ensure!(
+            self.capture_step > 0,
+            "capture_step must be one-based and greater than zero"
+        );
+        anyhow::ensure!(
+            self.warmup_steps < self.capture_step,
+            "warmup_steps ({}) must be fewer than the one-based capture_step ({})",
+            self.warmup_steps,
+            self.capture_step
+        );
+        if let Some(identity) = &self.comparison_identity {
+            identity.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl ComparisonIdentity {
+    /// Validate that every declared identity dimension carries a usable value.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (label, value) in [
+            ("workload_id", &self.workload_id),
+            ("model_id", &self.model_id),
+            ("config_id", &self.config_id),
+            ("data_id", &self.data_id),
+            ("seed_policy", &self.seed_policy),
+            ("precision", &self.precision),
+            ("device_state", &self.device_state),
+        ] {
+            anyhow::ensure!(
+                !value.trim().is_empty(),
+                "comparison identity {label} must not be empty"
+            );
+        }
+        for (label, value) in [
+            ("implementation_id", &self.implementation_id),
+            ("pair_id", &self.pair_id),
+        ] {
+            if let Some(value) = value {
+                anyhow::ensure!(
+                    !value.trim().is_empty(),
+                    "comparison identity {label} must not be empty when declared"
+                );
+            }
+        }
+        anyhow::ensure!(
+            self.physical_batch > 0,
+            "comparison identity physical_batch must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.accumulation_steps > 0,
+            "comparison identity accumulation_steps must be greater than zero"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimingMode {

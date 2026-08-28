@@ -148,6 +148,12 @@ impl TraceDocument {
                 "unsupported trace schema {schema:?}; expected {SCHEMA:?} or {PREVIOUS_SCHEMA:?}"
             );
         }
+        if schema == PREVIOUS_SCHEMA && !tensor_stats.is_empty() {
+            bail!(
+                "trace schema {PREVIOUS_SCHEMA:?} does not define tensor_stats events; \
+                 producers emitting tensor statistics must declare {SCHEMA:?}"
+            );
+        }
 
         let mut spans: Vec<SpanRecord> = span_starts
             .into_iter()
@@ -539,9 +545,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn tensor_stats_round_trip_and_previous_schema_remains_readable() {
-        let stats = TensorStatsEvent {
+    fn sample_tensor_stats() -> TensorStatsEvent {
+        TensorStatsEvent {
             span_id: "s1".into(),
             label: "seam/out_y".into(),
             shape: vec![2, 3],
@@ -551,12 +556,14 @@ mod tests {
             rms: 1.5,
             abs_max: 3.0,
             mean: -0.25,
-        };
+        }
+    }
+
+    #[test]
+    fn tensor_stats_round_trip_in_current_schema() {
+        let stats = sample_tensor_stats();
         let events = vec![
-            TraceEvent::Meta {
-                schema: PREVIOUS_SCHEMA.into(),
-                run: Box::new(sample_meta()),
-            },
+            TraceEvent::meta(sample_meta()),
             TraceEvent::TensorStats(stats.clone()),
             TraceEvent::Terminal(TerminalEvent {
                 outcome: RunOutcome::Complete,
@@ -565,10 +572,46 @@ mod tests {
             }),
         ];
         let document = TraceDocument::from_events(events).unwrap();
-        assert_eq!(document.schema, PREVIOUS_SCHEMA);
+        assert_eq!(document.schema, SCHEMA);
         assert_eq!(document.tensor_stats, vec![stats]);
         let rebuilt = TraceDocument::from_events(document.to_events()).unwrap();
         assert_eq!(rebuilt, document);
+    }
+
+    #[test]
+    fn previous_schema_remains_readable_without_tensor_stats() {
+        let events = vec![
+            TraceEvent::Meta {
+                schema: PREVIOUS_SCHEMA.into(),
+                run: Box::new(sample_meta()),
+            },
+            TraceEvent::Terminal(TerminalEvent {
+                outcome: RunOutcome::Complete,
+                timestamp_ns: 0,
+                reason: None,
+            }),
+        ];
+        let document = TraceDocument::from_events(events).unwrap();
+        assert_eq!(document.schema, PREVIOUS_SCHEMA);
+        assert!(document.tensor_stats.is_empty());
+    }
+
+    #[test]
+    fn previous_schema_rejects_tensor_stats_events() {
+        let events = vec![
+            TraceEvent::Meta {
+                schema: PREVIOUS_SCHEMA.into(),
+                run: Box::new(sample_meta()),
+            },
+            TraceEvent::TensorStats(sample_tensor_stats()),
+            TraceEvent::Terminal(TerminalEvent {
+                outcome: RunOutcome::Complete,
+                timestamp_ns: 0,
+                reason: None,
+            }),
+        ];
+        let error = TraceDocument::from_events(events).unwrap_err();
+        assert!(error.to_string().contains("does not define tensor_stats"));
     }
 
     #[test]

@@ -44,7 +44,7 @@ fn run(cohort: &str, index: usize, duration_ns: u64) -> TraceDocument {
             entrypoint: "demo::infer".into(),
             phase: ExecutionPhase::Infer,
             timestamp: "2026-08-21T00:00:00Z".into(),
-            capture_step: 1,
+            capture_step: 6,
             warmup_steps: 5,
             device: "cpu".into(),
             measured_region_device_synchronized: false,

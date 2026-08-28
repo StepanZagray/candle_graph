@@ -1,118 +1,130 @@
-# candle-graph — product context
+# candle-graph product context
 
 ## Goal
 
 Help people and building agents understand what a Candle model actually did in one representative
-run without pretending static source inspection can reconstruct tensor execution.
+run, without pretending static source inspection can reconstruct tensor execution.
 
-## Language
+## Domain language
 
-**Profile run**: one selected model update or inference invocation, with enough provenance and
-timing semantics to judge representativeness.
+**Profile run**: one selected training update or inference invocation, with enough provenance and
+timing semantics to judge whether it represents the intended workload.
 
-**Measured region**: the caller-controlled part of a profile run used for totals and comparisons;
-session setup and evidence publication are outside it. Host headline attribution also includes
-structurally separate spans that overlap this interval, explicitly scoped as concurrent rather than
-reparented into the measured call tree.
+**Session envelope**: the lifetime owned by `TraceSession`. It contains trace setup and one measured
+region; publication happens after it.
 
-**GPU evidence**: optional normalized Nsight kernel, runtime, transfer, timeline, and projected NVTX
-facts. Its absence never invalidates application evidence.
+**Measured region**: the caller-controlled interval used for outer-wall totals and comparisons.
+Host headlines include its normal descendants and structurally separate host spans that overlap
+the interval. Overlapping work is labelled concurrent rather than reparented into the measured call
+tree.
 
-**Evidence packet**: the single deep interface for agents, reports, and the HTML viewer:
-provenance, structural health, capability states, typed facts, explicit gaps, optional validated
-graph, separate timing and memory planes, and optional GPU evidence.
+**Capture contract**: the producer's typed declaration of which evidence classes cover the entire
+measured region. An observed event proves presence, but only the producer can declare its coverage
+policy complete.
 
-**Capture contract**: the producer's typed declaration of which evidence classes cover the whole
-measured region. Required application spans may be partitioned into GPU-expected and explicitly
-CPU-only semantic labels; older contracts classify every required label as GPU-expected. Observed
-event counts can prove presence, but never upgrade coverage to complete.
+**Semantic label contract**: the exact set of required application span names. The set may be
+partitioned into labels expected to project onto the GPU and labels known to be CPU-only. Older
+contracts with no explicit partition treat every required label as GPU-expected.
 
 **Gradient contract**: a SHA-256-bound, caller-ordered manifest of expected `(root, key, family)`
-parameters plus an active, inactive, or data-conditional expectation for every family. Complete
-gradient coverage means the observed event set matched this contract exactly and passed state/norm
-and family validation.
+parameters, plus an active, inactive, or data-conditional expectation for every family. Complete
+gradient coverage means the observed events match the manifest and all state, norm, and family
+rules.
 
-**Evidence capability**: a machine-checkable statement that one class of conclusion is supported,
+**Evidence capability**: a machine-checkable statement that one class of conclusion is complete,
 partial, unavailable, or invalid for an evidence packet.
 
-**Timing plane**: one clock and interval semantics for timing evidence. Host, device-event, and
-Nsight-projected intervals are separate timing planes even when they describe the same phase.
+**Evidence packet**: the shared deep interface for CLI output, reports, bundles, and the HTML
+viewer: provenance, health, capabilities, facts, gaps, an optional validated graph, timing, memory,
+and optional GPU evidence.
 
-**Logical memory evidence**: storage lifetimes identified by device and storage identity, including
-simultaneous live bytes and residual storage.
+**Timing plane**: one clock and interval semantics. Host spans, device-event intervals, and
+Nsight-projected intervals remain separate timing planes even when they describe the same phase.
 
-**Physical memory evidence**: observed device or allocator used, reserved, free, and capacity bytes.
-Each measurement is independently optional. Capacity is never derived from used plus free, tensor
-metadata, or logical storage lifetimes.
+**Logical memory evidence**: explicit backend storage lifetimes keyed by device and storage
+identity, including simultaneous live bytes and residual storage.
 
-**Replicated comparison**: a metric-scoped comparison of at least five compatible independent
-baseline runs and five compatible independent candidate runs, retaining every raw sample. An
-eligible comparison reads traces only from bundles deeply verified immediately beforehand.
+**Physical memory evidence**: observed device or allocator used, reserved, free, and capacity
+bytes. Every measurement is independently optional; capacity is never inferred from another
+field, tensor metadata, or logical lifetime evidence.
+
+**GPU evidence**: optional normalized Nsight kernel, runtime, transfer, timeline, and projected
+NVTX facts. Its absence never invalidates application evidence.
 
 **Evidence bundle**: one atomically published directory whose manifest binds every input and
-derived artifact to the profile run.
+derived file to the profile run.
+
+**Replicated comparison**: a comparison of at least five compatible independent baseline bundles
+and five compatible independent candidate bundles. It retains every timing sample and binds every
+input to a point-in-time bundle verification receipt.
 
 **Failed capture**: a terminated profile run with an explicit failure reason and partial structural
-evidence. It is diagnosable but cannot support normal findings or comparisons.
+evidence. It is diagnosable but cannot support a normal graph, findings, or timing verdict.
 
 ## Evidence flow
 
 ```text
-representative update
+representative update or inference call
   ├─ TraceSession envelope
   ├─ one measured semantic region
   └─ matching NVTX labels (optional)
-            │
-            ▼
- application.jsonl (trace/10) ── validate ── graph/5
-            │                                │
- official nsys stats CSV ── normalize ───────┤
-            │                                ▼
-            └──────────────────── evidence/4 packet
-                                      ├─ bounded JSON / Markdown for agents
-                                      ├─ atomic bundle/1 + verification receipt
-                                      ├─ comparison/4 across verified repeated bundles
-                                      └─ viewer/5 HTML for humans
+                 │
+                 ▼
+      application.jsonl (trace/10)
+                 │
+        structural validation ──────┐
+                 │                  │
+                 ▼                  │
+             graph/5                │
+                                    │
+ official nsys stats CSV ─ normalize┤
+                                    ▼
+                            evidence/4 packet
+                              ├─ CLI JSON / Markdown
+                              ├─ atomic bundle/1 + verification receipt
+                              ├─ comparison/5 across repeated bundles
+                              └─ viewer/5 HTML
 ```
 
-Analysis never proceeds through an invalid hierarchy. Optional evidence is represented by coverage
-and reasons, never silent empty arrays. Tensor footprint and observed memory lifetime are distinct.
+Analysis never proceeds through an invalid hierarchy. Failed traces keep diagnostic evidence but
+do not receive a graph. Optional evidence is represented by capabilities and reasons rather than
+silent empty-success values. Tensor footprint and observed memory lifetime are different facts.
 
-## Product targets
+## Product invariants
 
-1. Zero overhead outside one selected invocation.
-2. One caller-owned measured region with forward/backward/optimizer semantics.
-3. Required provenance and typed timing mode before comparisons.
-4. Structural trust before graph construction or findings.
-5. Bounded agent queries and durable JSON/Markdown evidence.
-6. Fail-closed repeated-run timing comparisons with raw samples and confidence intervals.
-7. One accessible offline UI for application and optional GPU evidence.
-8. Stable normalization from official Nsight CSV, retaining raw `.nsys-rep`.
-9. Exact gradient-manifest and family validation before claiming complete gradient coverage.
-10. Bundle verification receipts on every comparison input; raw traces are diagnostic-only.
+1. Instrumentation is inactive outside the caller-selected invocation.
+2. One caller-owned measured region supplies the run total.
+3. Required provenance and typed timing semantics precede comparisons.
+4. Structural trust precedes graph construction and graph-dependent findings.
+5. Agent-facing JSON states evidence gaps and output truncation explicitly.
+6. Timing comparisons fail closed and retain raw samples plus the confidence interval.
+7. One accessible offline UI presents application and optional GPU evidence.
+8. Nsight normalization consumes supported official CSV and retains the raw `.nsys-rep`.
+9. Complete gradient coverage requires an exact manifest and family validation.
+10. Eligible comparisons use finalized bundles and retain a verification receipt for each input.
 
-## Schemas
+## Non-goals
+
+- Static Rust analysis or reconstruction of operations that were not observed.
+- Treating host launch duration as completed asynchronous device work.
+- Inferring physical allocation size from shape metadata.
+- Aligning Candle and Nsight clocks without an explicit mapping.
+- Declaring unverified raw traces eligible for a performance verdict.
+- Parsing Nsight's internal SQLite schema as a stable interface.
+
+## Current protocols
 
 | Schema | Role |
 | --- | --- |
-| `candle-graph/trace/10` | Execution evidence stream with exact gradient contract, caller-labeled tensor statistics, and terminal outcome |
-| `candle-graph/graph/5` | Validated call/data graph with mandatory separate timing planes and explicit measured host scope |
-| `candle-graph/evidence/4` | Capability-qualified agent/human packet with report-specific Nsight availability |
-| `candle-graph/comparison/4` | Replicated outer-wall comparison with verified bundle receipts |
+| `candle-graph/trace/10` | Execution JSONL with tensor statistics and exact gradient contracts |
+| `candle-graph/graph/5` | Validated call/data graph and measured host scopes |
+| `candle-graph/evidence/4` | Capability-qualified application and GPU evidence packet |
+| `candle-graph/comparison/5` | Replicated timing and tensor-stat comparison |
 | `candle-graph/viewer/5` | Embedded offline UI payload |
-| `candle-graph/gradient-manifest/1` | Ordered parameter-manifest digest domain |
-| `candle-graph/nsight-capture/1` | Nsight raw/normalized artifact provenance |
-| `candle-graph/bundle/1` | Content-addressed atomic evidence bundle |
-| `candle-graph/bundle-verification/1` | Deep verification receipt bound to one manifest digest |
+| `candle-graph/gradient-manifest/1` | Ordered gradient-manifest digest domain |
+| `candle-graph/nsight-capture/1` | Nsight artifact and run-identity manifest |
+| `candle-graph/bundle/1` | Content-addressed evidence bundle |
+| `candle-graph/bundle-verification/1` | Point-in-time deep-verification receipt |
 
-## 0.9 schema migration
-
-- Trace/8 is rejected. Emit trace/9; `gradients: complete` now requires `gradient_contract`.
-- Evidence/3 carries trace/9 provenance and typed gradient manifest/family facts.
-- Comparison/4 embeds per-run bundle manifest receipts. The default CLI inputs are bundle
-  directories; `--unverified-traces` accepts raw traces but always produces an ineligible result.
-
-## 0.10 schema migration
-
-- Trace/9 remains readable. Trace/10 adds caller-labeled `tensor_stats` events for numerical
-  mechanism evidence; older traces simply contain no such events.
+The parser reads trace/10 and trace/9; new sessions emit trace/10. Derived packet consumers require
+their current schema. See [schemas and compatibility](docs/schemas.md) for the complete list.

@@ -102,10 +102,14 @@ pub struct NsightProvenance {
 pub struct NsightSummaryRow {
     pub name: String,
     pub total_ns: u64,
-    pub count: u64,
-    pub average_ns: u64,
-    pub minimum_ns: u64,
-    pub maximum_ns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_ns: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
 }
@@ -915,7 +919,7 @@ fn parse_summary(path: &Path) -> anyhow::Result<Vec<NsightSummaryRow>> {
                 field(&headers, &record, &["total_time_ns", "total_ns"]),
                 "total_ns",
             )?,
-            count: number(
+            count: optional_number(
                 field(
                     &headers,
                     &record,
@@ -923,15 +927,15 @@ fn parse_summary(path: &Path) -> anyhow::Result<Vec<NsightSummaryRow>> {
                 ),
                 "count",
             )?,
-            average_ns: number(
+            average_ns: optional_number(
                 field(&headers, &record, &["avg_ns", "average_ns"]),
                 "average_ns",
             )?,
-            minimum_ns: number(
+            minimum_ns: optional_number(
                 field(&headers, &record, &["min_ns", "minimum_ns"]),
                 "minimum_ns",
             )?,
-            maximum_ns: number(
+            maximum_ns: optional_number(
                 field(&headers, &record, &["max_ns", "maximum_ns"]),
                 "maximum_ns",
             )?,
@@ -1098,10 +1102,6 @@ fn field<'a>(headers: &[String], record: &'a csv::StringRecord, names: &[&str]) 
     })
 }
 
-fn number(value: Option<&str>, label: &str) -> anyhow::Result<u64> {
-    Ok(optional_number(value, label)?.unwrap_or(0))
-}
-
 fn required_number(value: Option<&str>, label: &str) -> anyhow::Result<u64> {
     optional_number(value, label)?.ok_or_else(|| anyhow::anyhow!("missing required {label} value"))
 }
@@ -1205,7 +1205,7 @@ mod tests {
             );
         }
         fs::write(&path, "Total Time (ns),Instances,Name\n1,,gemm\n").unwrap();
-        assert_eq!(parse_summary(&path).unwrap()[0].count, 0);
+        assert_eq!(parse_summary(&path).unwrap()[0].count, None);
         let _ = fs::remove_dir_all(dir);
     }
 

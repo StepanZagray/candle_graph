@@ -442,7 +442,7 @@
     }
     panel.innerHTML =
       '<div class="view-heading"><div><p class="eyebrow">Aggregated semantic work</p><h1>Span costs</h1></div><p>' +
-      items.length + ' measured spans</p></div><div class="table-wrap"><table class="timeline-table span-cost-table"><caption class="sr">Span cost ranking</caption>' +
+      items.length + ' graph nodes (spans, operations, tensors)</p></div><div class="table-wrap"><table class="timeline-table span-cost-table"><caption class="sr">Span cost ranking</caption>' +
       '<thead><tr><th scope="col">Span</th><th scope="col">Kind</th><th scope="col">Host self</th><th scope="col">Host total</th><th scope="col">Device busy</th><th scope="col">Memory</th></tr></thead><tbody>' +
       items.map(function (it) {
         return '<tr data-id="' + esc(idStr(it.id)) + '"><td><button type="button" class="table-row-action" data-span-cost-id="' +
