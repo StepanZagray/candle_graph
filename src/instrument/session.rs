@@ -296,7 +296,20 @@ impl TraceSession {
         measured: bool,
     ) -> SpanGuard<'_> {
         let started = Instant::now();
-        let start_ns = self.elapsed_ns();
+        self.begin_span_inner_at(name, kind, step, measured, started)
+    }
+
+    fn begin_span_inner_at(
+        &self,
+        name: impl Into<String>,
+        kind: SpanKind,
+        step: Option<crate::phase::ExecutionStep>,
+        measured: bool,
+        started: Instant,
+    ) -> SpanGuard<'_> {
+        let start_ns = self
+            .host_timestamp_ns(started)
+            .expect("span start must follow trace session start");
         let mut inner = self.inner.borrow_mut();
         inner.next_span_id += 1;
         let span_id = inner.next_span_id;
@@ -870,6 +883,28 @@ mod tests {
         assert!(
             doc.memory.is_empty(),
             "op metadata must not fabricate tensor lifetime"
+        );
+    }
+
+    #[test]
+    fn span_start_and_duration_survive_preemption_between_clock_samples() {
+        let path = temp_trace("preempted-span-start");
+        let session =
+            TraceSession::open(&path, ProfileRun::training("train::update", 1, "cpu")).unwrap();
+
+        let started = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let measured =
+            session.begin_span_inner_at("update", SpanKind::Function, None, true, started);
+        drop(measured);
+        session.finish().unwrap();
+
+        let document =
+            parse_trace(&path).expect("preemption must not put span evidence after terminal");
+        let measured = document.spans.iter().find(|span| span.measured).unwrap();
+        assert!(
+            measured.start_ns.saturating_add(measured.duration_ns)
+                <= document.terminal.timestamp_ns
         );
     }
 
